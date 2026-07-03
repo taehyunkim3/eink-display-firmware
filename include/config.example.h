@@ -5,11 +5,11 @@
 #define WIFI_SSID "your-wifi-name"
 #define WIFI_PASSWORD "your-wifi-password"
 
-// Use the deployed Vercel PNG endpoint for Korean text and layout fidelity.
-// Example: "https://your-app.vercel.app/api/screen.png"
+// Use the deployed Vercel 1bpp bitmap endpoint for Korean text and layout fidelity.
+// Example: "https://your-app.vercel.app/api/screen.bin"
 // Local testing from the ESP32 must use your Mac's LAN IP, not localhost:
-// Example: "http://192.168.0.10:3000/api/screen.png"
-#define DEVICE_ENDPOINT "https://your-app.vercel.app/api/screen.png"
+// Example: "http://192.168.0.10:3000/api/screen.bin"
+#define DEVICE_ENDPOINT "https://your-app.vercel.app/api/screen.bin"
 #define DEVICE_AUTH_TOKEN "replace-with-the-same-token-as-eink-frontend"
 
 // First upload/debug should stay false so Serial Monitor remains usable.
@@ -19,27 +19,32 @@
 #define FALLBACK_SLEEP_SECONDS 1800
 #define BOOT_TEST_SECONDS 4
 #define DEBUG_HEARTBEAT_SECONDS 5
+#define SCREEN_PAGE_COUNT 2
 
-// Battery telemetry is board-specific. Leave disabled until the product
-// schematic/wiki confirms the battery ADC pin and voltage divider ratio.
-#define ENABLE_BATTERY_ADC false
-#define BATTERY_ADC_PIN A0
+// reTerminal E1001 top buttons from the official schematic.
+#define ENABLE_BUTTONS true
+#define BUTTON_LEFT_PIN 3
+#define BUTTON_RIGHT_PIN 4
+#define BUTTON_REFRESH_PIN 5
+
+// reTerminal E1001 battery telemetry pins from the official schematic.
+#define ENABLE_BATTERY_ADC true
+#define BATTERY_ADC_PIN 1
+#define BATTERY_ADC_ENABLE_PIN 21
 #define BATTERY_VOLTAGE_MULTIPLIER 2.0f
 #define BATTERY_EMPTY_MV 3300
 #define BATTERY_FULL_MV 4200
 
-// Keep this comfortably above the PNG response size, but below available RAM.
-#define MAX_IMAGE_BYTES 320000
+// 800 x 480 x 1bpp = 48,000 bytes.
+#define MAX_IMAGE_BYTES 64000
 
-// Default pin mapping for XIAO-style ePaper panels. If the display stays blank,
-// check the product wiki/schematic and adjust these first.
-#define EPD_BUSY D2
-#define EPD_RST D0
-#define EPD_DC D3
-#define EPD_CS D1
-#define EPD_SCK D8
-#define EPD_MOSI D10
+// reTerminal E1001 screen pins from the official schematic.
+#define EPD_BUSY 13
+#define EPD_RST 12
+#define EPD_DC 11
+#define EPD_CS 10
+#define EPD_SCK 7
+#define EPD_MOSI 9
 
-// Common 7.5 inch 800x480 black/white panel class in GxEPD2.
-// If compilation says this class is unknown, try GxEPD2_750_T7.
-#define EPD_MODEL GxEPD2_750_GDEY075T7
+// 7.5 inch 800x480 black/white panel class used by reTerminal E1001.
+#define EPD_MODEL GxEPD2_750_T7

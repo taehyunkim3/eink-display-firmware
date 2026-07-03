@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <HTTPClient.h>
-#include <PNGdec.h>
 #include <SPI.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
@@ -17,8 +16,14 @@
 GxEPD2_BW<EPD_MODEL, EPD_MODEL::HEIGHT> display(
     EPD_MODEL(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
 
-PNG png;
-static uint16_t lineBuffer[800];
+constexpr int SCREEN_WIDTH = 800;
+constexpr int SCREEN_HEIGHT = 480;
+constexpr int SCREEN_BYTES_PER_ROW = SCREEN_WIDTH / 8;
+constexpr int SCREEN_BITMAP_BYTES = SCREEN_BYTES_PER_ROW * SCREEN_HEIGHT;
+static const char *deviceState = "booting";
+static int lastErrorCode = 0;
+static bool displayInitialized = false;
+RTC_DATA_ATTR static int screenPage = 0;
 
 struct DeviceTelemetry {
   String ssid;
@@ -105,6 +110,10 @@ static float readBatteryVoltage() {
     return -1.0f;
   }
 
+  pinMode(BATTERY_ADC_ENABLE_PIN, OUTPUT);
+  digitalWrite(BATTERY_ADC_ENABLE_PIN, HIGH);
+  delay(10);
+
   analogReadResolution(12);
   analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
   delay(5);
@@ -118,6 +127,7 @@ static float readBatteryVoltage() {
 
   const float raw = static_cast<float>(total) / sampleCount;
   const float pinVoltage = raw / 4095.0f * 3.3f;
+  digitalWrite(BATTERY_ADC_ENABLE_PIN, LOW);
   return pinVoltage * BATTERY_VOLTAGE_MULTIPLIER;
 }
 
@@ -149,6 +159,7 @@ static String endpointWithTelemetry(const DeviceTelemetry &telemetry) {
   endpoint += "wifi=connected";
   endpoint += "&ssid=" + urlEncode(telemetry.ssid);
   endpoint += "&rssi=" + String(telemetry.rssi);
+  endpoint += "&page=" + String(screenPage);
 
   if (telemetry.batteryPercent >= 0) {
     endpoint += "&battery=" + String(telemetry.batteryPercent);
@@ -156,6 +167,29 @@ static String endpointWithTelemetry(const DeviceTelemetry &telemetry) {
   }
 
   return endpoint;
+}
+
+static void setupButtons() {
+  if (!ENABLE_BUTTONS) {
+    return;
+  }
+
+  pinMode(BUTTON_LEFT_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_RIGHT_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_REFRESH_PIN, INPUT_PULLUP);
+}
+
+static bool buttonPressed(int pin) {
+  if (!ENABLE_BUTTONS) {
+    return false;
+  }
+
+  if (digitalRead(pin) != LOW) {
+    return false;
+  }
+
+  delay(30);
+  return digitalRead(pin) == LOW;
 }
 
 static void drawStatus(const String &title, const String &detail) {
@@ -196,7 +230,12 @@ static void drawBootTest() {
   } while (display.nextPage());
 }
 
-static void sleepOrWait(uint32_t seconds) {
+enum class WaitAction {
+  None,
+  Refresh,
+};
+
+static WaitAction sleepOrWait(uint32_t seconds) {
   if (ENABLE_DEEP_SLEEP) {
     Serial.printf("Deep sleep for %lu seconds\n", static_cast<unsigned long>(seconds));
     esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(seconds) * 1000000ULL);
@@ -207,11 +246,45 @@ static void sleepOrWait(uint32_t seconds) {
   const uint32_t waitStartedAt = millis();
   const uint32_t waitMs = seconds * 1000UL;
   while (millis() - waitStartedAt < waitMs) {
-    Serial.printf("Heartbeat: waiting, uptime=%lu ms, wifi=%s\n",
+    Serial.printf("Heartbeat: waiting, state=%s, err=%d, uptime=%lu ms, wifi=%s\n",
+                  deviceState,
+                  lastErrorCode,
                   static_cast<unsigned long>(millis()),
                   WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
-    delay(DEBUG_HEARTBEAT_SECONDS * 1000UL);
+
+    const uint32_t heartbeatStartedAt = millis();
+    while (millis() - heartbeatStartedAt < DEBUG_HEARTBEAT_SECONDS * 1000UL) {
+      if (buttonPressed(BUTTON_REFRESH_PIN)) {
+        Serial.println("Button: refresh");
+        while (digitalRead(BUTTON_REFRESH_PIN) == LOW) {
+          delay(10);
+        }
+        return WaitAction::Refresh;
+      }
+
+      if (buttonPressed(BUTTON_LEFT_PIN)) {
+        screenPage = (screenPage + SCREEN_PAGE_COUNT - 1) % SCREEN_PAGE_COUNT;
+        Serial.printf("Button: page left -> %d\n", screenPage);
+        while (digitalRead(BUTTON_LEFT_PIN) == LOW) {
+          delay(10);
+        }
+        return WaitAction::Refresh;
+      }
+
+      if (buttonPressed(BUTTON_RIGHT_PIN)) {
+        screenPage = (screenPage + 1) % SCREEN_PAGE_COUNT;
+        Serial.printf("Button: page right -> %d\n", screenPage);
+        while (digitalRead(BUTTON_RIGHT_PIN) == LOW) {
+          delay(10);
+        }
+        return WaitAction::Refresh;
+      }
+
+      delay(50);
+    }
   }
+
+  return WaitAction::None;
 }
 
 static bool connectWifi() {
@@ -236,7 +309,7 @@ static bool connectWifi() {
   return true;
 }
 
-static bool fetchPng(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer, int &size) {
+static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer, int &size) {
   WiFiClient plainClient;
   WiFiClientSecure secureClient;
   HTTPClient http;
@@ -266,9 +339,9 @@ static bool fetchPng(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer,
   }
 
   const int contentLength = http.getSize();
-  Serial.printf("PNG content length: %d\n", contentLength);
+  Serial.printf("Bitmap content length: %d\n", contentLength);
   if (contentLength > MAX_IMAGE_BYTES) {
-    Serial.println("PNG response exceeds MAX_IMAGE_BYTES");
+    Serial.println("Bitmap response exceeds MAX_IMAGE_BYTES");
     http.end();
     return false;
   }
@@ -276,105 +349,96 @@ static bool fetchPng(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer,
   const int bufferCapacity = contentLength > 0 ? contentLength : MAX_IMAGE_BYTES;
   buffer.reset(new (std::nothrow) uint8_t[bufferCapacity]);
   if (!buffer) {
-    Serial.println("PNG buffer allocation failed");
+    Serial.println("Bitmap buffer allocation failed");
     http.end();
     return false;
   }
 
-  MemoryWriteStream pngStream(buffer.get(), bufferCapacity);
-  const int written = http.writeToStream(&pngStream);
+  MemoryWriteStream bitmapStream(buffer.get(), bufferCapacity);
+  const int written = http.writeToStream(&bitmapStream);
 
   http.end();
 
-  if (written < 0 || pngStream.overflowed() || pngStream.size() == 0) {
-    Serial.printf("PNG download failed: written=%d, received=%u, overflow=%s\n",
+  if (written < 0 || bitmapStream.overflowed() || bitmapStream.size() == 0) {
+    Serial.printf("Bitmap download failed: written=%d, received=%u, overflow=%s\n",
                   written,
-                  static_cast<unsigned int>(pngStream.size()),
-                  pngStream.overflowed() ? "yes" : "no");
+                  static_cast<unsigned int>(bitmapStream.size()),
+                  bitmapStream.overflowed() ? "yes" : "no");
     return false;
   }
 
-  if (contentLength > 0 && static_cast<int>(pngStream.size()) != contentLength) {
-    Serial.printf("PNG download incomplete: %u/%d\n",
-                  static_cast<unsigned int>(pngStream.size()),
+  if (contentLength > 0 && static_cast<int>(bitmapStream.size()) != contentLength) {
+    Serial.printf("Bitmap download incomplete: %u/%d\n",
+                  static_cast<unsigned int>(bitmapStream.size()),
                   contentLength);
     return false;
   }
 
-  size = static_cast<int>(pngStream.size());
-  Serial.printf("PNG received bytes: %d\n", size);
+  size = static_cast<int>(bitmapStream.size());
+  Serial.printf("Bitmap received bytes: %d\n", size);
+  if (size != SCREEN_BITMAP_BYTES) {
+    Serial.printf("Bitmap size mismatch: expected=%d, got=%d\n", SCREEN_BITMAP_BYTES, size);
+    return false;
+  }
+
   return true;
 }
 
-static int pngDraw(PNGDRAW *draw) {
-  png.getLineAsRGB565(draw, lineBuffer, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
-
-  for (int x = 0; x < draw->iWidth; x++) {
-    const uint16_t color = lineBuffer[x];
-    const uint8_t r = ((color >> 11) & 0x1f) << 3;
-    const uint8_t g = ((color >> 5) & 0x3f) << 2;
-    const uint8_t b = (color & 0x1f) << 3;
-    const uint16_t luminance = (r * 30 + g * 59 + b * 11) / 100;
-    display.drawPixel(x, draw->y, luminance < 170 ? GxEPD_BLACK : GxEPD_WHITE);
+static bool renderBitmap(const uint8_t *buffer, int size) {
+  if (size != SCREEN_BITMAP_BYTES) {
+    return false;
   }
 
-  return 1;
-}
-
-static bool renderPng(const uint8_t *buffer, int size) {
   display.setRotation(0);
   display.setFullWindow();
   display.firstPage();
-
   do {
     display.fillScreen(GxEPD_WHITE);
-    const int result = png.openRAM(const_cast<uint8_t *>(buffer), size, pngDraw);
-    if (result != PNG_SUCCESS) {
-      Serial.printf("PNG open failed: %d\n", result);
-      png.close();
-      return false;
-    }
-
-    const int decoded = png.decode(nullptr, 0);
-    png.close();
-    if (decoded != PNG_SUCCESS) {
-      Serial.printf("PNG decode failed: %d\n", decoded);
-      return false;
+    for (int y = 0; y < SCREEN_HEIGHT; y++) {
+      const int rowOffset = y * SCREEN_BYTES_PER_ROW;
+      for (int x = 0; x < SCREEN_WIDTH; x++) {
+        const bool black = buffer[rowOffset + (x >> 3)] & (0x80 >> (x & 7));
+        display.drawPixel(x, y, black ? GxEPD_BLACK : GxEPD_WHITE);
+      }
     }
   } while (display.nextPage());
 
   return true;
 }
 
-void setup() {
-  Serial.begin(115200);
-  delay(1500);
-  Serial.println();
-  Serial.println("ESP32 e-ink dashboard firmware");
-  Serial.printf("Display enabled: %s\n", ENABLE_DISPLAY ? "yes" : "no");
+static void setupDisplay() {
+  if (!ENABLE_DISPLAY || displayInitialized) {
+    return;
+  }
 
-  if (!ENABLE_DISPLAY) {
-    Serial.println("Display disabled for serial/debug check");
-  } else {
     SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
     Serial.println("Initializing e-paper display");
     display.init(115200, true, 2, false);
     Serial.println("Drawing boot test screen");
     drawBootTest();
     delay(BOOT_TEST_SECONDS * 1000UL);
+    displayInitialized = true;
+}
+
+static bool refreshScreen() {
+  if (!ENABLE_DISPLAY) {
+    deviceState = "display-disabled";
+    Serial.println("Display disabled for serial/debug check");
+  } else {
+    setupDisplay();
   }
 
   if (!connectWifi()) {
+    deviceState = "wifi-failed";
     if (!ENABLE_DISPLAY) {
-      sleepOrWait(FALLBACK_SLEEP_SECONDS);
-      return;
+      return false;
     }
     drawStatus("Wi-Fi failed", "Check WIFI_SSID / WIFI_PASSWORD");
-    sleepOrWait(FALLBACK_SLEEP_SECONDS);
-    return;
+    return false;
   }
 
   const DeviceTelemetry telemetry = readDeviceTelemetry();
+  deviceState = "wifi-connected";
   Serial.printf("Wi-Fi SSID: %s, RSSI: %ld dBm\n",
                 telemetry.ssid.c_str(),
                 static_cast<long>(telemetry.rssi));
@@ -386,32 +450,48 @@ void setup() {
     Serial.println("Battery telemetry disabled");
   }
 
-  std::unique_ptr<uint8_t[]> pngBuffer;
-  int pngSize = 0;
-  if (!fetchPng(endpointWithTelemetry(telemetry), pngBuffer, pngSize)) {
+  std::unique_ptr<uint8_t[]> bitmapBuffer;
+  int bitmapSize = 0;
+  if (!fetchBitmap(endpointWithTelemetry(telemetry), bitmapBuffer, bitmapSize)) {
+    deviceState = "fetch-failed";
     if (!ENABLE_DISPLAY) {
-      sleepOrWait(FALLBACK_SLEEP_SECONDS);
-      return;
+      return false;
     }
     drawStatus("Fetch failed", "Check endpoint, token, and Vercel logs");
-    sleepOrWait(FALLBACK_SLEEP_SECONDS);
-    return;
+    return false;
   }
+  deviceState = "bitmap-received";
 
   if (!ENABLE_DISPLAY) {
-    Serial.println("Display disabled; skipping PNG render");
-    sleepOrWait(FALLBACK_SLEEP_SECONDS);
-    return;
+    Serial.println("Display disabled; skipping bitmap render");
+    return true;
   }
 
-  if (!renderPng(pngBuffer.get(), pngSize)) {
-    drawStatus("Render failed", "Check GxEPD2 model and panel pins");
-    sleepOrWait(FALLBACK_SLEEP_SECONDS);
-    return;
+  if (!renderBitmap(bitmapBuffer.get(), bitmapSize)) {
+    deviceState = "render-failed";
+    drawStatus("Render failed", "Check bitmap endpoint and size");
+    return false;
   }
 
+  deviceState = "screen-updated";
   Serial.println("Screen updated");
-  sleepOrWait(FALLBACK_SLEEP_SECONDS);
+  return true;
 }
 
-void loop() {}
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+  Serial.println();
+  Serial.println("ESP32 e-ink dashboard firmware");
+  Serial.printf("Display enabled: %s\n", ENABLE_DISPLAY ? "yes" : "no");
+  Serial.printf("Screen page: %d\n", screenPage);
+  setupButtons();
+  refreshScreen();
+}
+
+void loop() {
+  const WaitAction action = sleepOrWait(FALLBACK_SLEEP_SECONDS);
+  if (action == WaitAction::Refresh) {
+    refreshScreen();
+  }
+}
