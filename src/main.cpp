@@ -161,7 +161,14 @@ static void sleepOrWait(uint32_t seconds) {
   }
 
   Serial.println("Deep sleep disabled. Waiting before next refresh.");
-  delay(seconds * 1000UL);
+  const uint32_t waitStartedAt = millis();
+  const uint32_t waitMs = seconds * 1000UL;
+  while (millis() - waitStartedAt < waitMs) {
+    Serial.printf("Heartbeat: waiting, uptime=%lu ms, wifi=%s\n",
+                  static_cast<unsigned long>(millis()),
+                  WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
+    delay(DEBUG_HEARTBEAT_SECONDS * 1000UL);
+  }
 }
 
 static bool connectWifi() {

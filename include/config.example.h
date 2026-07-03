@@ -17,6 +17,7 @@
 #define ENABLE_DEEP_SLEEP false
 #define FALLBACK_SLEEP_SECONDS 1800
 #define BOOT_TEST_SECONDS 4
+#define DEBUG_HEARTBEAT_SECONDS 5
 
 // Battery telemetry is board-specific. Leave disabled until the product
 // schematic/wiki confirms the battery ADC pin and voltage divider ratio.
