@@ -57,6 +57,14 @@
 #define CHARGER_STATUS_MASK 0x03
 #endif
 
+#ifndef WIFI_BUTTON_PASSWORD_MAX_LENGTH
+#define WIFI_BUTTON_PASSWORD_MAX_LENGTH 64
+#endif
+
+static const char WIFI_PASSWORD_CHARSET[] =
+    "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "!@#$%^&*()-_=+[]{}:;,.?/\\|~`'\" ";
+
 GxEPD2_BW<EPD_MODEL, EPD_MODEL::HEIGHT> display(
     EPD_MODEL(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
 
@@ -502,6 +510,124 @@ static void drawBootTest() {
   } while (display.nextPage());
 }
 
+enum class WifiButtonStage {
+  NetworkSelect,
+  PasswordInput,
+  Saved,
+};
+
+static String maskedPassword(const String &password) {
+  String masked;
+  for (size_t i = 0; i < password.length(); i++) {
+    masked += '*';
+  }
+  return masked;
+}
+
+static String wifiPasswordChoiceLabel(int index) {
+  const int charsetLength = strlen(WIFI_PASSWORD_CHARSET);
+  if (index < charsetLength) {
+    const char c = WIFI_PASSWORD_CHARSET[index];
+    if (c == ' ') {
+      return "<SPACE>";
+    }
+    return String(c);
+  }
+  if (index == charsetLength) {
+    return "<DEL>";
+  }
+  if (index == charsetLength + 1) {
+    return "<SAVE>";
+  }
+  return "<EXIT>";
+}
+
+static void drawWifiButtonSetup(WifiButtonStage stage,
+                                const String &apName,
+                                int networkCount,
+                                int selectedNetwork,
+                                const String &password,
+                                int passwordChoiceIndex) {
+  if (!ENABLE_DISPLAY) {
+    return;
+  }
+
+  display.setRotation(0);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(28, 48);
+    display.print("Wi-Fi setup");
+
+    display.setFont(&FreeMono9pt7b);
+    display.setCursor(28, 86);
+    display.print("Buttons: left/right move, refresh select");
+
+    display.drawLine(28, 104, SCREEN_WIDTH - 28, 104, GxEPD_BLACK);
+
+    if (stage == WifiButtonStage::NetworkSelect) {
+      display.setFont(&FreeMonoBold9pt7b);
+      display.setCursor(28, 148);
+      display.print("1. Choose network");
+
+      display.setFont(&FreeMono9pt7b);
+      if (networkCount <= 0) {
+        display.setCursor(28, 194);
+        display.print("No networks found. Use browser setup below.");
+      } else {
+        display.setCursor(28, 194);
+        display.print(selectedNetwork + 1);
+        display.print(" / ");
+        display.print(networkCount);
+        display.print("  ");
+        display.print(WiFi.SSID(selectedNetwork).substring(0, 32));
+
+        display.setCursor(28, 230);
+        display.print("Signal: ");
+        display.print(WiFi.RSSI(selectedNetwork));
+        display.print(" dBm");
+      }
+    } else if (stage == WifiButtonStage::PasswordInput) {
+      display.setFont(&FreeMonoBold9pt7b);
+      display.setCursor(28, 148);
+      display.print("2. Enter password");
+
+      display.setFont(&FreeMono9pt7b);
+      display.setCursor(28, 188);
+      display.print("SSID: ");
+      display.print(WiFi.SSID(selectedNetwork).substring(0, 30));
+
+      display.setCursor(28, 224);
+      display.print("Password: ");
+      display.print(maskedPassword(password));
+      display.print(" (");
+      display.print(password.length());
+      display.print(")");
+
+      display.setFont(&FreeMonoBold9pt7b);
+      display.setCursor(28, 284);
+      display.print("< ");
+      display.print(wifiPasswordChoiceLabel(passwordChoiceIndex));
+      display.print(" >");
+    } else {
+      display.setFont(&FreeMonoBold9pt7b);
+      display.setCursor(28, 160);
+      display.print("Saved. Restarting...");
+    }
+
+    display.setFont(&FreeMono9pt7b);
+    display.drawLine(28, SCREEN_HEIGHT - 92, SCREEN_WIDTH - 28, SCREEN_HEIGHT - 92, GxEPD_BLACK);
+    display.setCursor(28, SCREEN_HEIGHT - 58);
+    display.print("Browser setup also works: connect ");
+    display.print(apName.substring(0, 24));
+    display.setCursor(28, SCREEN_HEIGHT - 28);
+    display.print("then open http://192.168.4.1");
+  } while (display.nextPage());
+}
+
 enum class WaitAction {
   None,
   Refresh,
@@ -648,14 +774,45 @@ static void startWifiSetupPortal() {
 
   const int networkCount = WiFi.scanNetworks();
   Serial.printf("Wi-Fi setup AP: %s, open http://192.168.4.1\n", apName.c_str());
-  if (ENABLE_DISPLAY) {
-    setupDisplay();
-    drawStatus("Wi-Fi setup", "Connect to " + apName + " then open 192.168.4.1");
-  }
+  setupDisplay();
 
   DNSServer dnsServer;
   WebServer server(80);
   bool saved = false;
+  bool exitRequested = false;
+  WifiButtonStage buttonStage = WifiButtonStage::NetworkSelect;
+  String buttonPassword;
+  int selectedNetwork = 0;
+  int passwordChoiceIndex = 0;
+  bool uiDirty = true;
+
+  auto hasVisibleNetwork = [&]() {
+    for (int i = 0; i < networkCount; i++) {
+      if (WiFi.SSID(i).length() > 0) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  auto moveNetworkSelection = [&](int delta) {
+    if (!hasVisibleNetwork()) {
+      return;
+    }
+
+    for (int attempts = 0; attempts < networkCount; attempts++) {
+      selectedNetwork = (selectedNetwork + delta + networkCount) % networkCount;
+      if (WiFi.SSID(selectedNetwork).length() > 0) {
+        return;
+      }
+    }
+  };
+
+  if (hasVisibleNetwork()) {
+    while (selectedNetwork < networkCount && WiFi.SSID(selectedNetwork).length() == 0) {
+      selectedNetwork++;
+    }
+  }
 
   dnsServer.start(53, "*", apIP);
   server.on("/", HTTP_GET, [&]() {
@@ -681,10 +838,82 @@ static void startWifiSetupPortal() {
   server.begin();
 
   const uint32_t startedAt = millis();
-  while (!saved && millis() - startedAt < WIFI_SETUP_TIMEOUT_SECONDS * 1000UL) {
+  while (!saved && !exitRequested && millis() - startedAt < WIFI_SETUP_TIMEOUT_SECONDS * 1000UL) {
     dnsServer.processNextRequest();
     server.handleClient();
-    delay(10);
+
+    if (uiDirty) {
+      drawWifiButtonSetup(buttonStage,
+                          apName,
+                          networkCount,
+                          selectedNetwork,
+                          buttonPassword,
+                          passwordChoiceIndex);
+      uiDirty = false;
+    }
+
+    if (buttonPressed(BUTTON_LEFT_PIN)) {
+      if (buttonStage == WifiButtonStage::NetworkSelect) {
+        moveNetworkSelection(-1);
+        Serial.printf("Wi-Fi setup button network: %s\n", WiFi.SSID(selectedNetwork).c_str());
+      } else if (buttonStage == WifiButtonStage::PasswordInput) {
+        const int choiceCount = strlen(WIFI_PASSWORD_CHARSET) + 3;
+        passwordChoiceIndex = (passwordChoiceIndex + choiceCount - 1) % choiceCount;
+        Serial.printf("Wi-Fi setup password choice: %s\n",
+                      wifiPasswordChoiceLabel(passwordChoiceIndex).c_str());
+      }
+      waitForButtonRelease(BUTTON_LEFT_PIN);
+      uiDirty = true;
+    } else if (buttonPressed(BUTTON_RIGHT_PIN)) {
+      if (buttonStage == WifiButtonStage::NetworkSelect) {
+        moveNetworkSelection(1);
+        Serial.printf("Wi-Fi setup button network: %s\n", WiFi.SSID(selectedNetwork).c_str());
+      } else if (buttonStage == WifiButtonStage::PasswordInput) {
+        const int choiceCount = strlen(WIFI_PASSWORD_CHARSET) + 3;
+        passwordChoiceIndex = (passwordChoiceIndex + 1) % choiceCount;
+        Serial.printf("Wi-Fi setup password choice: %s\n",
+                      wifiPasswordChoiceLabel(passwordChoiceIndex).c_str());
+      }
+      waitForButtonRelease(BUTTON_RIGHT_PIN);
+      uiDirty = true;
+    } else if (buttonPressed(BUTTON_REFRESH_PIN)) {
+      if (buttonStage == WifiButtonStage::NetworkSelect) {
+        if (hasVisibleNetwork() && selectedNetwork < networkCount &&
+            WiFi.SSID(selectedNetwork).length() > 0) {
+          buttonStage = WifiButtonStage::PasswordInput;
+          buttonPassword = "";
+          passwordChoiceIndex = 0;
+          Serial.printf("Wi-Fi setup button selected SSID: %s\n",
+                        WiFi.SSID(selectedNetwork).c_str());
+        }
+      } else if (buttonStage == WifiButtonStage::PasswordInput) {
+        const int charsetLength = strlen(WIFI_PASSWORD_CHARSET);
+        if (passwordChoiceIndex < charsetLength) {
+          if (buttonPassword.length() < WIFI_BUTTON_PASSWORD_MAX_LENGTH) {
+            buttonPassword += WIFI_PASSWORD_CHARSET[passwordChoiceIndex];
+          }
+        } else if (passwordChoiceIndex == charsetLength) {
+          if (buttonPassword.length() > 0) {
+            buttonPassword.remove(buttonPassword.length() - 1);
+          }
+        } else if (passwordChoiceIndex == charsetLength + 1) {
+          const String ssid = WiFi.SSID(selectedNetwork);
+          if (ssid.length() > 0) {
+            saveWifiCredentials(ssid, buttonPassword);
+            saved = true;
+            buttonStage = WifiButtonStage::Saved;
+            Serial.printf("Wi-Fi credentials saved from buttons: %s\n", ssid.c_str());
+          }
+        } else {
+          exitRequested = true;
+          Serial.println("Wi-Fi setup button exit");
+        }
+      }
+      waitForButtonRelease(BUTTON_REFRESH_PIN);
+      uiDirty = true;
+    }
+
+    delay(20);
   }
 
   server.stop();
@@ -693,8 +922,22 @@ static void startWifiSetupPortal() {
   WiFi.scanDelete();
 
   if (saved) {
+    drawWifiButtonSetup(WifiButtonStage::Saved,
+                        apName,
+                        networkCount,
+                        selectedNetwork,
+                        buttonPassword,
+                        passwordChoiceIndex);
     delay(800);
     ESP.restart();
+  }
+
+  if (exitRequested) {
+    Serial.println("Wi-Fi setup exited by button");
+    if (ENABLE_DISPLAY) {
+      drawStatus("Wi-Fi setup", "Canceled; returning to dashboard");
+    }
+    return;
   }
 
   Serial.println("Wi-Fi setup timed out");

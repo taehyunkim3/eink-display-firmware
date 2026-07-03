@@ -21,6 +21,7 @@
 #define DEBUG_HEARTBEAT_SECONDS 5
 #define SCREEN_PAGE_COUNT 2
 #define WIFI_SETUP_TIMEOUT_SECONDS 300
+#define WIFI_BUTTON_PASSWORD_MAX_LENGTH 64
 
 // reTerminal E1001 top buttons from the official schematic.
 #define ENABLE_BUTTONS true
