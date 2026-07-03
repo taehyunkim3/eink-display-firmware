@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
+#include <Wire.h>
 #include <memory>
 #include <new>
 
@@ -15,6 +16,46 @@
 #include <GxEPD2_BW.h>
 
 #include "config.h"
+
+#ifndef BUTTON_DEBOUNCE_MS
+#define BUTTON_DEBOUNCE_MS 30
+#endif
+
+#ifndef BUTTON_CHORD_GRACE_MS
+#define BUTTON_CHORD_GRACE_MS 700
+#endif
+
+#ifndef WIFI_SETUP_HOLD_MS
+#define WIFI_SETUP_HOLD_MS 1800
+#endif
+
+#ifndef ENABLE_CHARGER_STATUS
+#define ENABLE_CHARGER_STATUS false
+#endif
+
+#ifndef CHARGER_I2C_SDA
+#define CHARGER_I2C_SDA 39
+#endif
+
+#ifndef CHARGER_I2C_SCL
+#define CHARGER_I2C_SCL 40
+#endif
+
+#ifndef CHARGER_I2C_ADDRESS
+#define CHARGER_I2C_ADDRESS 0x6B
+#endif
+
+#ifndef CHARGER_STATUS_REGISTER
+#define CHARGER_STATUS_REGISTER 0x0B
+#endif
+
+#ifndef CHARGER_STATUS_SHIFT
+#define CHARGER_STATUS_SHIFT 3
+#endif
+
+#ifndef CHARGER_STATUS_MASK
+#define CHARGER_STATUS_MASK 0x03
+#endif
 
 GxEPD2_BW<EPD_MODEL, EPD_MODEL::HEIGHT> display(
     EPD_MODEL(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
@@ -35,6 +76,7 @@ struct DeviceTelemetry {
   int32_t rssi;
   int32_t batteryPercent;
   float batteryVoltage;
+  String batteryChargeState;
 };
 
 class MemoryWriteStream : public Stream {
@@ -185,9 +227,55 @@ static int32_t batteryPercentFromVoltage(float voltage) {
   }
 
   const float millivolts = voltage * 1000.0f;
+  if (millivolts >= BATTERY_FULL_MV) {
+    return 100;
+  }
+
   const float percent =
       (millivolts - BATTERY_EMPTY_MV) * 100.0f / (BATTERY_FULL_MV - BATTERY_EMPTY_MV);
   return constrain(static_cast<int32_t>(roundf(percent)), 0, 100);
+}
+
+static bool readChargerRegister(uint8_t reg, uint8_t &value) {
+  if (!ENABLE_CHARGER_STATUS) {
+    return false;
+  }
+
+  static bool wireStarted = false;
+  if (!wireStarted) {
+    Wire.begin(CHARGER_I2C_SDA, CHARGER_I2C_SCL);
+    Wire.setClock(100000);
+    wireStarted = true;
+  }
+
+  Wire.beginTransmission(CHARGER_I2C_ADDRESS);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  if (Wire.requestFrom(static_cast<uint8_t>(CHARGER_I2C_ADDRESS), static_cast<uint8_t>(1)) != 1) {
+    return false;
+  }
+
+  value = Wire.read();
+  return true;
+}
+
+static String readBatteryChargeState() {
+  uint8_t status = 0;
+  if (!readChargerRegister(CHARGER_STATUS_REGISTER, status)) {
+    return "unknown";
+  }
+
+  const uint8_t chargeStatus = (status >> CHARGER_STATUS_SHIFT) & CHARGER_STATUS_MASK;
+  if (chargeStatus == 1 || chargeStatus == 2) {
+    return "charging";
+  }
+  if (chargeStatus == 3) {
+    return "full";
+  }
+  return "not_charging";
 }
 
 static DeviceTelemetry readDeviceTelemetry() {
@@ -198,6 +286,7 @@ static DeviceTelemetry readDeviceTelemetry() {
       WiFi.RSSI(),
       batteryPercentFromVoltage(voltage),
       voltage,
+      readBatteryChargeState(),
   };
 }
 
@@ -213,6 +302,7 @@ static String endpointWithTelemetry(const DeviceTelemetry &telemetry) {
     endpoint += "&battery=" + String(telemetry.batteryPercent);
     endpoint += "&batteryVoltage=" + String(telemetry.batteryVoltage, 2);
   }
+  endpoint += "&charge=" + telemetry.batteryChargeState;
 
   return endpoint;
 }
@@ -245,21 +335,80 @@ static bool buttonPressed(int pin) {
     return false;
   }
 
-  delay(30);
+  delay(BUTTON_DEBOUNCE_MS);
   return digitalRead(pin) == LOW;
 }
 
-static bool bothPageButtonsPressed() {
+enum class ButtonIntent {
+  None,
+  PageLeft,
+  PageRight,
+  PageChord,
+};
+
+static bool buttonHeld(int pin) {
+  return digitalRead(pin) == LOW;
+}
+
+static void waitForButtonRelease(int pin) {
+  while (buttonHeld(pin)) {
+    delay(10);
+  }
+}
+
+static void waitForPageButtonsRelease() {
+  while (buttonHeld(BUTTON_LEFT_PIN) || buttonHeld(BUTTON_RIGHT_PIN)) {
+    delay(10);
+  }
+}
+
+static ButtonIntent readPageButtonIntent() {
   if (!ENABLE_BUTTONS) {
-    return false;
+    return ButtonIntent::None;
   }
 
-  if (digitalRead(BUTTON_LEFT_PIN) != LOW || digitalRead(BUTTON_RIGHT_PIN) != LOW) {
-    return false;
+  if (!buttonHeld(BUTTON_LEFT_PIN) && !buttonHeld(BUTTON_RIGHT_PIN)) {
+    return ButtonIntent::None;
   }
 
-  delay(30);
-  return digitalRead(BUTTON_LEFT_PIN) == LOW && digitalRead(BUTTON_RIGHT_PIN) == LOW;
+  bool sawLeft = buttonHeld(BUTTON_LEFT_PIN);
+  bool sawRight = buttonHeld(BUTTON_RIGHT_PIN);
+  const uint32_t startedAt = millis();
+
+  while (millis() - startedAt < BUTTON_CHORD_GRACE_MS) {
+    sawLeft = sawLeft || buttonHeld(BUTTON_LEFT_PIN);
+    sawRight = sawRight || buttonHeld(BUTTON_RIGHT_PIN);
+
+    if (sawLeft && sawRight) {
+      delay(BUTTON_DEBOUNCE_MS);
+      return ButtonIntent::PageChord;
+    }
+
+    if (!buttonHeld(BUTTON_LEFT_PIN) && !buttonHeld(BUTTON_RIGHT_PIN)) {
+      break;
+    }
+
+    delay(20);
+  }
+
+  if (sawLeft) {
+    return ButtonIntent::PageLeft;
+  }
+  if (sawRight) {
+    return ButtonIntent::PageRight;
+  }
+  return ButtonIntent::None;
+}
+
+static bool pageChordHeldFor(uint32_t holdMs) {
+  const uint32_t startedAt = millis();
+  while (buttonHeld(BUTTON_LEFT_PIN) && buttonHeld(BUTTON_RIGHT_PIN)) {
+    if (millis() - startedAt >= holdMs) {
+      return true;
+    }
+    delay(50);
+  }
+  return false;
 }
 
 static void drawStatus(const String &title, const String &detail) {
@@ -326,43 +475,30 @@ static WaitAction sleepOrWait(uint32_t seconds) {
 
     const uint32_t heartbeatStartedAt = millis();
     while (millis() - heartbeatStartedAt < DEBUG_HEARTBEAT_SECONDS * 1000UL) {
-      if (bothPageButtonsPressed()) {
-        const uint32_t pressedAt = millis();
-        while (bothPageButtonsPressed()) {
-          if (millis() - pressedAt >= 2000) {
-            Serial.println("Button: Wi-Fi setup");
-            while (digitalRead(BUTTON_LEFT_PIN) == LOW || digitalRead(BUTTON_RIGHT_PIN) == LOW) {
-              delay(10);
-            }
-            return WaitAction::WifiSetup;
-          }
-          delay(50);
-        }
-      }
-
       if (buttonPressed(BUTTON_REFRESH_PIN)) {
         Serial.println("Button: refresh");
-        while (digitalRead(BUTTON_REFRESH_PIN) == LOW) {
-          delay(10);
-        }
+        waitForButtonRelease(BUTTON_REFRESH_PIN);
         return WaitAction::ForceRefresh;
       }
 
-      if (buttonPressed(BUTTON_LEFT_PIN)) {
+      const ButtonIntent pageIntent = readPageButtonIntent();
+      if (pageIntent == ButtonIntent::PageChord) {
+        Serial.println("Button: page chord detected");
+        if (pageChordHeldFor(WIFI_SETUP_HOLD_MS)) {
+          Serial.println("Button: Wi-Fi setup");
+          waitForPageButtonsRelease();
+          return WaitAction::WifiSetup;
+        }
+        waitForPageButtonsRelease();
+      } else if (pageIntent == ButtonIntent::PageLeft) {
         screenPage = (screenPage + SCREEN_PAGE_COUNT - 1) % SCREEN_PAGE_COUNT;
         Serial.printf("Button: page left -> %d\n", screenPage);
-        while (digitalRead(BUTTON_LEFT_PIN) == LOW) {
-          delay(10);
-        }
+        waitForButtonRelease(BUTTON_LEFT_PIN);
         return WaitAction::Refresh;
-      }
-
-      if (buttonPressed(BUTTON_RIGHT_PIN)) {
+      } else if (pageIntent == ButtonIntent::PageRight) {
         screenPage = (screenPage + 1) % SCREEN_PAGE_COUNT;
         Serial.printf("Button: page right -> %d\n", screenPage);
-        while (digitalRead(BUTTON_RIGHT_PIN) == LOW) {
-          delay(10);
-        }
+        waitForButtonRelease(BUTTON_RIGHT_PIN);
         return WaitAction::Refresh;
       }
 
@@ -638,9 +774,10 @@ static bool refreshScreen(bool forceServerRefresh = false) {
                 telemetry.ssid.c_str(),
                 static_cast<long>(telemetry.rssi));
   if (telemetry.batteryPercent >= 0) {
-    Serial.printf("Battery: %ld%% %.2fV\n",
+    Serial.printf("Battery: %ld%% %.2fV charge=%s\n",
                   static_cast<long>(telemetry.batteryPercent),
-                  telemetry.batteryVoltage);
+                  telemetry.batteryVoltage,
+                  telemetry.batteryChargeState.c_str());
   } else {
     Serial.println("Battery telemetry disabled");
   }

@@ -27,6 +27,9 @@
 #define BUTTON_LEFT_PIN 3
 #define BUTTON_RIGHT_PIN 4
 #define BUTTON_REFRESH_PIN 5
+#define BUTTON_DEBOUNCE_MS 30
+#define BUTTON_CHORD_GRACE_MS 700
+#define WIFI_SETUP_HOLD_MS 1800
 
 // reTerminal E1001 battery telemetry pins from the official schematic.
 #define ENABLE_BATTERY_ADC true
@@ -34,7 +37,17 @@
 #define BATTERY_ADC_ENABLE_PIN 21
 #define BATTERY_VOLTAGE_MULTIPLIER 2.0f
 #define BATTERY_EMPTY_MV 3300
-#define BATTERY_FULL_MV 4200
+#define BATTERY_FULL_MV 3840
+
+// reTerminal E1001 charger is connected over I2C1. Status is best-effort:
+// if the charger does not answer, the firmware sends charge=unknown.
+#define ENABLE_CHARGER_STATUS true
+#define CHARGER_I2C_SDA 39
+#define CHARGER_I2C_SCL 40
+#define CHARGER_I2C_ADDRESS 0x6B
+#define CHARGER_STATUS_REGISTER 0x0B
+#define CHARGER_STATUS_SHIFT 3
+#define CHARGER_STATUS_MASK 0x03
 
 // 800 x 480 x 1bpp = 48,000 bytes.
 #define MAX_IMAGE_BYTES 64000
