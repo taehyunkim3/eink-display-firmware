@@ -66,6 +66,10 @@
 #define WIFI_BUTTON_SAVE_DOUBLE_PRESS_MS 900
 #endif
 
+#ifndef WIFI_SETUP_MAX_NETWORKS
+#define WIFI_SETUP_MAX_NETWORKS 10
+#endif
+
 static const char WIFI_PASSWORD_CHARSET[] =
     "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "!@#$%^&*()-_=+[]{}:;,.?/\\|~`'\" ";
@@ -524,6 +528,86 @@ enum class WifiButtonStage {
   Saved,
 };
 
+struct WifiNetworkEntry {
+  String ssid;
+  int32_t rssi;
+};
+
+static int32_t wifiSignalPercentFromRssi(int32_t rssi) {
+  return constrain(static_cast<int32_t>(roundf((rssi + 90) * 100.0f / 60.0f)), 0, 100);
+}
+
+static uint8_t wifiSignalBarsFromRssi(int32_t rssi) {
+  const int32_t percent = wifiSignalPercentFromRssi(rssi);
+  if (percent >= 75) {
+    return 4;
+  }
+  if (percent >= 50) {
+    return 3;
+  }
+  if (percent >= 25) {
+    return 2;
+  }
+  if (percent > 0) {
+    return 1;
+  }
+  return 0;
+}
+
+static void drawWifiSignalIcon(int16_t x, int16_t y, int32_t rssi, uint16_t color = GxEPD_BLACK) {
+  const uint8_t bars = wifiSignalBarsFromRssi(rssi);
+  for (uint8_t i = 0; i < 4; i++) {
+    const int16_t barHeight = 5 + i * 4;
+    const int16_t barX = x + i * 8;
+    const int16_t barY = y - barHeight;
+    display.drawRect(barX, barY, 5, barHeight, color);
+    if (i < bars) {
+      display.fillRect(barX + 1, barY + 1, 3, barHeight - 2, color);
+    }
+  }
+}
+
+static int buildWifiNetworkList(int scanCount, WifiNetworkEntry *networks, int capacity) {
+  int count = 0;
+
+  for (int scanIndex = 0; scanIndex < scanCount; scanIndex++) {
+    const String ssid = WiFi.SSID(scanIndex);
+    if (ssid.length() == 0) {
+      continue;
+    }
+
+    const int32_t rssi = WiFi.RSSI(scanIndex);
+    bool replacedDuplicate = false;
+    for (int i = 0; i < count; i++) {
+      if (networks[i].ssid == ssid) {
+        if (rssi > networks[i].rssi) {
+          networks[i].rssi = rssi;
+        }
+        replacedDuplicate = true;
+        break;
+      }
+    }
+
+    if (!replacedDuplicate && count < capacity) {
+      networks[count++] = {ssid, rssi};
+    } else if (!replacedDuplicate && count > 0 && rssi > networks[count - 1].rssi) {
+      networks[count - 1] = {ssid, rssi};
+    }
+
+    for (int i = 1; i < count; i++) {
+      WifiNetworkEntry current = networks[i];
+      int j = i - 1;
+      while (j >= 0 && networks[j].rssi < current.rssi) {
+        networks[j + 1] = networks[j];
+        j--;
+      }
+      networks[j + 1] = current;
+    }
+  }
+
+  return count;
+}
+
 static String maskedPassword(const String &password) {
   String masked;
   for (size_t i = 0; i < password.length(); i++) {
@@ -575,6 +659,7 @@ static void drawWifiButtonFrame(const String &apName) {
 
 static void drawWifiButtonSetup(WifiButtonStage stage,
                                 const String &apName,
+                                const WifiNetworkEntry *networks,
                                 int networkCount,
                                 int selectedNetwork,
                                 const String &password,
@@ -602,22 +687,50 @@ static void drawWifiButtonSetup(WifiButtonStage stage,
 
     if (stage == WifiButtonStage::NetworkSelect) {
       drawKorean(28, 145, "1. 와이파이 선택");
-      drawKorean(28, 178, "좌/우: 목록 이동    확인: 선택");
+      drawKorean(28, 174, "좌/우: 목록 이동    확인: 선택");
 
       if (networkCount <= 0 || selectedNetwork < 0 || selectedNetwork >= networkCount ||
-          WiFi.SSID(selectedNetwork).length() == 0) {
+          networks[selectedNetwork].ssid.length() == 0) {
         drawKorean(28, 230, "검색된 와이파이가 없습니다. 아래 휴대폰 설정을 사용하세요.");
       } else {
-        drawKorean(28, 230, String("현재 선택: ") + WiFi.SSID(selectedNetwork).substring(0, 30));
-        drawKorean(28, 264, String("목록 위치: ") + String(selectedNetwork + 1) + " / " +
-                            String(networkCount));
-        drawKorean(28, 298, String("신호 세기: ") + String(WiFi.RSSI(selectedNetwork)) + " dBm");
+        constexpr int16_t rowTop = 192;
+        constexpr int16_t rowHeight = 18;
+        for (int i = 0; i < networkCount; i++) {
+          const int16_t y = rowTop + i * rowHeight;
+          if (i == selectedNetwork) {
+            display.fillRect(22, y - 15, SCREEN_WIDTH - 52, 17, GxEPD_BLACK);
+            koreanFonts.setForegroundColor(GxEPD_WHITE);
+            koreanFonts.setBackgroundColor(GxEPD_BLACK);
+          } else {
+            koreanFonts.setForegroundColor(GxEPD_BLACK);
+            koreanFonts.setBackgroundColor(GxEPD_WHITE);
+          }
+
+          setKoreanFont();
+          if (i == selectedNetwork) {
+            koreanFonts.setForegroundColor(GxEPD_WHITE);
+            koreanFonts.setBackgroundColor(GxEPD_BLACK);
+          }
+          koreanFonts.drawUTF8(32, y, networks[i].ssid.substring(0, 22).c_str());
+          display.setTextColor(i == selectedNetwork ? GxEPD_WHITE : GxEPD_BLACK);
+          display.setFont(&FreeMono9pt7b);
+          display.setCursor(604, y);
+          display.print(wifiSignalPercentFromRssi(networks[i].rssi));
+          display.print("%");
+          drawWifiSignalIcon(690,
+                             y - 2,
+                             networks[i].rssi,
+                             i == selectedNetwork ? GxEPD_WHITE : GxEPD_BLACK);
+          display.setTextColor(GxEPD_BLACK);
+        }
       }
     } else if (stage == WifiButtonStage::PasswordInput) {
       drawKorean(28, 145, "2. 비밀번호 입력");
       drawKorean(28, 178, "좌/우: 문자 변경    확인: 현재 문자 입력");
       drawKorean(28, 210, "확인을 빠르게 두 번 누르면 저장합니다.");
-      drawKorean(28, 246, String("와이파이: ") + WiFi.SSID(selectedNetwork).substring(0, 28));
+      const String ssid =
+          selectedNetwork >= 0 && selectedNetwork < networkCount ? networks[selectedNetwork].ssid : "";
+      drawKorean(28, 246, String("와이파이: ") + ssid.substring(0, 28));
       drawKorean(28, 280, String("입력값: ") + maskedPassword(password) + " (" +
                           String(password.length()) + "글자)");
       drawKorean(28, 330, String("현재 문자: [ ") + wifiPasswordChoiceLabel(passwordChoiceIndex) +
@@ -724,7 +837,7 @@ static bool connectWifi() {
   return true;
 }
 
-static String wifiSetupPage(int networkCount, bool saved) {
+static String wifiSetupPage(const WifiNetworkEntry *networks, int networkCount, bool saved) {
   String body = F("<!doctype html><html><head><meta charset='utf-8'>"
                   "<meta name='viewport' content='width=device-width,initial-scale=1'>"
                   "<title>전자잉크 와이파이 설정</title>"
@@ -738,9 +851,9 @@ static String wifiSetupPage(int networkCount, bool saved) {
   } else {
     body += F("<p class='note'>2.4GHz 와이파이를 선택하고 비밀번호를 입력하세요. "
               "기기 버튼으로도 입력할 수 있습니다.</p>"
-              "<form method='POST' action='/save'><label>와이파이</label><select name='ssid'>");
+              "<form method='POST' action='/save'><label>와이파이 신호 강한 순서 최대 10개</label><select name='ssid'>");
     for (int i = 0; i < networkCount; i++) {
-      const String ssid = WiFi.SSID(i);
+      const String ssid = networks[i].ssid;
       if (ssid.length() == 0) {
         continue;
       }
@@ -749,8 +862,8 @@ static String wifiSetupPage(int networkCount, bool saved) {
       body += F("\">");
       body += htmlEscape(ssid);
       body += F(" (");
-      body += WiFi.RSSI(i);
-      body += F(" dBm)</option>");
+      body += wifiSignalPercentFromRssi(networks[i].rssi);
+      body += F("%)</option>");
     }
     body += F("</select><label>비밀번호</label><input name='password' type='password' autocomplete='current-password'>"
               "<button type='submit'>저장하고 다시 시작</button></form>"
@@ -774,8 +887,11 @@ static void startWifiSetupPortal() {
   WiFi.softAPConfig(apIP, apIP, netmask);
   WiFi.softAP(apName.c_str());
 
-  const int networkCount = WiFi.scanNetworks();
+  const int scanCount = WiFi.scanNetworks();
+  WifiNetworkEntry wifiNetworks[WIFI_SETUP_MAX_NETWORKS];
+  const int networkCount = buildWifiNetworkList(scanCount, wifiNetworks, WIFI_SETUP_MAX_NETWORKS);
   Serial.printf("Wi-Fi setup AP: %s, open http://192.168.4.1\n", apName.c_str());
+  Serial.printf("Wi-Fi setup networks: scanned=%d, shown=%d\n", scanCount, networkCount);
   setupDisplay();
 
   DNSServer dnsServer;
@@ -792,12 +908,7 @@ static void startWifiSetupPortal() {
   uint32_t lastPasswordConfirmAt = 0;
 
   auto hasVisibleNetwork = [&]() {
-    for (int i = 0; i < networkCount; i++) {
-      if (WiFi.SSID(i).length() > 0) {
-        return true;
-      }
-    }
-    return false;
+    return networkCount > 0;
   };
 
   auto moveNetworkSelection = [&](int delta) {
@@ -805,23 +916,12 @@ static void startWifiSetupPortal() {
       return;
     }
 
-    for (int attempts = 0; attempts < networkCount; attempts++) {
-      selectedNetwork = (selectedNetwork + delta + networkCount) % networkCount;
-      if (WiFi.SSID(selectedNetwork).length() > 0) {
-        return;
-      }
-    }
+    selectedNetwork = (selectedNetwork + delta + networkCount) % networkCount;
   };
-
-  if (hasVisibleNetwork()) {
-    while (selectedNetwork < networkCount && WiFi.SSID(selectedNetwork).length() == 0) {
-      selectedNetwork++;
-    }
-  }
 
   dnsServer.start(53, "*", apIP);
   server.on("/", HTTP_GET, [&]() {
-    server.send(200, "text/html", wifiSetupPage(networkCount, saved));
+    server.send(200, "text/html", wifiSetupPage(wifiNetworks, networkCount, saved));
   });
   server.on("/save", HTTP_POST, [&]() {
     const String ssid = server.arg("ssid");
@@ -833,7 +933,7 @@ static void startWifiSetupPortal() {
 
     saveWifiCredentials(ssid, password);
     saved = true;
-    server.send(200, "text/html", wifiSetupPage(networkCount, true));
+    server.send(200, "text/html", wifiSetupPage(wifiNetworks, networkCount, true));
     Serial.printf("Wi-Fi credentials saved: %s\n", ssid.c_str());
   });
   server.onNotFound([&]() {
@@ -863,6 +963,7 @@ static void startWifiSetupPortal() {
                     partialUiRefresh ? "yes" : "no");
       drawWifiButtonSetup(buttonStage,
                           apName,
+                          wifiNetworks,
                           networkCount,
                           selectedNetwork,
                           buttonPassword,
@@ -875,7 +976,9 @@ static void startWifiSetupPortal() {
     if (buttonPressed(BUTTON_LEFT_PIN)) {
       if (buttonStage == WifiButtonStage::NetworkSelect) {
         moveNetworkSelection(-1);
-        Serial.printf("Wi-Fi setup button network: %s\n", WiFi.SSID(selectedNetwork).c_str());
+        Serial.printf("Wi-Fi setup button network: %s (%ld%%)\n",
+                      wifiNetworks[selectedNetwork].ssid.c_str(),
+                      static_cast<long>(wifiSignalPercentFromRssi(wifiNetworks[selectedNetwork].rssi)));
       } else if (buttonStage == WifiButtonStage::PasswordInput) {
         const int choiceCount = strlen(WIFI_PASSWORD_CHARSET) + 2;
         passwordChoiceIndex = (passwordChoiceIndex + choiceCount - 1) % choiceCount;
@@ -888,7 +991,9 @@ static void startWifiSetupPortal() {
     } else if (buttonPressed(BUTTON_RIGHT_PIN)) {
       if (buttonStage == WifiButtonStage::NetworkSelect) {
         moveNetworkSelection(1);
-        Serial.printf("Wi-Fi setup button network: %s\n", WiFi.SSID(selectedNetwork).c_str());
+        Serial.printf("Wi-Fi setup button network: %s (%ld%%)\n",
+                      wifiNetworks[selectedNetwork].ssid.c_str(),
+                      static_cast<long>(wifiSignalPercentFromRssi(wifiNetworks[selectedNetwork].rssi)));
       } else if (buttonStage == WifiButtonStage::PasswordInput) {
         const int choiceCount = strlen(WIFI_PASSWORD_CHARSET) + 2;
         passwordChoiceIndex = (passwordChoiceIndex + 1) % choiceCount;
@@ -901,14 +1006,14 @@ static void startWifiSetupPortal() {
     } else if (buttonPressed(BUTTON_REFRESH_PIN)) {
       if (buttonStage == WifiButtonStage::NetworkSelect) {
         if (hasVisibleNetwork() && selectedNetwork < networkCount &&
-            WiFi.SSID(selectedNetwork).length() > 0) {
+            wifiNetworks[selectedNetwork].ssid.length() > 0) {
           buttonStage = WifiButtonStage::PasswordInput;
           buttonPassword = "";
           passwordChoiceIndex = 0;
           lastPasswordConfirmIndex = -1;
           lastPasswordConfirmAt = 0;
           Serial.printf("Wi-Fi setup button selected SSID: %s\n",
-                        WiFi.SSID(selectedNetwork).c_str());
+                        wifiNetworks[selectedNetwork].ssid.c_str());
         }
       } else if (buttonStage == WifiButtonStage::PasswordInput) {
         const int charsetLength = strlen(WIFI_PASSWORD_CHARSET);
@@ -920,7 +1025,7 @@ static void startWifiSetupPortal() {
               buttonPassword.length() > 0;
 
           if (doubleConfirm) {
-            const String ssid = WiFi.SSID(selectedNetwork);
+            const String ssid = wifiNetworks[selectedNetwork].ssid;
             if (ssid.length() > 0) {
               saveWifiCredentials(ssid, buttonPassword);
               saved = true;
@@ -957,6 +1062,7 @@ static void startWifiSetupPortal() {
   if (saved) {
     drawWifiButtonSetup(WifiButtonStage::Saved,
                         apName,
+                        wifiNetworks,
                         networkCount,
                         selectedNetwork,
                         buttonPassword,
