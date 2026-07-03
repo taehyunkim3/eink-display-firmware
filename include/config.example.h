@@ -17,7 +17,7 @@
 #define ENABLE_DEEP_SLEEP false
 #define ENABLE_DISPLAY true
 #define FALLBACK_SLEEP_SECONDS 1800
-#define BOOT_TEST_SECONDS 4
+#define BOOT_TEST_SECONDS 0
 #define DEBUG_HEARTBEAT_SECONDS 5
 #define SCREEN_PAGE_COUNT 2
 #define WIFI_SETUP_TIMEOUT_SECONDS 300
@@ -27,9 +27,9 @@
 
 // reTerminal E1001 top buttons from the official schematic.
 #define ENABLE_BUTTONS true
-#define BUTTON_LEFT_PIN 3
+#define BUTTON_LEFT_PIN 5
 #define BUTTON_RIGHT_PIN 4
-#define BUTTON_REFRESH_PIN 5
+#define BUTTON_REFRESH_PIN 3
 #define BUTTON_DEBOUNCE_MS 30
 #define BUTTON_CHORD_GRACE_MS 700
 #define WIFI_SETUP_HOLD_MS 1800

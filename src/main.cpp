@@ -517,8 +517,8 @@ static void drawBootTest() {
     display.drawLine(display.width() - 1, 0, 0, display.height() - 1, GxEPD_BLACK);
     display.setTextColor(GxEPD_BLACK);
     drawKorean(32, 64, "전자잉크 대시보드");
-    drawKorean(32, 104, "화면 시작 테스트");
-    drawKorean(32, 136, "이 문구가 보이면 화면 연결은 정상입니다.");
+    drawKorean(32, 104, "부팅 중입니다.");
+    drawKorean(32, 136, "와이파이 연결과 화면 데이터를 준비합니다.");
   } while (display.nextPage());
 }
 
