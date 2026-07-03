@@ -14,6 +14,7 @@
 #include <Fonts/FreeMono9pt7b.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <GxEPD2_BW.h>
+#include <U8g2_for_Adafruit_GFX.h>
 
 #include "config.h"
 
@@ -61,12 +62,17 @@
 #define WIFI_BUTTON_PASSWORD_MAX_LENGTH 64
 #endif
 
+#ifndef WIFI_BUTTON_SAVE_DOUBLE_PRESS_MS
+#define WIFI_BUTTON_SAVE_DOUBLE_PRESS_MS 900
+#endif
+
 static const char WIFI_PASSWORD_CHARSET[] =
     "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "!@#$%^&*()-_=+[]{}:;,.?/\\|~`'\" ";
 
 GxEPD2_BW<EPD_MODEL, EPD_MODEL::HEIGHT> display(
     EPD_MODEL(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
+U8G2_FOR_ADAFRUIT_GFX koreanFonts;
 
 constexpr int SCREEN_WIDTH = 800;
 constexpr int SCREEN_HEIGHT = 480;
@@ -78,6 +84,7 @@ static bool displayInitialized = false;
 RTC_DATA_ATTR static int screenPage = 0;
 
 static void setupDisplay();
+static void drawKorean(int16_t x, int16_t y, const String &text);
 
 struct DeviceTelemetry {
   String ssid;
@@ -479,12 +486,9 @@ static void drawStatus(const String &title, const String &detail) {
   do {
     display.fillScreen(GxEPD_WHITE);
     display.setTextColor(GxEPD_BLACK);
-    display.setFont(&FreeMonoBold9pt7b);
-    display.setCursor(32, 72);
-    display.print(title);
-    display.setFont(&FreeMono9pt7b);
-    display.setCursor(32, 112);
-    display.print(detail);
+    display.drawRect(10, 10, SCREEN_WIDTH - 20, SCREEN_HEIGHT - 20, GxEPD_BLACK);
+    drawKorean(32, 72, title);
+    drawKorean(32, 116, detail);
   } while (display.nextPage());
 }
 
@@ -499,14 +503,9 @@ static void drawBootTest() {
     display.drawLine(0, 0, display.width() - 1, display.height() - 1, GxEPD_BLACK);
     display.drawLine(display.width() - 1, 0, 0, display.height() - 1, GxEPD_BLACK);
     display.setTextColor(GxEPD_BLACK);
-    display.setFont(&FreeMonoBold9pt7b);
-    display.setCursor(32, 64);
-    display.print("ESP32 e-ink dashboard");
-    display.setFont(&FreeMono9pt7b);
-    display.setCursor(32, 104);
-    display.print("Display boot test");
-    display.setCursor(32, 136);
-    display.print("If this is visible, panel pins work.");
+    drawKorean(32, 64, "전자잉크 대시보드");
+    drawKorean(32, 104, "화면 시작 테스트");
+    drawKorean(32, 136, "이 문구가 보이면 화면 연결은 정상입니다.");
   } while (display.nextPage());
 }
 
@@ -529,17 +528,39 @@ static String wifiPasswordChoiceLabel(int index) {
   if (index < charsetLength) {
     const char c = WIFI_PASSWORD_CHARSET[index];
     if (c == ' ') {
-      return "<SPACE>";
+      return "공백";
     }
     return String(c);
   }
   if (index == charsetLength) {
-    return "<DEL>";
+    return "삭제";
   }
-  if (index == charsetLength + 1) {
-    return "<SAVE>";
-  }
-  return "<EXIT>";
+  return "취소";
+}
+
+static void setKoreanFont() {
+  koreanFonts.setFont(u8g2_font_unifont_t_korean2);
+  koreanFonts.setFontMode(1);
+  koreanFonts.setFontDirection(0);
+  koreanFonts.setForegroundColor(GxEPD_BLACK);
+  koreanFonts.setBackgroundColor(GxEPD_WHITE);
+}
+
+static void drawKorean(int16_t x, int16_t y, const String &text) {
+  setKoreanFont();
+  koreanFonts.drawUTF8(x, y, text.c_str());
+}
+
+static void drawWifiButtonFrame(const String &apName) {
+  display.fillScreen(GxEPD_WHITE);
+  display.drawRect(10, 10, SCREEN_WIDTH - 20, SCREEN_HEIGHT - 20, GxEPD_BLACK);
+  display.drawLine(28, 104, SCREEN_WIDTH - 28, 104, GxEPD_BLACK);
+  display.drawLine(28, SCREEN_HEIGHT - 104, SCREEN_WIDTH - 28, SCREEN_HEIGHT - 104, GxEPD_BLACK);
+
+  drawKorean(28, 48, "와이파이 설정");
+  drawKorean(28, 82, "좌/우 버튼으로 이동하고 확인 버튼으로 선택합니다.");
+  drawKorean(28, SCREEN_HEIGHT - 70, "휴대폰 설정도 가능: 와이파이에서 " + apName + " 연결");
+  drawKorean(28, SCREEN_HEIGHT - 38, "브라우저에서 http://192.168.4.1 을 여세요.");
 }
 
 static void drawWifiButtonSetup(WifiButtonStage stage,
@@ -547,84 +568,53 @@ static void drawWifiButtonSetup(WifiButtonStage stage,
                                 int networkCount,
                                 int selectedNetwork,
                                 const String &password,
-                                int passwordChoiceIndex) {
+                                int passwordChoiceIndex,
+                                bool partialRefresh) {
   if (!ENABLE_DISPLAY) {
     return;
   }
 
   display.setRotation(0);
-  display.setFullWindow();
+  if (partialRefresh) {
+    display.setPartialWindow(12, 108, SCREEN_WIDTH - 24, SCREEN_HEIGHT - 222);
+  } else {
+    display.setFullWindow();
+  }
   display.firstPage();
   do {
-    display.fillScreen(GxEPD_WHITE);
-    display.setTextColor(GxEPD_BLACK);
-    display.setFont(&FreeMonoBold9pt7b);
-    display.setCursor(28, 48);
-    display.print("Wi-Fi setup");
-
-    display.setFont(&FreeMono9pt7b);
-    display.setCursor(28, 86);
-    display.print("Buttons: left/right move, refresh select");
-
-    display.drawLine(28, 104, SCREEN_WIDTH - 28, 104, GxEPD_BLACK);
-
-    if (stage == WifiButtonStage::NetworkSelect) {
-      display.setFont(&FreeMonoBold9pt7b);
-      display.setCursor(28, 148);
-      display.print("1. Choose network");
-
-      display.setFont(&FreeMono9pt7b);
-      if (networkCount <= 0) {
-        display.setCursor(28, 194);
-        display.print("No networks found. Use browser setup below.");
-      } else {
-        display.setCursor(28, 194);
-        display.print(selectedNetwork + 1);
-        display.print(" / ");
-        display.print(networkCount);
-        display.print("  ");
-        display.print(WiFi.SSID(selectedNetwork).substring(0, 32));
-
-        display.setCursor(28, 230);
-        display.print("Signal: ");
-        display.print(WiFi.RSSI(selectedNetwork));
-        display.print(" dBm");
-      }
-    } else if (stage == WifiButtonStage::PasswordInput) {
-      display.setFont(&FreeMonoBold9pt7b);
-      display.setCursor(28, 148);
-      display.print("2. Enter password");
-
-      display.setFont(&FreeMono9pt7b);
-      display.setCursor(28, 188);
-      display.print("SSID: ");
-      display.print(WiFi.SSID(selectedNetwork).substring(0, 30));
-
-      display.setCursor(28, 224);
-      display.print("Password: ");
-      display.print(maskedPassword(password));
-      display.print(" (");
-      display.print(password.length());
-      display.print(")");
-
-      display.setFont(&FreeMonoBold9pt7b);
-      display.setCursor(28, 284);
-      display.print("< ");
-      display.print(wifiPasswordChoiceLabel(passwordChoiceIndex));
-      display.print(" >");
+    if (!partialRefresh) {
+      drawWifiButtonFrame(apName);
     } else {
-      display.setFont(&FreeMonoBold9pt7b);
-      display.setCursor(28, 160);
-      display.print("Saved. Restarting...");
+      display.fillRect(12, 108, SCREEN_WIDTH - 24, SCREEN_HEIGHT - 222, GxEPD_WHITE);
     }
 
-    display.setFont(&FreeMono9pt7b);
-    display.drawLine(28, SCREEN_HEIGHT - 92, SCREEN_WIDTH - 28, SCREEN_HEIGHT - 92, GxEPD_BLACK);
-    display.setCursor(28, SCREEN_HEIGHT - 58);
-    display.print("Browser setup also works: connect ");
-    display.print(apName.substring(0, 24));
-    display.setCursor(28, SCREEN_HEIGHT - 28);
-    display.print("then open http://192.168.4.1");
+    display.setTextColor(GxEPD_BLACK);
+
+    if (stage == WifiButtonStage::NetworkSelect) {
+      drawKorean(28, 145, "1. 와이파이 선택");
+      drawKorean(28, 178, "좌/우: 목록 이동    확인: 선택");
+
+      if (networkCount <= 0 || selectedNetwork < 0 || selectedNetwork >= networkCount ||
+          WiFi.SSID(selectedNetwork).length() == 0) {
+        drawKorean(28, 230, "검색된 와이파이가 없습니다. 아래 휴대폰 설정을 사용하세요.");
+      } else {
+        drawKorean(28, 230, String("현재 선택: ") + WiFi.SSID(selectedNetwork).substring(0, 30));
+        drawKorean(28, 264, String("목록 위치: ") + String(selectedNetwork + 1) + " / " +
+                            String(networkCount));
+        drawKorean(28, 298, String("신호 세기: ") + String(WiFi.RSSI(selectedNetwork)) + " dBm");
+      }
+    } else if (stage == WifiButtonStage::PasswordInput) {
+      drawKorean(28, 145, "2. 비밀번호 입력");
+      drawKorean(28, 178, "좌/우: 문자 변경    확인: 현재 문자 입력");
+      drawKorean(28, 210, "확인을 빠르게 두 번 누르면 저장합니다.");
+      drawKorean(28, 246, String("와이파이: ") + WiFi.SSID(selectedNetwork).substring(0, 28));
+      drawKorean(28, 280, String("입력값: ") + maskedPassword(password) + " (" +
+                          String(password.length()) + "글자)");
+      drawKorean(28, 330, String("현재 문자: [ ") + wifiPasswordChoiceLabel(passwordChoiceIndex) +
+                          " ]");
+    } else {
+      drawKorean(28, 176, "저장했습니다. 기기를 다시 시작합니다.");
+    }
   } while (display.nextPage());
 }
 
@@ -725,18 +715,20 @@ static bool connectWifi() {
 }
 
 static String wifiSetupPage(int networkCount, bool saved) {
-  String body = F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                  "<title>E-ink Wi-Fi Setup</title>"
+  String body = F("<!doctype html><html><head><meta charset='utf-8'>"
+                  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                  "<title>전자잉크 와이파이 설정</title>"
                   "<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;margin:24px;}"
                   "label,input,select,button{display:block;width:100%;box-sizing:border-box;font-size:18px;margin-top:10px;}"
                   "input,select{padding:10px}button{padding:12px;font-weight:700}.note{color:#555}</style>"
-                  "</head><body><h1>E-ink Wi-Fi Setup</h1>");
+                  "</head><body><h1>전자잉크 와이파이 설정</h1>");
 
   if (saved) {
-    body += F("<p>Saved. Device will restart now.</p>");
+    body += F("<p>저장했습니다. 기기를 다시 시작합니다.</p>");
   } else {
-    body += F("<p class='note'>Choose a 2.4GHz Wi-Fi network.</p>"
-              "<form method='POST' action='/save'><label>Network</label><select name='ssid'>");
+    body += F("<p class='note'>2.4GHz 와이파이를 선택하고 비밀번호를 입력하세요. "
+              "기기 버튼으로도 입력할 수 있습니다.</p>"
+              "<form method='POST' action='/save'><label>와이파이</label><select name='ssid'>");
     for (int i = 0; i < networkCount; i++) {
       const String ssid = WiFi.SSID(i);
       if (ssid.length() == 0) {
@@ -750,9 +742,9 @@ static String wifiSetupPage(int networkCount, bool saved) {
       body += WiFi.RSSI(i);
       body += F(" dBm)</option>");
     }
-    body += F("</select><label>Password</label><input name='password' type='password' autocomplete='current-password'>"
-              "<button type='submit'>Save and Restart</button></form>"
-              "<form method='GET' action='/'><button type='submit'>Rescan</button></form>");
+    body += F("</select><label>비밀번호</label><input name='password' type='password' autocomplete='current-password'>"
+              "<button type='submit'>저장하고 다시 시작</button></form>"
+              "<form method='GET' action='/'><button type='submit'>다시 검색</button></form>");
   }
 
   body += F("</body></html>");
@@ -785,6 +777,9 @@ static void startWifiSetupPortal() {
   int selectedNetwork = 0;
   int passwordChoiceIndex = 0;
   bool uiDirty = true;
+  bool partialUiRefresh = false;
+  int lastPasswordConfirmIndex = -1;
+  uint32_t lastPasswordConfirmAt = 0;
 
   auto hasVisibleNetwork = [&]() {
     for (int i = 0; i < networkCount; i++) {
@@ -822,7 +817,7 @@ static void startWifiSetupPortal() {
     const String ssid = server.arg("ssid");
     const String password = server.arg("password");
     if (ssid.length() == 0) {
-      server.send(400, "text/plain", "SSID is required");
+      server.send(400, "text/plain; charset=utf-8", "와이파이를 선택해야 합니다.");
       return;
     }
 
@@ -848,8 +843,10 @@ static void startWifiSetupPortal() {
                           networkCount,
                           selectedNetwork,
                           buttonPassword,
-                          passwordChoiceIndex);
+                          passwordChoiceIndex,
+                          partialUiRefresh);
       uiDirty = false;
+      partialUiRefresh = true;
     }
 
     if (buttonPressed(BUTTON_LEFT_PIN)) {
@@ -857,10 +854,11 @@ static void startWifiSetupPortal() {
         moveNetworkSelection(-1);
         Serial.printf("Wi-Fi setup button network: %s\n", WiFi.SSID(selectedNetwork).c_str());
       } else if (buttonStage == WifiButtonStage::PasswordInput) {
-        const int choiceCount = strlen(WIFI_PASSWORD_CHARSET) + 3;
+        const int choiceCount = strlen(WIFI_PASSWORD_CHARSET) + 2;
         passwordChoiceIndex = (passwordChoiceIndex + choiceCount - 1) % choiceCount;
         Serial.printf("Wi-Fi setup password choice: %s\n",
                       wifiPasswordChoiceLabel(passwordChoiceIndex).c_str());
+        lastPasswordConfirmIndex = -1;
       }
       waitForButtonRelease(BUTTON_LEFT_PIN);
       uiDirty = true;
@@ -869,10 +867,11 @@ static void startWifiSetupPortal() {
         moveNetworkSelection(1);
         Serial.printf("Wi-Fi setup button network: %s\n", WiFi.SSID(selectedNetwork).c_str());
       } else if (buttonStage == WifiButtonStage::PasswordInput) {
-        const int choiceCount = strlen(WIFI_PASSWORD_CHARSET) + 3;
+        const int choiceCount = strlen(WIFI_PASSWORD_CHARSET) + 2;
         passwordChoiceIndex = (passwordChoiceIndex + 1) % choiceCount;
         Serial.printf("Wi-Fi setup password choice: %s\n",
                       wifiPasswordChoiceLabel(passwordChoiceIndex).c_str());
+        lastPasswordConfirmIndex = -1;
       }
       waitForButtonRelease(BUTTON_RIGHT_PIN);
       uiDirty = true;
@@ -883,27 +882,38 @@ static void startWifiSetupPortal() {
           buttonStage = WifiButtonStage::PasswordInput;
           buttonPassword = "";
           passwordChoiceIndex = 0;
+          lastPasswordConfirmIndex = -1;
+          lastPasswordConfirmAt = 0;
           Serial.printf("Wi-Fi setup button selected SSID: %s\n",
                         WiFi.SSID(selectedNetwork).c_str());
         }
       } else if (buttonStage == WifiButtonStage::PasswordInput) {
         const int charsetLength = strlen(WIFI_PASSWORD_CHARSET);
         if (passwordChoiceIndex < charsetLength) {
-          if (buttonPassword.length() < WIFI_BUTTON_PASSWORD_MAX_LENGTH) {
+          const uint32_t now = millis();
+          const bool doubleConfirm =
+              lastPasswordConfirmIndex == passwordChoiceIndex &&
+              now - lastPasswordConfirmAt <= WIFI_BUTTON_SAVE_DOUBLE_PRESS_MS &&
+              buttonPassword.length() > 0;
+
+          if (doubleConfirm) {
+            const String ssid = WiFi.SSID(selectedNetwork);
+            if (ssid.length() > 0) {
+              saveWifiCredentials(ssid, buttonPassword);
+              saved = true;
+              buttonStage = WifiButtonStage::Saved;
+              Serial.printf("Wi-Fi credentials saved from buttons: %s\n", ssid.c_str());
+            }
+          } else if (buttonPassword.length() < WIFI_BUTTON_PASSWORD_MAX_LENGTH) {
             buttonPassword += WIFI_PASSWORD_CHARSET[passwordChoiceIndex];
+            lastPasswordConfirmIndex = passwordChoiceIndex;
+            lastPasswordConfirmAt = now;
           }
         } else if (passwordChoiceIndex == charsetLength) {
           if (buttonPassword.length() > 0) {
             buttonPassword.remove(buttonPassword.length() - 1);
           }
-        } else if (passwordChoiceIndex == charsetLength + 1) {
-          const String ssid = WiFi.SSID(selectedNetwork);
-          if (ssid.length() > 0) {
-            saveWifiCredentials(ssid, buttonPassword);
-            saved = true;
-            buttonStage = WifiButtonStage::Saved;
-            Serial.printf("Wi-Fi credentials saved from buttons: %s\n", ssid.c_str());
-          }
+          lastPasswordConfirmIndex = -1;
         } else {
           exitRequested = true;
           Serial.println("Wi-Fi setup button exit");
@@ -927,7 +937,8 @@ static void startWifiSetupPortal() {
                         networkCount,
                         selectedNetwork,
                         buttonPassword,
-                        passwordChoiceIndex);
+                        passwordChoiceIndex,
+                        false);
     delay(800);
     ESP.restart();
   }
@@ -935,14 +946,14 @@ static void startWifiSetupPortal() {
   if (exitRequested) {
     Serial.println("Wi-Fi setup exited by button");
     if (ENABLE_DISPLAY) {
-      drawStatus("Wi-Fi setup", "Canceled; returning to dashboard");
+      drawStatus("와이파이 설정", "취소했습니다. 대시보드로 돌아갑니다.");
     }
     return;
   }
 
   Serial.println("Wi-Fi setup timed out");
   if (ENABLE_DISPLAY) {
-    drawStatus("Wi-Fi setup", "Timed out; returning to dashboard");
+    drawStatus("와이파이 설정", "시간이 초과되었습니다. 대시보드로 돌아갑니다.");
   }
 }
 
@@ -1051,6 +1062,11 @@ static void setupDisplay() {
     SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
     Serial.println("Initializing e-paper display");
     display.init(115200, true, 2, false);
+    koreanFonts.begin(display);
+    koreanFonts.setFontMode(1);
+    koreanFonts.setFontDirection(0);
+    koreanFonts.setForegroundColor(GxEPD_BLACK);
+    koreanFonts.setBackgroundColor(GxEPD_WHITE);
     Serial.println("Drawing boot test screen");
     drawBootTest();
     delay(BOOT_TEST_SECONDS * 1000UL);
@@ -1070,7 +1086,7 @@ static bool refreshScreen(bool forceServerRefresh = false) {
     if (!ENABLE_DISPLAY) {
       return false;
     }
-    drawStatus("Wi-Fi failed", "Check WIFI_SSID / WIFI_PASSWORD");
+    drawStatus("와이파이 연결 실패", "와이파이 이름과 비밀번호를 확인하세요.");
     return false;
   }
 
@@ -1095,7 +1111,7 @@ static bool refreshScreen(bool forceServerRefresh = false) {
     if (!ENABLE_DISPLAY) {
       return false;
     }
-    drawStatus("Fetch failed", "Check endpoint, token, and Vercel logs");
+    drawStatus("화면 가져오기 실패", "서버 주소, 토큰, Vercel 로그를 확인하세요.");
     return false;
   }
   deviceState = "bitmap-received";
@@ -1107,7 +1123,7 @@ static bool refreshScreen(bool forceServerRefresh = false) {
 
   if (!renderBitmap(bitmapBuffer.get(), bitmapSize)) {
     deviceState = "render-failed";
-    drawStatus("Render failed", "Check bitmap endpoint and size");
+    drawStatus("화면 표시 실패", "비트맵 주소와 크기를 확인하세요.");
     return false;
   }
 
