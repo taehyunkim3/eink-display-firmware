@@ -1,0 +1,91 @@
+# ESP32 E-ink Firmware
+
+PlatformIO 기반 ESP32 펌웨어입니다. `eink-frontend`의 `/api/screen.png`를 받아 800 x 480 e-ink 화면에 출력합니다.
+
+## 1. 설정
+
+```bash
+cd /Users/user/Documents/GithubFolder/PERSONAL/eink/eink-firmware
+cp include/config.example.h include/config.h
+```
+
+`include/config.h`에서 아래 값을 채웁니다.
+
+```cpp
+#define WIFI_SSID "..."
+#define WIFI_PASSWORD "..."
+#define DEVICE_ENDPOINT "https://your-app.vercel.app/api/screen.png"
+#define DEVICE_AUTH_TOKEN "eink-frontend의 DEVICE_AUTH_TOKEN과 같은 값"
+```
+
+로컬 Next.js 서버로 테스트할 때는 `localhost`가 아니라 Mac의 같은 Wi-Fi LAN IP를 써야 합니다.
+
+```cpp
+#define DEVICE_ENDPOINT "http://192.168.0.10:3000/api/screen.png"
+```
+
+## 2. 보드 연결 확인
+
+현재 Mac에서는 보드가 아래 포트로 보였습니다.
+
+```bash
+/dev/cu.usbserial-110
+```
+
+포트가 달라지면 `platformio.ini`의 `upload_port`, `monitor_port`를 바꿉니다.
+
+## 3. 업로드
+
+PlatformIO가 없다면 둘 중 하나로 설치합니다.
+
+```bash
+python3 -m pip install --user platformio
+```
+
+또는 VS Code에서 `PlatformIO IDE` 확장을 설치해도 됩니다.
+
+CLI 업로드:
+
+```bash
+pio run -t upload
+pio device monitor
+```
+
+현재 Mac에서는 `pio`가 `/Users/user/Library/Python/3.9/bin/pio`에 설치됐습니다. PATH에 없으면 아래처럼 실행합니다.
+
+```bash
+/Users/user/Library/Python/3.9/bin/pio run -t upload
+/Users/user/Library/Python/3.9/bin/pio device monitor
+```
+
+VS Code에서는 PlatformIO 탭에서 `Upload`, `Monitor`를 실행합니다.
+
+## 4. 첫 테스트 순서
+
+1. `eink-frontend`를 Vercel에 배포하거나 로컬에서 `npm run dev`로 실행합니다.
+2. `curl`로 PNG API가 200을 주는지 확인합니다.
+   ```bash
+   curl -H "Authorization: Bearer <token>" -I https://your-app.vercel.app/api/screen.png
+   ```
+3. `include/config.h`에 같은 URL과 토큰을 넣습니다.
+4. USB로 보드를 연결하고 업로드합니다.
+5. Serial Monitor에서 `HTTP failed`, `PNG decode failed`, `Render failed` 중 어디서 막히는지 확인합니다.
+
+## 5. 화면이 안 나오면 먼저 볼 것
+
+- `EPD_MODEL`: 기본값은 `GxEPD2_750_GDEY075T7`입니다. 컴파일 오류가 나면 `GxEPD2_750_T7`을 시도합니다.
+- `EPD_*` 핀: 제품 위키/회로도와 다르면 `include/config.h`에서 바꿉니다.
+- `DEVICE_ENDPOINT`: ESP32에서 접근 가능한 URL이어야 합니다. 로컬 테스트의 `localhost`는 ESP32 자기 자신을 의미하므로 안 됩니다.
+- `DEVICE_AUTH_TOKEN`: `eink-frontend`의 `DEVICE_AUTH_TOKEN`과 정확히 같아야 합니다.
+- PNG 크기: Serial Monitor에 찍히는 `PNG content length`가 `MAX_IMAGE_BYTES`보다 크면 값을 조금 올립니다.
+
+## 6. 절전
+
+첫 업로드 때는 `ENABLE_DEEP_SLEEP false`가 편합니다. 화면 갱신이 확인되면 아래처럼 바꿉니다.
+
+```cpp
+#define ENABLE_DEEP_SLEEP true
+#define FALLBACK_SLEEP_SECONDS 1800
+```
+
+e-ink는 10분에서 1시간 주기 갱신이 적당합니다.
