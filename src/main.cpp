@@ -23,7 +23,7 @@
 #endif
 
 #ifndef BUTTON_CHORD_GRACE_MS
-#define BUTTON_CHORD_GRACE_MS 700
+#define BUTTON_CHORD_GRACE_MS 150
 #endif
 
 #ifndef WIFI_SETUP_HOLD_MS
