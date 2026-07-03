@@ -19,8 +19,12 @@
 #define FALLBACK_SLEEP_SECONDS 1800
 #define BOOT_TEST_SECONDS 0
 #define DEBUG_HEARTBEAT_SECONDS 5
-#define SCREEN_PAGE_COUNT 5
+#define SCREEN_PAGE_COUNT 6
+// Device setting defaults. Users can change these from the on-device settings
+// menu; saved values are stored in ESP32 Preferences.
 #define PAGE_FULL_REFRESH_INTERVAL 5
+#define SETTINGS_REFRESH_SECONDS_MIN 300
+#define SETTINGS_REFRESH_SECONDS_MAX 7200
 #define WIFI_SETUP_TIMEOUT_SECONDS 300
 #define WIFI_SETUP_MAX_NETWORKS 10
 #define WIFI_BUTTON_PASSWORD_MAX_LENGTH 64

@@ -82,6 +82,14 @@
 #define PAGE_FULL_REFRESH_INTERVAL 5
 #endif
 
+#ifndef SETTINGS_REFRESH_SECONDS_MIN
+#define SETTINGS_REFRESH_SECONDS_MIN 300
+#endif
+
+#ifndef SETTINGS_REFRESH_SECONDS_MAX
+#define SETTINGS_REFRESH_SECONDS_MAX 7200
+#endif
+
 static const char WIFI_PASSWORD_CHARSET[] =
     "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "!@#$%^&*()-_=+[]{}:;,.?/\\|~`'\" ";
@@ -109,6 +117,11 @@ struct DeviceTelemetry {
   int32_t batteryPercent;
   float batteryVoltage;
   String batteryChargeState;
+};
+
+struct DeviceSettings {
+  uint32_t fullRefreshInterval;
+  uint32_t refreshSeconds;
 };
 
 class MemoryWriteStream : public Stream {
@@ -224,6 +237,49 @@ static void saveWifiCredentials(const String &ssid, const String &password) {
   preferences.begin("wifi", false);
   preferences.putString("ssid", ssid);
   preferences.putString("password", password);
+  preferences.end();
+}
+
+static uint32_t clampSetting(uint32_t value, uint32_t minimum, uint32_t maximum) {
+  if (value < minimum) {
+    return minimum;
+  }
+  if (value > maximum) {
+    return maximum;
+  }
+  return value;
+}
+
+static DeviceSettings defaultDeviceSettings() {
+  return {
+      clampSetting(PAGE_FULL_REFRESH_INTERVAL, 1, 20),
+      clampSetting(FALLBACK_SLEEP_SECONDS, SETTINGS_REFRESH_SECONDS_MIN, SETTINGS_REFRESH_SECONDS_MAX),
+  };
+}
+
+static DeviceSettings loadDeviceSettings() {
+  const DeviceSettings defaults = defaultDeviceSettings();
+  Preferences preferences;
+  preferences.begin("settings", false);
+  const uint32_t fullRefreshInterval =
+      preferences.getUInt("fullEvery", defaults.fullRefreshInterval);
+  const uint32_t refreshSeconds = preferences.getUInt("refreshSec", defaults.refreshSeconds);
+  preferences.end();
+
+  return {
+      clampSetting(fullRefreshInterval, 1, 20),
+      clampSetting(refreshSeconds, SETTINGS_REFRESH_SECONDS_MIN, SETTINGS_REFRESH_SECONDS_MAX),
+  };
+}
+
+static void saveDeviceSettings(const DeviceSettings &settings) {
+  Preferences preferences;
+  preferences.begin("settings", false);
+  preferences.putUInt("fullEvery", clampSetting(settings.fullRefreshInterval, 1, 20));
+  preferences.putUInt("refreshSec",
+                      clampSetting(settings.refreshSeconds,
+                                   SETTINGS_REFRESH_SECONDS_MIN,
+                                   SETTINGS_REFRESH_SECONDS_MAX));
   preferences.end();
 }
 
@@ -511,9 +567,13 @@ static void setupButtons() {
   buttonManager.begin();
 }
 
-static void drawStatus(const String &title, const String &detail) {
+static void drawStatus(const String &title, const String &detail, bool partialRefresh = false) {
   display.setRotation(0);
-  display.setFullWindow();
+  if (partialRefresh) {
+    display.setPartialWindow(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+  } else {
+    display.setFullWindow();
+  }
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
@@ -541,9 +601,11 @@ static void drawBootTest() {
   } while (display.nextPage());
 }
 
-enum class WifiButtonStage {
+enum class SettingsStage {
+  Menu,
   NetworkSelect,
   PasswordInput,
+  DisplaySettings,
   Saved,
 };
 
@@ -642,6 +704,42 @@ static String wifiPasswordChoiceLabel(int index) {
   return "취소";
 }
 
+static const uint32_t FULL_REFRESH_OPTIONS[] = {1, 3, 5, 10, 20};
+static const uint32_t WEB_REFRESH_OPTIONS[] = {300, 600, 1800, 3600, 7200};
+
+static uint8_t optionIndexForValue(const uint32_t *options,
+                                   uint8_t optionCount,
+                                   uint32_t value,
+                                   uint8_t fallbackIndex) {
+  for (uint8_t i = 0; i < optionCount; i++) {
+    if (options[i] == value) {
+      return i;
+    }
+  }
+  return fallbackIndex < optionCount ? fallbackIndex : 0;
+}
+
+static String refreshSecondsLabel(uint32_t seconds) {
+  if (seconds < 60) {
+    return String(seconds) + "초";
+  }
+
+  const uint32_t minutes = seconds / 60;
+  if (minutes < 60) {
+    return String(minutes) + "분";
+  }
+
+  const uint32_t hours = minutes / 60;
+  return String(hours) + "시간";
+}
+
+static String fullRefreshIntervalLabel(uint32_t interval) {
+  if (interval <= 1) {
+    return "항상 전체";
+  }
+  return String(interval) + "번 전환마다";
+}
+
 static void setKoreanFont() {
   koreanFonts.setFont(u8g2_font_unifont_t_korean2);
   koreanFonts.setFontMode(1);
@@ -655,48 +753,74 @@ static void drawKorean(int16_t x, int16_t y, const String &text) {
   koreanFonts.drawUTF8(x, y, text.c_str());
 }
 
-static void drawWifiButtonFrame(const String &apName) {
+static void drawSettingsFrame(const String &apName) {
   display.fillScreen(GxEPD_WHITE);
   display.drawRect(10, 10, SCREEN_WIDTH - 20, SCREEN_HEIGHT - 20, GxEPD_BLACK);
   display.drawLine(28, 104, SCREEN_WIDTH - 28, 104, GxEPD_BLACK);
   display.drawLine(28, SCREEN_HEIGHT - 104, SCREEN_WIDTH - 28, SCREEN_HEIGHT - 104, GxEPD_BLACK);
 
-  drawKorean(28, 48, "와이파이 설정");
+  drawKorean(28, 48, "기기 설정");
   drawKorean(28, 82, "좌/우 버튼으로 이동하고 확인 버튼으로 선택합니다.");
   drawKorean(28, SCREEN_HEIGHT - 86, "취소: 상단 버튼 2개를 길게 누르세요.");
   drawKorean(28, SCREEN_HEIGHT - 58, "휴대폰 설정도 가능: 와이파이에서 " + apName + " 연결");
   drawKorean(28, SCREEN_HEIGHT - 30, "브라우저에서 http://192.168.4.1 을 여세요.");
 }
 
-static void drawWifiButtonSetup(WifiButtonStage stage,
-                                const String &apName,
-                                const WifiNetworkEntry *networks,
-                                int networkCount,
-                                int selectedNetwork,
-                                const String &password,
-                                int passwordChoiceIndex,
-                                bool partialRefresh) {
+static void drawSelectionRow(int16_t x,
+                             int16_t y,
+                             int16_t width,
+                             const String &text,
+                             bool selected) {
+  if (selected) {
+    display.fillRect(x - 6, y - 20, width, 26, GxEPD_BLACK);
+    koreanFonts.setForegroundColor(GxEPD_WHITE);
+    koreanFonts.setBackgroundColor(GxEPD_BLACK);
+  } else {
+    koreanFonts.setForegroundColor(GxEPD_BLACK);
+    koreanFonts.setBackgroundColor(GxEPD_WHITE);
+  }
+  setKoreanFont();
+  if (selected) {
+    koreanFonts.setForegroundColor(GxEPD_WHITE);
+    koreanFonts.setBackgroundColor(GxEPD_BLACK);
+  }
+  koreanFonts.drawUTF8(x, y, text.c_str());
+  koreanFonts.setForegroundColor(GxEPD_BLACK);
+  koreanFonts.setBackgroundColor(GxEPD_WHITE);
+}
+
+static void drawSettingsScreen(SettingsStage stage,
+                               const String &apName,
+                               const WifiNetworkEntry *networks,
+                               int networkCount,
+                               int selectedNetwork,
+                               const String &password,
+                               int passwordChoiceIndex,
+                               int menuSelection,
+                               const DeviceSettings &settings,
+                               int displaySelection,
+                               bool partialRefresh) {
   if (!ENABLE_DISPLAY) {
     return;
   }
 
   display.setRotation(0);
   if (partialRefresh) {
-    display.setPartialWindow(12, 108, SCREEN_WIDTH - 24, SCREEN_HEIGHT - 222);
+    display.setPartialWindow(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
   } else {
     display.setFullWindow();
   }
   display.firstPage();
   do {
-    if (!partialRefresh) {
-      drawWifiButtonFrame(apName);
-    } else {
-      display.fillRect(12, 108, SCREEN_WIDTH - 24, SCREEN_HEIGHT - 222, GxEPD_WHITE);
-    }
-
+    drawSettingsFrame(apName);
     display.setTextColor(GxEPD_BLACK);
 
-    if (stage == WifiButtonStage::NetworkSelect) {
+    if (stage == SettingsStage::Menu) {
+      drawKorean(28, 145, "설정 메뉴");
+      drawKorean(28, 174, "좌/우: 메뉴 이동    확인: 들어가기");
+      drawSelectionRow(46, 232, SCREEN_WIDTH - 92, "와이파이 설정", menuSelection == 0);
+      drawSelectionRow(46, 282, SCREEN_WIDTH - 92, "화면 설정", menuSelection == 1);
+    } else if (stage == SettingsStage::NetworkSelect) {
       drawKorean(28, 145, "1. 와이파이 선택");
       drawKorean(28, 174, "좌/우: 목록 이동    확인: 선택");
 
@@ -735,7 +859,7 @@ static void drawWifiButtonSetup(WifiButtonStage stage,
           display.setTextColor(GxEPD_BLACK);
         }
       }
-    } else if (stage == WifiButtonStage::PasswordInput) {
+    } else if (stage == SettingsStage::PasswordInput) {
       drawKorean(28, 145, "2. 비밀번호 입력");
       drawKorean(28, 178, "좌/우: 문자 변경    확인: 현재 문자 입력");
       drawKorean(28, 210, "확인을 빠르게 두 번 누르면 저장합니다.");
@@ -746,6 +870,21 @@ static void drawWifiButtonSetup(WifiButtonStage stage,
                           String(password.length()) + "글자)");
       drawKorean(28, 330, String("현재 문자: [ ") + wifiPasswordChoiceLabel(passwordChoiceIndex) +
                           " ]");
+    } else if (stage == SettingsStage::DisplaySettings) {
+      drawKorean(28, 145, "화면 설정");
+      drawKorean(28, 174, "좌/우: 항목 이동    확인: 값 변경/저장");
+      drawSelectionRow(46,
+                       226,
+                       SCREEN_WIDTH - 92,
+                       String("전체 refresh: ") +
+                           fullRefreshIntervalLabel(settings.fullRefreshInterval),
+                       displaySelection == 0);
+      drawSelectionRow(46,
+                       276,
+                       SCREEN_WIDTH - 92,
+                       String("웹 데이터 갱신: ") + refreshSecondsLabel(settings.refreshSeconds),
+                       displaySelection == 1);
+      drawSelectionRow(46, 326, SCREEN_WIDTH - 92, "저장하고 나가기", displaySelection == 2);
     } else {
       drawKorean(28, 176, "저장했습니다. 기기를 다시 시작합니다.");
     }
@@ -759,14 +898,15 @@ enum class WaitAction {
   WifiSetup,
 };
 
-static bool shouldUsePartialRefreshForPageTransition() {
-  if (PAGE_FULL_REFRESH_INTERVAL <= 1) {
+static bool shouldUsePartialRefreshForScreenTransition() {
+  const DeviceSettings settings = loadDeviceSettings();
+  if (settings.fullRefreshInterval <= 1) {
     pageTransitionRefreshCount = 0;
     return false;
   }
 
   pageTransitionRefreshCount++;
-  if (pageTransitionRefreshCount >= PAGE_FULL_REFRESH_INTERVAL) {
+  if (pageTransitionRefreshCount >= settings.fullRefreshInterval) {
     pageTransitionRefreshCount = 0;
     return false;
   }
@@ -799,7 +939,7 @@ static WaitAction sleepOrWait(uint32_t seconds) {
         Serial.println("Button: refresh");
         return WaitAction::ForceRefresh;
       } else if (buttonEvent == ButtonEvent::LeftRightHold) {
-        Serial.println("Button: Wi-Fi setup chord hold");
+        Serial.println("Button: settings chord hold");
         buttonManager.waitForAllReleased();
         return WaitAction::WifiSetup;
       } else if (buttonEvent == ButtonEvent::LeftClick) {
@@ -882,8 +1022,8 @@ static String wifiSetupPage(const WifiNetworkEntry *networks, int networkCount, 
   return body;
 }
 
-static void startWifiSetupPortal() {
-  deviceState = "wifi-setup";
+static void startSettingsPortal() {
+  deviceState = "settings";
   lastErrorCode = 0;
 
   const String suffix = WiFi.macAddress().substring(12);
@@ -898,20 +1038,33 @@ static void startWifiSetupPortal() {
   const int scanCount = WiFi.scanNetworks();
   WifiNetworkEntry wifiNetworks[WIFI_SETUP_MAX_NETWORKS];
   const int networkCount = buildWifiNetworkList(scanCount, wifiNetworks, WIFI_SETUP_MAX_NETWORKS);
-  Serial.printf("Wi-Fi setup AP: %s, open http://192.168.4.1\n", apName.c_str());
+  Serial.printf("Settings AP: %s, open http://192.168.4.1\n", apName.c_str());
   Serial.printf("Wi-Fi setup networks: scanned=%d, shown=%d\n", scanCount, networkCount);
   setupDisplay();
 
   DNSServer dnsServer;
   WebServer server(80);
-  bool saved = false;
+  bool wifiSaved = false;
+  bool displaySettingsSaved = false;
   bool exitRequested = false;
-  WifiButtonStage buttonStage = WifiButtonStage::NetworkSelect;
+  SettingsStage buttonStage = SettingsStage::Menu;
   String buttonPassword;
+  DeviceSettings displaySettings = loadDeviceSettings();
   int selectedNetwork = 0;
+  int menuSelection = 0;
+  int displaySelection = 0;
+  uint8_t fullRefreshOptionIndex =
+      optionIndexForValue(FULL_REFRESH_OPTIONS,
+                          sizeof(FULL_REFRESH_OPTIONS) / sizeof(FULL_REFRESH_OPTIONS[0]),
+                          displaySettings.fullRefreshInterval,
+                          2);
+  uint8_t webRefreshOptionIndex =
+      optionIndexForValue(WEB_REFRESH_OPTIONS,
+                          sizeof(WEB_REFRESH_OPTIONS) / sizeof(WEB_REFRESH_OPTIONS[0]),
+                          displaySettings.refreshSeconds,
+                          2);
   int passwordChoiceIndex = 0;
   bool uiDirty = true;
-  bool partialUiRefresh = false;
   int lastPasswordConfirmIndex = -1;
   uint32_t lastPasswordConfirmAt = 0;
 
@@ -929,7 +1082,7 @@ static void startWifiSetupPortal() {
 
   dnsServer.start(53, "*", apIP);
   server.on("/", HTTP_GET, [&]() {
-    server.send(200, "text/html", wifiSetupPage(wifiNetworks, networkCount, saved));
+    server.send(200, "text/html", wifiSetupPage(wifiNetworks, networkCount, wifiSaved));
   });
   server.on("/save", HTTP_POST, [&]() {
     const String ssid = server.arg("ssid");
@@ -940,7 +1093,7 @@ static void startWifiSetupPortal() {
     }
 
     saveWifiCredentials(ssid, password);
-    saved = true;
+    wifiSaved = true;
     server.send(200, "text/html", wifiSetupPage(wifiNetworks, networkCount, true));
     Serial.printf("Wi-Fi credentials saved: %s\n", ssid.c_str());
   });
@@ -952,67 +1105,94 @@ static void startWifiSetupPortal() {
 
   buttonManager.reset();
   const uint32_t startedAt = millis();
-  while (!saved && !exitRequested && millis() - startedAt < WIFI_SETUP_TIMEOUT_SECONDS * 1000UL) {
+  while (!wifiSaved && !exitRequested && millis() - startedAt < WIFI_SETUP_TIMEOUT_SECONDS * 1000UL) {
     dnsServer.processNextRequest();
     server.handleClient();
 
     const ButtonEvent buttonEvent = buttonManager.update();
     if (buttonEvent == ButtonEvent::LeftRightHold) {
       exitRequested = true;
-      Serial.println("Wi-Fi setup canceled by left+right hold");
+      Serial.println("Settings canceled by left+right hold");
       buttonManager.waitForAllReleased();
       continue;
     }
 
     if (uiDirty) {
-      Serial.printf("Wi-Fi setup UI redraw: stage=%d, partial=%s\n",
+      const bool partialUiRefresh = shouldUsePartialRefreshForScreenTransition();
+      Serial.printf("Settings UI redraw: stage=%d, partial=%s\n",
                     static_cast<int>(buttonStage),
                     partialUiRefresh ? "yes" : "no");
-      drawWifiButtonSetup(buttonStage,
-                          apName,
-                          wifiNetworks,
-                          networkCount,
-                          selectedNetwork,
-                          buttonPassword,
-                          passwordChoiceIndex,
-                          partialUiRefresh);
+      drawSettingsScreen(buttonStage,
+                         apName,
+                         wifiNetworks,
+                         networkCount,
+                         selectedNetwork,
+                         buttonPassword,
+                         passwordChoiceIndex,
+                         menuSelection,
+                         displaySettings,
+                         displaySelection,
+                         partialUiRefresh);
       uiDirty = false;
-      partialUiRefresh = true;
     }
 
     if (buttonEvent == ButtonEvent::LeftClick) {
-      if (buttonStage == WifiButtonStage::NetworkSelect) {
+      if (buttonStage == SettingsStage::Menu) {
+        menuSelection = (menuSelection + 1) % 2;
+        Serial.printf("Settings menu selection: %d\n", menuSelection);
+      } else if (buttonStage == SettingsStage::NetworkSelect) {
         moveNetworkSelection(-1);
-        Serial.printf("Wi-Fi setup button network: %s (%ld%%)\n",
-                      wifiNetworks[selectedNetwork].ssid.c_str(),
-                      static_cast<long>(wifiSignalPercentFromRssi(wifiNetworks[selectedNetwork].rssi)));
-      } else if (buttonStage == WifiButtonStage::PasswordInput) {
+        if (hasVisibleNetwork()) {
+          Serial.printf("Wi-Fi setup button network: %s (%ld%%)\n",
+                        wifiNetworks[selectedNetwork].ssid.c_str(),
+                        static_cast<long>(wifiSignalPercentFromRssi(wifiNetworks[selectedNetwork].rssi)));
+        }
+      } else if (buttonStage == SettingsStage::PasswordInput) {
         const int choiceCount = strlen(WIFI_PASSWORD_CHARSET) + 2;
         passwordChoiceIndex = (passwordChoiceIndex + choiceCount - 1) % choiceCount;
         Serial.printf("Wi-Fi setup password choice: %s\n",
                       wifiPasswordChoiceLabel(passwordChoiceIndex).c_str());
         lastPasswordConfirmIndex = -1;
+      } else if (buttonStage == SettingsStage::DisplaySettings) {
+        displaySelection = (displaySelection + 2) % 3;
+        Serial.printf("Display setting selection: %d\n", displaySelection);
       }
       uiDirty = true;
     } else if (buttonEvent == ButtonEvent::RightClick) {
-      if (buttonStage == WifiButtonStage::NetworkSelect) {
+      if (buttonStage == SettingsStage::Menu) {
+        menuSelection = (menuSelection + 1) % 2;
+        Serial.printf("Settings menu selection: %d\n", menuSelection);
+      } else if (buttonStage == SettingsStage::NetworkSelect) {
         moveNetworkSelection(1);
-        Serial.printf("Wi-Fi setup button network: %s (%ld%%)\n",
-                      wifiNetworks[selectedNetwork].ssid.c_str(),
-                      static_cast<long>(wifiSignalPercentFromRssi(wifiNetworks[selectedNetwork].rssi)));
-      } else if (buttonStage == WifiButtonStage::PasswordInput) {
+        if (hasVisibleNetwork()) {
+          Serial.printf("Wi-Fi setup button network: %s (%ld%%)\n",
+                        wifiNetworks[selectedNetwork].ssid.c_str(),
+                        static_cast<long>(wifiSignalPercentFromRssi(wifiNetworks[selectedNetwork].rssi)));
+        }
+      } else if (buttonStage == SettingsStage::PasswordInput) {
         const int choiceCount = strlen(WIFI_PASSWORD_CHARSET) + 2;
         passwordChoiceIndex = (passwordChoiceIndex + 1) % choiceCount;
         Serial.printf("Wi-Fi setup password choice: %s\n",
                       wifiPasswordChoiceLabel(passwordChoiceIndex).c_str());
         lastPasswordConfirmIndex = -1;
+      } else if (buttonStage == SettingsStage::DisplaySettings) {
+        displaySelection = (displaySelection + 1) % 3;
+        Serial.printf("Display setting selection: %d\n", displaySelection);
       }
       uiDirty = true;
     } else if (buttonEvent == ButtonEvent::RefreshClick) {
-      if (buttonStage == WifiButtonStage::NetworkSelect) {
+      if (buttonStage == SettingsStage::Menu) {
+        if (menuSelection == 0) {
+          buttonStage = SettingsStage::NetworkSelect;
+          Serial.println("Settings menu: Wi-Fi setup");
+        } else {
+          buttonStage = SettingsStage::DisplaySettings;
+          Serial.println("Settings menu: display settings");
+        }
+      } else if (buttonStage == SettingsStage::NetworkSelect) {
         if (hasVisibleNetwork() && selectedNetwork < networkCount &&
             wifiNetworks[selectedNetwork].ssid.length() > 0) {
-          buttonStage = WifiButtonStage::PasswordInput;
+          buttonStage = SettingsStage::PasswordInput;
           buttonPassword = "";
           passwordChoiceIndex = 0;
           lastPasswordConfirmIndex = -1;
@@ -1020,7 +1200,7 @@ static void startWifiSetupPortal() {
           Serial.printf("Wi-Fi setup button selected SSID: %s\n",
                         wifiNetworks[selectedNetwork].ssid.c_str());
         }
-      } else if (buttonStage == WifiButtonStage::PasswordInput) {
+      } else if (buttonStage == SettingsStage::PasswordInput) {
         const int charsetLength = strlen(WIFI_PASSWORD_CHARSET);
         if (passwordChoiceIndex < charsetLength) {
           const uint32_t now = millis();
@@ -1033,8 +1213,8 @@ static void startWifiSetupPortal() {
             const String ssid = wifiNetworks[selectedNetwork].ssid;
             if (ssid.length() > 0) {
               saveWifiCredentials(ssid, buttonPassword);
-              saved = true;
-              buttonStage = WifiButtonStage::Saved;
+              wifiSaved = true;
+              buttonStage = SettingsStage::Saved;
               Serial.printf("Wi-Fi credentials saved from buttons: %s\n", ssid.c_str());
             }
           } else if (buttonPassword.length() < WIFI_BUTTON_PASSWORD_MAX_LENGTH) {
@@ -1051,6 +1231,29 @@ static void startWifiSetupPortal() {
           exitRequested = true;
           Serial.println("Wi-Fi setup button exit");
         }
+      } else if (buttonStage == SettingsStage::DisplaySettings) {
+        if (displaySelection == 0) {
+          fullRefreshOptionIndex =
+              (fullRefreshOptionIndex + 1) %
+              (sizeof(FULL_REFRESH_OPTIONS) / sizeof(FULL_REFRESH_OPTIONS[0]));
+          displaySettings.fullRefreshInterval = FULL_REFRESH_OPTIONS[fullRefreshOptionIndex];
+          pageTransitionRefreshCount = 0;
+          Serial.printf("Display setting full refresh interval: %lu\n",
+                        static_cast<unsigned long>(displaySettings.fullRefreshInterval));
+        } else if (displaySelection == 1) {
+          webRefreshOptionIndex =
+              (webRefreshOptionIndex + 1) %
+              (sizeof(WEB_REFRESH_OPTIONS) / sizeof(WEB_REFRESH_OPTIONS[0]));
+          displaySettings.refreshSeconds = WEB_REFRESH_OPTIONS[webRefreshOptionIndex];
+          Serial.printf("Display setting web refresh seconds: %lu\n",
+                        static_cast<unsigned long>(displaySettings.refreshSeconds));
+        } else {
+          saveDeviceSettings(displaySettings);
+          displaySettingsSaved = true;
+          exitRequested = true;
+          pageTransitionRefreshCount = 0;
+          Serial.println("Display settings saved");
+        }
       }
       uiDirty = true;
     }
@@ -1063,30 +1266,40 @@ static void startWifiSetupPortal() {
   WiFi.softAPdisconnect(true);
   WiFi.scanDelete();
 
-  if (saved) {
-    drawWifiButtonSetup(WifiButtonStage::Saved,
-                        apName,
-                        wifiNetworks,
-                        networkCount,
-                        selectedNetwork,
-                        buttonPassword,
-                        passwordChoiceIndex,
-                        false);
+  if (wifiSaved) {
+    drawSettingsScreen(SettingsStage::Saved,
+                       apName,
+                       wifiNetworks,
+                       networkCount,
+                       selectedNetwork,
+                       buttonPassword,
+                       passwordChoiceIndex,
+                       menuSelection,
+                       displaySettings,
+                       displaySelection,
+                       shouldUsePartialRefreshForScreenTransition());
     delay(800);
     ESP.restart();
   }
 
   if (exitRequested) {
-    Serial.println("Wi-Fi setup exited by button");
+    Serial.println("Settings exited by button");
     if (ENABLE_DISPLAY) {
-      drawStatus("와이파이 설정", "취소했습니다. 대시보드로 돌아갑니다.");
+      const bool partialStatusRefresh = shouldUsePartialRefreshForScreenTransition();
+      if (displaySettingsSaved) {
+        drawStatus("화면 설정", "저장했습니다. 대시보드로 돌아갑니다.", partialStatusRefresh);
+      } else {
+        drawStatus("기기 설정", "취소했습니다. 대시보드로 돌아갑니다.", partialStatusRefresh);
+      }
     }
     return;
   }
 
-  Serial.println("Wi-Fi setup timed out");
+  Serial.println("Settings timed out");
   if (ENABLE_DISPLAY) {
-    drawStatus("와이파이 설정", "시간이 초과되었습니다. 대시보드로 돌아갑니다.");
+    drawStatus("기기 설정",
+               "시간이 초과되었습니다. 대시보드로 돌아갑니다.",
+               shouldUsePartialRefreshForScreenTransition());
   }
 }
 
@@ -1282,16 +1495,17 @@ void setup() {
 }
 
 void loop() {
-  const WaitAction action = sleepOrWait(FALLBACK_SLEEP_SECONDS);
+  const DeviceSettings settings = loadDeviceSettings();
+  const WaitAction action = sleepOrWait(settings.refreshSeconds);
   if (action == WaitAction::PageRefresh) {
-    const bool partialDisplayRefresh = shouldUsePartialRefreshForPageTransition();
+    const bool partialDisplayRefresh = shouldUsePartialRefreshForScreenTransition();
     refreshScreen(false, partialDisplayRefresh);
   } else if (action == WaitAction::ForceRefresh) {
     pageTransitionRefreshCount = 0;
     refreshScreen(true);
   } else if (action == WaitAction::WifiSetup) {
-    pageTransitionRefreshCount = 0;
-    startWifiSetupPortal();
-    refreshScreen(true);
+    startSettingsPortal();
+    const bool partialDisplayRefresh = shouldUsePartialRefreshForScreenTransition();
+    refreshScreen(true, partialDisplayRefresh);
   }
 }
