@@ -430,6 +430,15 @@ static bool setupButtonComboHeldFor(uint32_t holdMs) {
   return false;
 }
 
+static bool setupButtonComboCurrentlyPressed() {
+  if (!ENABLE_BUTTONS || heldTopButtonCount() < 2) {
+    return false;
+  }
+
+  delay(BUTTON_DEBOUNCE_MS);
+  return heldTopButtonCount() >= 2;
+}
+
 static ButtonIntent readPageButtonIntent() {
   if (!ENABLE_BUTTONS) {
     return ButtonIntent::None;
@@ -838,7 +847,7 @@ static void startWifiSetupPortal() {
     dnsServer.processNextRequest();
     server.handleClient();
 
-    if (setupButtonComboStarted()) {
+    if (setupButtonComboCurrentlyPressed()) {
       Serial.println("Wi-Fi setup cancel combo detected");
       if (setupButtonComboHeldFor(WIFI_SETUP_HOLD_MS)) {
         exitRequested = true;
@@ -849,6 +858,9 @@ static void startWifiSetupPortal() {
     }
 
     if (uiDirty) {
+      Serial.printf("Wi-Fi setup UI redraw: stage=%d, partial=%s\n",
+                    static_cast<int>(buttonStage),
+                    partialUiRefresh ? "yes" : "no");
       drawWifiButtonSetup(buttonStage,
                           apName,
                           networkCount,
