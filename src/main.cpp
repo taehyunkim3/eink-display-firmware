@@ -132,7 +132,7 @@ static String htmlEscape(const String &value) {
 static String storedWifiSsid() {
   Preferences preferences;
   preferences.begin("wifi", false);
-  const String ssid = preferences.getString("ssid", "");
+  const String ssid = preferences.isKey("ssid") ? preferences.getString("ssid", "") : "";
   preferences.end();
   return ssid;
 }
@@ -140,7 +140,7 @@ static String storedWifiSsid() {
 static String storedWifiPassword() {
   Preferences preferences;
   preferences.begin("wifi", false);
-  const String password = preferences.getString("password", "");
+  const String password = preferences.isKey("password") ? preferences.getString("password", "") : "";
   preferences.end();
   return password;
 }
