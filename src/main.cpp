@@ -559,8 +559,9 @@ static void drawWifiButtonFrame(const String &apName) {
 
   drawKorean(28, 48, "와이파이 설정");
   drawKorean(28, 82, "좌/우 버튼으로 이동하고 확인 버튼으로 선택합니다.");
-  drawKorean(28, SCREEN_HEIGHT - 70, "휴대폰 설정도 가능: 와이파이에서 " + apName + " 연결");
-  drawKorean(28, SCREEN_HEIGHT - 38, "브라우저에서 http://192.168.4.1 을 여세요.");
+  drawKorean(28, SCREEN_HEIGHT - 86, "취소: 상단 버튼 2개를 길게 누르세요.");
+  drawKorean(28, SCREEN_HEIGHT - 58, "휴대폰 설정도 가능: 와이파이에서 " + apName + " 연결");
+  drawKorean(28, SCREEN_HEIGHT - 30, "브라우저에서 http://192.168.4.1 을 여세요.");
 }
 
 static void drawWifiButtonSetup(WifiButtonStage stage,
@@ -836,6 +837,16 @@ static void startWifiSetupPortal() {
   while (!saved && !exitRequested && millis() - startedAt < WIFI_SETUP_TIMEOUT_SECONDS * 1000UL) {
     dnsServer.processNextRequest();
     server.handleClient();
+
+    if (setupButtonComboStarted()) {
+      Serial.println("Wi-Fi setup cancel combo detected");
+      if (setupButtonComboHeldFor(WIFI_SETUP_HOLD_MS)) {
+        exitRequested = true;
+        Serial.println("Wi-Fi setup canceled by button combo");
+      }
+      waitForTopButtonsRelease();
+      continue;
+    }
 
     if (uiDirty) {
       drawWifiButtonSetup(buttonStage,
