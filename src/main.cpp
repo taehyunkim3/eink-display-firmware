@@ -20,10 +20,99 @@ GxEPD2_BW<EPD_MODEL, EPD_MODEL::HEIGHT> display(
 PNG png;
 static uint16_t lineBuffer[800];
 
+struct DeviceTelemetry {
+  String ssid;
+  int32_t rssi;
+  int32_t batteryPercent;
+  float batteryVoltage;
+};
+
 static bool isHttpsEndpoint() {
   String endpoint = DEVICE_ENDPOINT;
   endpoint.toLowerCase();
   return endpoint.startsWith("https://");
+}
+
+static String urlEncode(const String &value) {
+  String encoded;
+  const char *hex = "0123456789ABCDEF";
+
+  for (size_t i = 0; i < value.length(); i++) {
+    const char c = value.charAt(i);
+    const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                      c == '.' || c == '~';
+
+    if (safe) {
+      encoded += c;
+    } else if (c == ' ') {
+      encoded += '+';
+    } else {
+      encoded += '%';
+      encoded += hex[(c >> 4) & 0x0f];
+      encoded += hex[c & 0x0f];
+    }
+  }
+
+  return encoded;
+}
+
+static float readBatteryVoltage() {
+  if (!ENABLE_BATTERY_ADC) {
+    return -1.0f;
+  }
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+  delay(5);
+
+  uint32_t total = 0;
+  constexpr uint8_t sampleCount = 8;
+  for (uint8_t i = 0; i < sampleCount; i++) {
+    total += analogRead(BATTERY_ADC_PIN);
+    delay(2);
+  }
+
+  const float raw = static_cast<float>(total) / sampleCount;
+  const float pinVoltage = raw / 4095.0f * 3.3f;
+  return pinVoltage * BATTERY_VOLTAGE_MULTIPLIER;
+}
+
+static int32_t batteryPercentFromVoltage(float voltage) {
+  if (voltage <= 0) {
+    return -1;
+  }
+
+  const float millivolts = voltage * 1000.0f;
+  const float percent =
+      (millivolts - BATTERY_EMPTY_MV) * 100.0f / (BATTERY_FULL_MV - BATTERY_EMPTY_MV);
+  return constrain(static_cast<int32_t>(roundf(percent)), 0, 100);
+}
+
+static DeviceTelemetry readDeviceTelemetry() {
+  const float voltage = readBatteryVoltage();
+
+  return {
+      WiFi.SSID(),
+      WiFi.RSSI(),
+      batteryPercentFromVoltage(voltage),
+      voltage,
+  };
+}
+
+static String endpointWithTelemetry(const DeviceTelemetry &telemetry) {
+  String endpoint = DEVICE_ENDPOINT;
+  endpoint += endpoint.indexOf('?') >= 0 ? '&' : '?';
+  endpoint += "wifi=connected";
+  endpoint += "&ssid=" + urlEncode(telemetry.ssid);
+  endpoint += "&rssi=" + String(telemetry.rssi);
+
+  if (telemetry.batteryPercent >= 0) {
+    endpoint += "&battery=" + String(telemetry.batteryPercent);
+    endpoint += "&batteryVoltage=" + String(telemetry.batteryVoltage, 2);
+  }
+
+  return endpoint;
 }
 
 static void drawStatus(const String &title, const String &detail) {
@@ -75,7 +164,7 @@ static bool connectWifi() {
   return true;
 }
 
-static bool fetchPng(std::unique_ptr<uint8_t[]> &buffer, int &size) {
+static bool fetchPng(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer, int &size) {
   WiFiClient plainClient;
   WiFiClientSecure secureClient;
   HTTPClient http;
@@ -90,8 +179,8 @@ static bool fetchPng(std::unique_ptr<uint8_t[]> &buffer, int &size) {
                            ? static_cast<WiFiClient &>(secureClient)
                            : static_cast<WiFiClient &>(plainClient);
 
-  Serial.printf("GET %s\n", DEVICE_ENDPOINT);
-  if (!http.begin(client, DEVICE_ENDPOINT)) {
+  Serial.printf("GET %s\n", endpoint.c_str());
+  if (!http.begin(client, endpoint)) {
     Serial.println("HTTP begin failed");
     return false;
   }
@@ -147,7 +236,7 @@ static bool fetchPng(std::unique_ptr<uint8_t[]> &buffer, int &size) {
   return true;
 }
 
-static void pngDraw(PNGDRAW *draw) {
+static int pngDraw(PNGDRAW *draw) {
   png.getLineAsRGB565(draw, lineBuffer, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
 
   for (int x = 0; x < draw->iWidth; x++) {
@@ -158,6 +247,8 @@ static void pngDraw(PNGDRAW *draw) {
     const uint16_t luminance = (r * 30 + g * 59 + b * 11) / 100;
     display.drawPixel(x, draw->y, luminance < 170 ? GxEPD_BLACK : GxEPD_WHITE);
   }
+
+  return 1;
 }
 
 static bool renderPng(const uint8_t *buffer, int size) {
@@ -200,9 +291,21 @@ void setup() {
     return;
   }
 
+  const DeviceTelemetry telemetry = readDeviceTelemetry();
+  Serial.printf("Wi-Fi SSID: %s, RSSI: %ld dBm\n",
+                telemetry.ssid.c_str(),
+                static_cast<long>(telemetry.rssi));
+  if (telemetry.batteryPercent >= 0) {
+    Serial.printf("Battery: %ld%% %.2fV\n",
+                  static_cast<long>(telemetry.batteryPercent),
+                  telemetry.batteryVoltage);
+  } else {
+    Serial.println("Battery telemetry disabled");
+  }
+
   std::unique_ptr<uint8_t[]> pngBuffer;
   int pngSize = 0;
-  if (!fetchPng(pngBuffer, pngSize)) {
+  if (!fetchPng(endpointWithTelemetry(telemetry), pngBuffer, pngSize)) {
     drawStatus("Fetch failed", "Check endpoint, token, and Vercel logs");
     sleepOrWait(FALLBACK_SLEEP_SECONDS);
     return;

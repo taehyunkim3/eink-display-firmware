@@ -17,6 +17,14 @@
 #define ENABLE_DEEP_SLEEP false
 #define FALLBACK_SLEEP_SECONDS 1800
 
+// Battery telemetry is board-specific. Leave disabled until the product
+// schematic/wiki confirms the battery ADC pin and voltage divider ratio.
+#define ENABLE_BATTERY_ADC false
+#define BATTERY_ADC_PIN A0
+#define BATTERY_VOLTAGE_MULTIPLIER 2.0f
+#define BATTERY_EMPTY_MV 3300
+#define BATTERY_FULL_MV 4200
+
 // Keep this comfortably above the PNG response size, but below available RAM.
 #define MAX_IMAGE_BYTES 320000
 
@@ -32,4 +40,3 @@
 // Common 7.5 inch 800x480 black/white panel class in GxEPD2.
 // If compilation says this class is unknown, try GxEPD2_750_T7.
 #define EPD_MODEL GxEPD2_750_GDEY075T7
-
