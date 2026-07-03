@@ -608,14 +608,6 @@ static int buildWifiNetworkList(int scanCount, WifiNetworkEntry *networks, int c
   return count;
 }
 
-static String maskedPassword(const String &password) {
-  String masked;
-  for (size_t i = 0; i < password.length(); i++) {
-    masked += '*';
-  }
-  return masked;
-}
-
 static String wifiPasswordChoiceLabel(int index) {
   const int charsetLength = strlen(WIFI_PASSWORD_CHARSET);
   if (index < charsetLength) {
@@ -731,7 +723,7 @@ static void drawWifiButtonSetup(WifiButtonStage stage,
       const String ssid =
           selectedNetwork >= 0 && selectedNetwork < networkCount ? networks[selectedNetwork].ssid : "";
       drawKorean(28, 246, String("와이파이: ") + ssid.substring(0, 28));
-      drawKorean(28, 280, String("입력값: ") + maskedPassword(password) + " (" +
+      drawKorean(28, 280, String("입력값: ") + password + " (" +
                           String(password.length()) + "글자)");
       drawKorean(28, 330, String("현재 문자: [ ") + wifiPasswordChoiceLabel(passwordChoiceIndex) +
                           " ]");
