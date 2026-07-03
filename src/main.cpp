@@ -310,14 +310,24 @@ void setup() {
   delay(1500);
   Serial.println();
   Serial.println("ESP32 e-ink dashboard firmware");
+  Serial.printf("Display enabled: %s\n", ENABLE_DISPLAY ? "yes" : "no");
 
-  SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
-  display.init(115200, true, 2, false);
-  Serial.println("Drawing boot test screen");
-  drawBootTest();
-  delay(BOOT_TEST_SECONDS * 1000UL);
+  if (!ENABLE_DISPLAY) {
+    Serial.println("Display disabled for serial/debug check");
+  } else {
+    SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
+    Serial.println("Initializing e-paper display");
+    display.init(115200, true, 2, false);
+    Serial.println("Drawing boot test screen");
+    drawBootTest();
+    delay(BOOT_TEST_SECONDS * 1000UL);
+  }
 
   if (!connectWifi()) {
+    if (!ENABLE_DISPLAY) {
+      sleepOrWait(FALLBACK_SLEEP_SECONDS);
+      return;
+    }
     drawStatus("Wi-Fi failed", "Check WIFI_SSID / WIFI_PASSWORD");
     sleepOrWait(FALLBACK_SLEEP_SECONDS);
     return;
@@ -338,7 +348,17 @@ void setup() {
   std::unique_ptr<uint8_t[]> pngBuffer;
   int pngSize = 0;
   if (!fetchPng(endpointWithTelemetry(telemetry), pngBuffer, pngSize)) {
+    if (!ENABLE_DISPLAY) {
+      sleepOrWait(FALLBACK_SLEEP_SECONDS);
+      return;
+    }
     drawStatus("Fetch failed", "Check endpoint, token, and Vercel logs");
+    sleepOrWait(FALLBACK_SLEEP_SECONDS);
+    return;
+  }
+
+  if (!ENABLE_DISPLAY) {
+    Serial.println("Display disabled; skipping PNG render");
     sleepOrWait(FALLBACK_SLEEP_SECONDS);
     return;
   }

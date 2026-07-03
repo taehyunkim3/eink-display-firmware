@@ -15,6 +15,7 @@
 // First upload/debug should stay false so Serial Monitor remains usable.
 // Turn this on after the screen refresh works.
 #define ENABLE_DEEP_SLEEP false
+#define ENABLE_DISPLAY true
 #define FALLBACK_SLEEP_SECONDS 1800
 #define BOOT_TEST_SECONDS 4
 #define DEBUG_HEARTBEAT_SECONDS 5
