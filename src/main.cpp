@@ -362,6 +362,59 @@ static void waitForPageButtonsRelease() {
   }
 }
 
+static uint8_t heldTopButtonCount() {
+  uint8_t count = 0;
+  if (buttonHeld(BUTTON_LEFT_PIN)) {
+    count++;
+  }
+  if (buttonHeld(BUTTON_RIGHT_PIN)) {
+    count++;
+  }
+  if (buttonHeld(BUTTON_REFRESH_PIN)) {
+    count++;
+  }
+  return count;
+}
+
+static void waitForTopButtonsRelease() {
+  while (heldTopButtonCount() > 0) {
+    delay(10);
+  }
+}
+
+static bool setupButtonComboStarted() {
+  if (!ENABLE_BUTTONS || heldTopButtonCount() == 0) {
+    return false;
+  }
+
+  const uint32_t startedAt = millis();
+  while (millis() - startedAt < BUTTON_CHORD_GRACE_MS) {
+    if (heldTopButtonCount() >= 2) {
+      delay(BUTTON_DEBOUNCE_MS);
+      return heldTopButtonCount() >= 2;
+    }
+
+    if (heldTopButtonCount() == 0) {
+      break;
+    }
+
+    delay(20);
+  }
+
+  return false;
+}
+
+static bool setupButtonComboHeldFor(uint32_t holdMs) {
+  const uint32_t startedAt = millis();
+  while (heldTopButtonCount() >= 2) {
+    if (millis() - startedAt >= holdMs) {
+      return true;
+    }
+    delay(50);
+  }
+  return false;
+}
+
 static ButtonIntent readPageButtonIntent() {
   if (!ENABLE_BUTTONS) {
     return ButtonIntent::None;
@@ -475,6 +528,16 @@ static WaitAction sleepOrWait(uint32_t seconds) {
 
     const uint32_t heartbeatStartedAt = millis();
     while (millis() - heartbeatStartedAt < DEBUG_HEARTBEAT_SECONDS * 1000UL) {
+      if (setupButtonComboStarted()) {
+        Serial.println("Button: Wi-Fi setup combo detected");
+        if (setupButtonComboHeldFor(WIFI_SETUP_HOLD_MS)) {
+          Serial.println("Button: Wi-Fi setup");
+          waitForTopButtonsRelease();
+          return WaitAction::WifiSetup;
+        }
+        waitForTopButtonsRelease();
+      }
+
       if (buttonPressed(BUTTON_REFRESH_PIN)) {
         Serial.println("Button: refresh");
         waitForButtonRelease(BUTTON_REFRESH_PIN);
