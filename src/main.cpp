@@ -26,6 +26,10 @@
 #define BUTTON_SCAN_INTERVAL_MS 10
 #endif
 
+#ifndef BUTTON_CLICK_MIN_MS
+#define BUTTON_CLICK_MIN_MS 60
+#endif
+
 #ifndef WIFI_SETUP_CHORD_GRACE_MS
 #define WIFI_SETUP_CHORD_GRACE_MS 700
 #endif
@@ -412,13 +416,16 @@ public:
     }
 
     const bool suppressLeftRightClicks = suppressLeftRightClicks_;
-    if (event == ButtonEvent::None && left_.released && !suppressLeftRightClicks) {
+    if (event == ButtonEvent::None && left_.released && left_.releasedAfter >= BUTTON_CLICK_MIN_MS &&
+        !suppressLeftRightClicks) {
       event = ButtonEvent::LeftClick;
     }
-    if (event == ButtonEvent::None && right_.released && !suppressLeftRightClicks) {
+    if (event == ButtonEvent::None && right_.released &&
+        right_.releasedAfter >= BUTTON_CLICK_MIN_MS && !suppressLeftRightClicks) {
       event = ButtonEvent::RightClick;
     }
-    if (event == ButtonEvent::None && refresh_.released) {
+    if (event == ButtonEvent::None && refresh_.released &&
+        refresh_.releasedAfter >= BUTTON_CLICK_MIN_MS) {
       event = ButtonEvent::RefreshClick;
     }
 
@@ -447,6 +454,7 @@ private:
     bool released = false;
     uint32_t rawChangedAt = 0;
     uint32_t downAt = 0;
+    uint32_t releasedAfter = 0;
 
     void reset(int pin, uint32_t now) {
       pin_ = pin;
@@ -455,10 +463,12 @@ private:
       released = false;
       rawChangedAt = now;
       downAt = raw ? now : 0;
+      releasedAfter = 0;
     }
 
     void update(uint32_t now) {
       released = false;
+      releasedAfter = 0;
       const bool currentRaw = rawButtonDown(pin_);
       if (currentRaw != raw) {
         raw = currentRaw;
@@ -471,6 +481,7 @@ private:
           downAt = now;
         } else {
           released = true;
+          releasedAfter = downAt == 0 ? 0 : now - downAt;
         }
       }
     }

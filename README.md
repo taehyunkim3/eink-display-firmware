@@ -95,11 +95,12 @@ Wi-Fi 설정 화면:
 ```cpp
 #define BUTTON_DEBOUNCE_MS 30
 #define BUTTON_SCAN_INTERVAL_MS 10
+#define BUTTON_CLICK_MIN_MS 60
 #define WIFI_SETUP_CHORD_GRACE_MS 700
 #define WIFI_SETUP_HOLD_MS 1500
 ```
 
-`WIFI_SETUP_CHORD_GRACE_MS`는 좌/우를 완전히 동시에 누르지 못해도 chord로 인정하는 최대 시차입니다. `WIFI_SETUP_HOLD_MS`는 두 버튼이 함께 눌린 뒤 Wi-Fi 설정으로 들어가기까지 유지해야 하는 시간입니다. 단일 클릭 반응이 느리면 hold 시간을 줄이는 게 아니라, Serial Monitor에서 `Button: page left`, `Button: page right`, `Button: Wi-Fi setup chord hold` 로그가 어떻게 찍히는지 먼저 확인합니다.
+`BUTTON_CLICK_MIN_MS`는 노이즈성 순간 입력을 클릭으로 보지 않기 위한 최소 눌림 시간입니다. `WIFI_SETUP_CHORD_GRACE_MS`는 좌/우를 완전히 동시에 누르지 못해도 chord로 인정하는 최대 시차입니다. `WIFI_SETUP_HOLD_MS`는 두 버튼이 함께 눌린 뒤 Wi-Fi 설정으로 들어가기까지 유지해야 하는 시간입니다. 단일 클릭 반응이 느리면 hold 시간을 줄이는 게 아니라, Serial Monitor에서 `Button: page left`, `Button: page right`, `Button: Wi-Fi setup chord hold` 로그가 어떻게 찍히는지 먼저 확인합니다.
 
 ## 6. 화면이 안 나오면 먼저 볼 것
 
