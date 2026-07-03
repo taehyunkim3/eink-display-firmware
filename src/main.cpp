@@ -22,8 +22,8 @@
 #define BUTTON_DEBOUNCE_MS 30
 #endif
 
-#ifndef BUTTON_CHORD_GRACE_MS
-#define BUTTON_CHORD_GRACE_MS 150
+#ifndef BUTTON_SCAN_INTERVAL_MS
+#define BUTTON_SCAN_INTERVAL_MS 10
 #endif
 
 #ifndef WIFI_SETUP_CHORD_GRACE_MS
@@ -31,7 +31,7 @@
 #endif
 
 #ifndef WIFI_SETUP_HOLD_MS
-#define WIFI_SETUP_HOLD_MS 1800
+#define WIFI_SETUP_HOLD_MS 1500
 #endif
 
 #ifndef ENABLE_CHARGER_STATUS
@@ -74,6 +74,10 @@
 #define WIFI_SETUP_MAX_NETWORKS 10
 #endif
 
+#ifndef PAGE_FULL_REFRESH_INTERVAL
+#define PAGE_FULL_REFRESH_INTERVAL 5
+#endif
+
 static const char WIFI_PASSWORD_CHARSET[] =
     "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "!@#$%^&*()-_=+[]{}:;,.?/\\|~`'\" ";
@@ -90,6 +94,7 @@ static const char *deviceState = "booting";
 static int lastErrorCode = 0;
 static bool displayInitialized = false;
 RTC_DATA_ATTR static int screenPage = 0;
+RTC_DATA_ATTR static uint32_t pageTransitionRefreshCount = 0;
 
 static void setupDisplay();
 static void drawKorean(int16_t x, int16_t y, const String &text);
@@ -339,6 +344,151 @@ static String endpointWithTelemetry(const DeviceTelemetry &telemetry, bool force
   return endpoint;
 }
 
+enum class ButtonEvent {
+  None,
+  LeftClick,
+  RightClick,
+  RefreshClick,
+  LeftRightHold,
+};
+
+static uint32_t absDiff(uint32_t a, uint32_t b) {
+  return a >= b ? a - b : b - a;
+}
+
+static bool rawButtonDown(int pin) {
+  return digitalRead(pin) == LOW;
+}
+
+// Keep all physical button interpretation here. Short clicks are emitted only
+// on release, while the Wi-Fi chord is emitted only after left+right are held
+// together. This avoids delaying every single click just to check for a chord.
+class ButtonManager {
+public:
+  void begin() {
+    reset();
+  }
+
+  void reset() {
+    const uint32_t now = millis();
+    left_.reset(BUTTON_LEFT_PIN, now);
+    right_.reset(BUTTON_RIGHT_PIN, now);
+    refresh_.reset(BUTTON_REFRESH_PIN, now);
+    leftRightSeen_ = false;
+    leftRightHoldEmitted_ = false;
+    suppressLeftRightClicks_ = false;
+    bothDownStartedAt_ = 0;
+  }
+
+  ButtonEvent update() {
+    if (!ENABLE_BUTTONS) {
+      return ButtonEvent::None;
+    }
+
+    const uint32_t now = millis();
+    left_.update(now);
+    right_.update(now);
+    refresh_.update(now);
+
+    ButtonEvent event = ButtonEvent::None;
+    bool resetLeftRightAfterEvent = false;
+    const bool bothDown = left_.down && right_.down;
+    if (bothDown) {
+      if (!leftRightSeen_) {
+        leftRightSeen_ = true;
+        bothDownStartedAt_ = now;
+        suppressLeftRightClicks_ = true;
+      }
+
+      const bool joinedInWindow =
+          absDiff(left_.downAt, right_.downAt) <= WIFI_SETUP_CHORD_GRACE_MS;
+      if (joinedInWindow && !leftRightHoldEmitted_ &&
+          now - bothDownStartedAt_ >= WIFI_SETUP_HOLD_MS) {
+        leftRightHoldEmitted_ = true;
+        event = ButtonEvent::LeftRightHold;
+      }
+    } else if (!left_.down && !right_.down) {
+      resetLeftRightAfterEvent = true;
+    }
+
+    const bool suppressLeftRightClicks = suppressLeftRightClicks_;
+    if (event == ButtonEvent::None && left_.released && !suppressLeftRightClicks) {
+      event = ButtonEvent::LeftClick;
+    }
+    if (event == ButtonEvent::None && right_.released && !suppressLeftRightClicks) {
+      event = ButtonEvent::RightClick;
+    }
+    if (event == ButtonEvent::None && refresh_.released) {
+      event = ButtonEvent::RefreshClick;
+    }
+
+    if (resetLeftRightAfterEvent) {
+      leftRightSeen_ = false;
+      leftRightHoldEmitted_ = false;
+      suppressLeftRightClicks_ = false;
+      bothDownStartedAt_ = 0;
+    }
+
+    return event;
+  }
+
+  void waitForAllReleased() {
+    while (rawButtonDown(BUTTON_LEFT_PIN) || rawButtonDown(BUTTON_RIGHT_PIN) ||
+           rawButtonDown(BUTTON_REFRESH_PIN)) {
+      delay(BUTTON_SCAN_INTERVAL_MS);
+    }
+    reset();
+  }
+
+private:
+  struct DebouncedButton {
+    bool raw = false;
+    bool down = false;
+    bool released = false;
+    uint32_t rawChangedAt = 0;
+    uint32_t downAt = 0;
+
+    void reset(int pin, uint32_t now) {
+      pin_ = pin;
+      raw = rawButtonDown(pin_);
+      down = raw;
+      released = false;
+      rawChangedAt = now;
+      downAt = raw ? now : 0;
+    }
+
+    void update(uint32_t now) {
+      released = false;
+      const bool currentRaw = rawButtonDown(pin_);
+      if (currentRaw != raw) {
+        raw = currentRaw;
+        rawChangedAt = now;
+      }
+
+      if (raw != down && now - rawChangedAt >= BUTTON_DEBOUNCE_MS) {
+        down = raw;
+        if (down) {
+          downAt = now;
+        } else {
+          released = true;
+        }
+      }
+    }
+
+    int pin_ = -1;
+  };
+
+  DebouncedButton left_;
+  DebouncedButton right_;
+  DebouncedButton refresh_;
+  bool leftRightSeen_ = false;
+  bool leftRightHoldEmitted_ = false;
+  bool suppressLeftRightClicks_ = false;
+  uint32_t bothDownStartedAt_ = 0;
+};
+
+static ButtonManager buttonManager;
+
 static void setupButtons() {
   if (!ENABLE_BUTTONS) {
     return;
@@ -347,146 +497,7 @@ static void setupButtons() {
   pinMode(BUTTON_LEFT_PIN, INPUT_PULLUP);
   pinMode(BUTTON_RIGHT_PIN, INPUT_PULLUP);
   pinMode(BUTTON_REFRESH_PIN, INPUT_PULLUP);
-}
-
-static bool buttonPressed(int pin) {
-  if (!ENABLE_BUTTONS) {
-    return false;
-  }
-
-  if (digitalRead(pin) != LOW) {
-    return false;
-  }
-
-  delay(BUTTON_DEBOUNCE_MS);
-  return digitalRead(pin) == LOW;
-}
-
-enum class ButtonIntent {
-  None,
-  PageLeft,
-  PageRight,
-  PageChord,
-};
-
-static bool buttonHeld(int pin) {
-  return digitalRead(pin) == LOW;
-}
-
-static void waitForButtonRelease(int pin) {
-  while (buttonHeld(pin)) {
-    delay(10);
-  }
-}
-
-static void waitForPageButtonsRelease() {
-  while (buttonHeld(BUTTON_LEFT_PIN) || buttonHeld(BUTTON_RIGHT_PIN)) {
-    delay(10);
-  }
-}
-
-static uint8_t heldTopButtonCount() {
-  uint8_t count = 0;
-  if (buttonHeld(BUTTON_LEFT_PIN)) {
-    count++;
-  }
-  if (buttonHeld(BUTTON_RIGHT_PIN)) {
-    count++;
-  }
-  if (buttonHeld(BUTTON_REFRESH_PIN)) {
-    count++;
-  }
-  return count;
-}
-
-static void waitForTopButtonsRelease() {
-  while (heldTopButtonCount() > 0) {
-    delay(10);
-  }
-}
-
-static bool setupButtonComboHeldFor(uint32_t holdMs) {
-  const uint32_t startedAt = millis();
-  while (heldTopButtonCount() >= 2) {
-    if (millis() - startedAt >= holdMs) {
-      return true;
-    }
-    delay(50);
-  }
-  return false;
-}
-
-static bool setupButtonComboCurrentlyPressed() {
-  if (!ENABLE_BUTTONS || heldTopButtonCount() < 2) {
-    return false;
-  }
-
-  delay(BUTTON_DEBOUNCE_MS);
-  return heldTopButtonCount() >= 2;
-}
-
-static ButtonIntent readPageButtonIntent() {
-  if (!ENABLE_BUTTONS) {
-    return ButtonIntent::None;
-  }
-
-  if (!buttonHeld(BUTTON_LEFT_PIN) && !buttonHeld(BUTTON_RIGHT_PIN)) {
-    return ButtonIntent::None;
-  }
-
-  const bool initialLeft = buttonHeld(BUTTON_LEFT_PIN);
-  const bool initialRight = buttonHeld(BUTTON_RIGHT_PIN);
-  bool sawLeft = initialLeft;
-  bool sawRight = initialRight;
-  const uint32_t startedAt = millis();
-
-  if (sawLeft && sawRight) {
-    delay(BUTTON_DEBOUNCE_MS);
-    return buttonHeld(BUTTON_LEFT_PIN) && buttonHeld(BUTTON_RIGHT_PIN) ? ButtonIntent::PageChord
-                                                                      : ButtonIntent::None;
-  }
-
-  while (millis() - startedAt < WIFI_SETUP_CHORD_GRACE_MS) {
-    const bool leftNow = buttonHeld(BUTTON_LEFT_PIN);
-    const bool rightNow = buttonHeld(BUTTON_RIGHT_PIN);
-    sawLeft = sawLeft || leftNow;
-    sawRight = sawRight || rightNow;
-
-    if (leftNow && rightNow) {
-      delay(BUTTON_DEBOUNCE_MS);
-      return buttonHeld(BUTTON_LEFT_PIN) && buttonHeld(BUTTON_RIGHT_PIN) ? ButtonIntent::PageChord
-                                                                        : ButtonIntent::None;
-    }
-
-    if (!leftNow && !rightNow) {
-      break;
-    }
-
-    if ((initialLeft && !leftNow) || (initialRight && !rightNow)) {
-      break;
-    }
-
-    delay(20);
-  }
-
-  if (sawLeft) {
-    return ButtonIntent::PageLeft;
-  }
-  if (sawRight) {
-    return ButtonIntent::PageRight;
-  }
-  return ButtonIntent::None;
-}
-
-static bool pageChordHeldFor(uint32_t holdMs) {
-  const uint32_t startedAt = millis();
-  while (buttonHeld(BUTTON_LEFT_PIN) && buttonHeld(BUTTON_RIGHT_PIN)) {
-    if (millis() - startedAt >= holdMs) {
-      return true;
-    }
-    delay(50);
-  }
-  return false;
+  buttonManager.begin();
 }
 
 static void drawStatus(const String &title, const String &detail) {
@@ -732,10 +743,25 @@ static void drawWifiButtonSetup(WifiButtonStage stage,
 
 enum class WaitAction {
   None,
-  Refresh,
+  PageRefresh,
   ForceRefresh,
   WifiSetup,
 };
+
+static bool shouldUsePartialRefreshForPageTransition() {
+  if (PAGE_FULL_REFRESH_INTERVAL <= 1) {
+    pageTransitionRefreshCount = 0;
+    return false;
+  }
+
+  pageTransitionRefreshCount++;
+  if (pageTransitionRefreshCount >= PAGE_FULL_REFRESH_INTERVAL) {
+    pageTransitionRefreshCount = 0;
+    return false;
+  }
+
+  return true;
+}
 
 static WaitAction sleepOrWait(uint32_t seconds) {
   if (ENABLE_DEEP_SLEEP) {
@@ -745,6 +771,7 @@ static WaitAction sleepOrWait(uint32_t seconds) {
   }
 
   Serial.println("Deep sleep disabled. Waiting before next refresh.");
+  buttonManager.reset();
   const uint32_t waitStartedAt = millis();
   const uint32_t waitMs = seconds * 1000UL;
   while (millis() - waitStartedAt < waitMs) {
@@ -756,34 +783,25 @@ static WaitAction sleepOrWait(uint32_t seconds) {
 
     const uint32_t heartbeatStartedAt = millis();
     while (millis() - heartbeatStartedAt < DEBUG_HEARTBEAT_SECONDS * 1000UL) {
-      if (buttonPressed(BUTTON_REFRESH_PIN)) {
+      const ButtonEvent buttonEvent = buttonManager.update();
+      if (buttonEvent == ButtonEvent::RefreshClick) {
         Serial.println("Button: refresh");
-        waitForButtonRelease(BUTTON_REFRESH_PIN);
         return WaitAction::ForceRefresh;
-      }
-
-      const ButtonIntent pageIntent = readPageButtonIntent();
-      if (pageIntent == ButtonIntent::PageChord) {
-        Serial.println("Button: page chord detected");
-        if (pageChordHeldFor(WIFI_SETUP_HOLD_MS)) {
-          Serial.println("Button: Wi-Fi setup");
-          waitForPageButtonsRelease();
-          return WaitAction::WifiSetup;
-        }
-        waitForPageButtonsRelease();
-      } else if (pageIntent == ButtonIntent::PageLeft) {
+      } else if (buttonEvent == ButtonEvent::LeftRightHold) {
+        Serial.println("Button: Wi-Fi setup chord hold");
+        buttonManager.waitForAllReleased();
+        return WaitAction::WifiSetup;
+      } else if (buttonEvent == ButtonEvent::LeftClick) {
         screenPage = (screenPage + SCREEN_PAGE_COUNT - 1) % SCREEN_PAGE_COUNT;
         Serial.printf("Button: page left -> %d\n", screenPage);
-        waitForButtonRelease(BUTTON_LEFT_PIN);
-        return WaitAction::Refresh;
-      } else if (pageIntent == ButtonIntent::PageRight) {
+        return WaitAction::PageRefresh;
+      } else if (buttonEvent == ButtonEvent::RightClick) {
         screenPage = (screenPage + 1) % SCREEN_PAGE_COUNT;
         Serial.printf("Button: page right -> %d\n", screenPage);
-        waitForButtonRelease(BUTTON_RIGHT_PIN);
-        return WaitAction::Refresh;
+        return WaitAction::PageRefresh;
       }
 
-      delay(50);
+      delay(BUTTON_SCAN_INTERVAL_MS);
     }
   }
 
@@ -921,18 +939,17 @@ static void startWifiSetupPortal() {
   });
   server.begin();
 
+  buttonManager.reset();
   const uint32_t startedAt = millis();
   while (!saved && !exitRequested && millis() - startedAt < WIFI_SETUP_TIMEOUT_SECONDS * 1000UL) {
     dnsServer.processNextRequest();
     server.handleClient();
 
-    if (setupButtonComboCurrentlyPressed()) {
-      Serial.println("Wi-Fi setup cancel combo detected");
-      if (setupButtonComboHeldFor(WIFI_SETUP_HOLD_MS)) {
-        exitRequested = true;
-        Serial.println("Wi-Fi setup canceled by button combo");
-      }
-      waitForTopButtonsRelease();
+    const ButtonEvent buttonEvent = buttonManager.update();
+    if (buttonEvent == ButtonEvent::LeftRightHold) {
+      exitRequested = true;
+      Serial.println("Wi-Fi setup canceled by left+right hold");
+      buttonManager.waitForAllReleased();
       continue;
     }
 
@@ -952,7 +969,7 @@ static void startWifiSetupPortal() {
       partialUiRefresh = true;
     }
 
-    if (buttonPressed(BUTTON_LEFT_PIN)) {
+    if (buttonEvent == ButtonEvent::LeftClick) {
       if (buttonStage == WifiButtonStage::NetworkSelect) {
         moveNetworkSelection(-1);
         Serial.printf("Wi-Fi setup button network: %s (%ld%%)\n",
@@ -965,9 +982,8 @@ static void startWifiSetupPortal() {
                       wifiPasswordChoiceLabel(passwordChoiceIndex).c_str());
         lastPasswordConfirmIndex = -1;
       }
-      waitForButtonRelease(BUTTON_LEFT_PIN);
       uiDirty = true;
-    } else if (buttonPressed(BUTTON_RIGHT_PIN)) {
+    } else if (buttonEvent == ButtonEvent::RightClick) {
       if (buttonStage == WifiButtonStage::NetworkSelect) {
         moveNetworkSelection(1);
         Serial.printf("Wi-Fi setup button network: %s (%ld%%)\n",
@@ -980,9 +996,8 @@ static void startWifiSetupPortal() {
                       wifiPasswordChoiceLabel(passwordChoiceIndex).c_str());
         lastPasswordConfirmIndex = -1;
       }
-      waitForButtonRelease(BUTTON_RIGHT_PIN);
       uiDirty = true;
-    } else if (buttonPressed(BUTTON_REFRESH_PIN)) {
+    } else if (buttonEvent == ButtonEvent::RefreshClick) {
       if (buttonStage == WifiButtonStage::NetworkSelect) {
         if (hasVisibleNetwork() && selectedNetwork < networkCount &&
             wifiNetworks[selectedNetwork].ssid.length() > 0) {
@@ -1026,11 +1041,10 @@ static void startWifiSetupPortal() {
           Serial.println("Wi-Fi setup button exit");
         }
       }
-      waitForButtonRelease(BUTTON_REFRESH_PIN);
       uiDirty = true;
     }
 
-    delay(20);
+    delay(BUTTON_SCAN_INTERVAL_MS);
   }
 
   server.stop();
@@ -1140,13 +1154,17 @@ static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buff
   return true;
 }
 
-static bool renderBitmap(const uint8_t *buffer, int size) {
+static bool renderBitmap(const uint8_t *buffer, int size, bool partialRefresh) {
   if (size != SCREEN_BITMAP_BYTES) {
     return false;
   }
 
   display.setRotation(0);
-  display.setFullWindow();
+  if (partialRefresh) {
+    display.setPartialWindow(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+  } else {
+    display.setFullWindow();
+  }
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
@@ -1181,7 +1199,7 @@ static void setupDisplay() {
     displayInitialized = true;
 }
 
-static bool refreshScreen(bool forceServerRefresh = false) {
+static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRefresh = false) {
   if (!ENABLE_DISPLAY) {
     deviceState = "display-disabled";
     Serial.println("Display disabled for serial/debug check");
@@ -1229,7 +1247,8 @@ static bool refreshScreen(bool forceServerRefresh = false) {
     return true;
   }
 
-  if (!renderBitmap(bitmapBuffer.get(), bitmapSize)) {
+  Serial.printf("Display refresh mode: %s\n", partialDisplayRefresh ? "partial" : "full");
+  if (!renderBitmap(bitmapBuffer.get(), bitmapSize, partialDisplayRefresh)) {
     deviceState = "render-failed";
     drawStatus("화면 표시 실패", "비트맵 주소와 크기를 확인하세요.");
     return false;
@@ -1253,11 +1272,14 @@ void setup() {
 
 void loop() {
   const WaitAction action = sleepOrWait(FALLBACK_SLEEP_SECONDS);
-  if (action == WaitAction::Refresh) {
-    refreshScreen(false);
+  if (action == WaitAction::PageRefresh) {
+    const bool partialDisplayRefresh = shouldUsePartialRefreshForPageTransition();
+    refreshScreen(false, partialDisplayRefresh);
   } else if (action == WaitAction::ForceRefresh) {
+    pageTransitionRefreshCount = 0;
     refreshScreen(true);
   } else if (action == WaitAction::WifiSetup) {
+    pageTransitionRefreshCount = 0;
     startWifiSetupPortal();
     refreshScreen(true);
   }

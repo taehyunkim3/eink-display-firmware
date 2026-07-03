@@ -20,6 +20,7 @@
 #define BOOT_TEST_SECONDS 0
 #define DEBUG_HEARTBEAT_SECONDS 5
 #define SCREEN_PAGE_COUNT 5
+#define PAGE_FULL_REFRESH_INTERVAL 5
 #define WIFI_SETUP_TIMEOUT_SECONDS 300
 #define WIFI_SETUP_MAX_NETWORKS 10
 #define WIFI_BUTTON_PASSWORD_MAX_LENGTH 64
@@ -31,9 +32,12 @@
 #define BUTTON_RIGHT_PIN 4
 #define BUTTON_REFRESH_PIN 3
 #define BUTTON_DEBOUNCE_MS 30
-#define BUTTON_CHORD_GRACE_MS 150
+// Buttons are scanned as events instead of blocking waits. A short click is
+// emitted when the button is released; left+right hold is emitted only after
+// both buttons are down together for WIFI_SETUP_HOLD_MS.
+#define BUTTON_SCAN_INTERVAL_MS 10
 #define WIFI_SETUP_CHORD_GRACE_MS 700
-#define WIFI_SETUP_HOLD_MS 1800
+#define WIFI_SETUP_HOLD_MS 1500
 
 // reTerminal E1001 battery telemetry pins from the official schematic.
 #define ENABLE_BATTERY_ADC true

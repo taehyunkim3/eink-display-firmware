@@ -71,7 +71,37 @@ VS Code에서는 PlatformIO 탭에서 `Upload`, `Monitor`를 실행합니다.
 4. USB로 보드를 연결하고 업로드합니다.
 5. Serial Monitor에서 `HTTP failed`, `PNG decode failed`, `Render failed` 중 어디서 막히는지 확인합니다.
 
-## 5. 화면이 안 나오면 먼저 볼 것
+## 5. 버튼 조작
+
+reTerminal E1001 상단 3개 버튼은 이벤트 방식으로 처리합니다. 버튼을 누른 순간 바로 명령을 실행하지 않고, debounce 후 버튼을 뗄 때 짧은 클릭 이벤트를 만듭니다. 좌/우 동시 길게 누르기는 별도 hold 이벤트로 처리해서, Wi-Fi 설정을 잘 잡으면서도 일반 페이지 이동이 느려지지 않게 했습니다.
+
+메인 화면:
+
+- 왼쪽 짧게: 이전 페이지
+- 오른쪽 짧게: 다음 페이지
+- refresh 짧게: 현재 페이지를 서버 강제 갱신
+- 왼쪽 + 오른쪽 길게: Wi-Fi 설정 진입
+
+Wi-Fi 설정 화면:
+
+- 왼쪽 짧게: 목록 위 / 문자 이전
+- 오른쪽 짧게: 목록 아래 / 문자 다음
+- refresh 짧게: 선택 / 현재 문자 입력
+- 같은 문자에서 refresh를 빠르게 두 번: 비밀번호 저장
+- 왼쪽 + 오른쪽 길게: 저장하지 않고 나가기
+
+관련 설정값:
+
+```cpp
+#define BUTTON_DEBOUNCE_MS 30
+#define BUTTON_SCAN_INTERVAL_MS 10
+#define WIFI_SETUP_CHORD_GRACE_MS 700
+#define WIFI_SETUP_HOLD_MS 1500
+```
+
+`WIFI_SETUP_CHORD_GRACE_MS`는 좌/우를 완전히 동시에 누르지 못해도 chord로 인정하는 최대 시차입니다. `WIFI_SETUP_HOLD_MS`는 두 버튼이 함께 눌린 뒤 Wi-Fi 설정으로 들어가기까지 유지해야 하는 시간입니다. 단일 클릭 반응이 느리면 hold 시간을 줄이는 게 아니라, Serial Monitor에서 `Button: page left`, `Button: page right`, `Button: Wi-Fi setup chord hold` 로그가 어떻게 찍히는지 먼저 확인합니다.
+
+## 6. 화면이 안 나오면 먼저 볼 것
 
 - `EPD_MODEL`: 기본값은 `GxEPD2_750_GDEY075T7`입니다. 컴파일 오류가 나면 `GxEPD2_750_T7`을 시도합니다.
 - `EPD_*` 핀: 제품 위키/회로도와 다르면 `include/config.h`에서 바꿉니다.
@@ -79,7 +109,7 @@ VS Code에서는 PlatformIO 탭에서 `Upload`, `Monitor`를 실행합니다.
 - `DEVICE_AUTH_TOKEN`: `eink-frontend`의 `DEVICE_AUTH_TOKEN`과 정확히 같아야 합니다.
 - PNG 크기: Serial Monitor에 찍히는 `PNG content length`가 `MAX_IMAGE_BYTES`보다 크면 값을 조금 올립니다.
 
-## 6. 절전
+## 7. 절전
 
 첫 업로드 때는 `ENABLE_DEEP_SLEEP false`가 편합니다. 화면 갱신이 확인되면 아래처럼 바꿉니다.
 
