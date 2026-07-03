@@ -20,6 +20,7 @@
 #define BOOT_TEST_SECONDS 4
 #define DEBUG_HEARTBEAT_SECONDS 5
 #define SCREEN_PAGE_COUNT 2
+#define WIFI_SETUP_TIMEOUT_SECONDS 300
 
 // reTerminal E1001 top buttons from the official schematic.
 #define ENABLE_BUTTONS true

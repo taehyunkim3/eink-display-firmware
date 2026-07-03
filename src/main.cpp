@@ -1,6 +1,9 @@
 #include <Arduino.h>
+#include <DNSServer.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <SPI.h>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
@@ -24,6 +27,8 @@ static const char *deviceState = "booting";
 static int lastErrorCode = 0;
 static bool displayInitialized = false;
 RTC_DATA_ATTR static int screenPage = 0;
+
+static void setupDisplay();
 
 struct DeviceTelemetry {
   String ssid;
@@ -105,6 +110,49 @@ static String urlEncode(const String &value) {
   return encoded;
 }
 
+static String htmlEscape(const String &value) {
+  String escaped;
+  for (size_t i = 0; i < value.length(); i++) {
+    const char c = value.charAt(i);
+    if (c == '&') {
+      escaped += F("&amp;");
+    } else if (c == '<') {
+      escaped += F("&lt;");
+    } else if (c == '>') {
+      escaped += F("&gt;");
+    } else if (c == '"') {
+      escaped += F("&quot;");
+    } else {
+      escaped += c;
+    }
+  }
+  return escaped;
+}
+
+static String storedWifiSsid() {
+  Preferences preferences;
+  preferences.begin("wifi", true);
+  const String ssid = preferences.getString("ssid", "");
+  preferences.end();
+  return ssid;
+}
+
+static String storedWifiPassword() {
+  Preferences preferences;
+  preferences.begin("wifi", true);
+  const String password = preferences.getString("password", "");
+  preferences.end();
+  return password;
+}
+
+static void saveWifiCredentials(const String &ssid, const String &password) {
+  Preferences preferences;
+  preferences.begin("wifi", false);
+  preferences.putString("ssid", ssid);
+  preferences.putString("password", password);
+  preferences.end();
+}
+
 static float readBatteryVoltage() {
   if (!ENABLE_BATTERY_ADC) {
     return -1.0f;
@@ -169,6 +217,15 @@ static String endpointWithTelemetry(const DeviceTelemetry &telemetry) {
   return endpoint;
 }
 
+static String endpointWithTelemetry(const DeviceTelemetry &telemetry, bool forceServerRefresh) {
+  String endpoint = endpointWithTelemetry(telemetry);
+  if (forceServerRefresh) {
+    endpoint += "&force=1";
+    endpoint += "&nonce=" + String(millis());
+  }
+  return endpoint;
+}
+
 static void setupButtons() {
   if (!ENABLE_BUTTONS) {
     return;
@@ -190,6 +247,19 @@ static bool buttonPressed(int pin) {
 
   delay(30);
   return digitalRead(pin) == LOW;
+}
+
+static bool bothPageButtonsPressed() {
+  if (!ENABLE_BUTTONS) {
+    return false;
+  }
+
+  if (digitalRead(BUTTON_LEFT_PIN) != LOW || digitalRead(BUTTON_RIGHT_PIN) != LOW) {
+    return false;
+  }
+
+  delay(30);
+  return digitalRead(BUTTON_LEFT_PIN) == LOW && digitalRead(BUTTON_RIGHT_PIN) == LOW;
 }
 
 static void drawStatus(const String &title, const String &detail) {
@@ -233,6 +303,8 @@ static void drawBootTest() {
 enum class WaitAction {
   None,
   Refresh,
+  ForceRefresh,
+  WifiSetup,
 };
 
 static WaitAction sleepOrWait(uint32_t seconds) {
@@ -254,12 +326,26 @@ static WaitAction sleepOrWait(uint32_t seconds) {
 
     const uint32_t heartbeatStartedAt = millis();
     while (millis() - heartbeatStartedAt < DEBUG_HEARTBEAT_SECONDS * 1000UL) {
+      if (bothPageButtonsPressed()) {
+        const uint32_t pressedAt = millis();
+        while (bothPageButtonsPressed()) {
+          if (millis() - pressedAt >= 2000) {
+            Serial.println("Button: Wi-Fi setup");
+            while (digitalRead(BUTTON_LEFT_PIN) == LOW || digitalRead(BUTTON_RIGHT_PIN) == LOW) {
+              delay(10);
+            }
+            return WaitAction::WifiSetup;
+          }
+          delay(50);
+        }
+      }
+
       if (buttonPressed(BUTTON_REFRESH_PIN)) {
         Serial.println("Button: refresh");
         while (digitalRead(BUTTON_REFRESH_PIN) == LOW) {
           delay(10);
         }
-        return WaitAction::Refresh;
+        return WaitAction::ForceRefresh;
       }
 
       if (buttonPressed(BUTTON_LEFT_PIN)) {
@@ -289,9 +375,13 @@ static WaitAction sleepOrWait(uint32_t seconds) {
 
 static bool connectWifi() {
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  const String savedSsid = storedWifiSsid();
+  const String savedPassword = storedWifiPassword();
+  const String ssid = savedSsid.length() > 0 ? savedSsid : String(WIFI_SSID);
+  const String password = savedSsid.length() > 0 ? savedPassword : String(WIFI_PASSWORD);
 
-  Serial.printf("Connecting Wi-Fi: %s", WIFI_SSID);
+  Serial.printf("Connecting Wi-Fi: %s", ssid.c_str());
+  WiFi.begin(ssid.c_str(), password.c_str());
   const uint32_t startedAt = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 20000) {
     Serial.print(".");
@@ -307,6 +397,111 @@ static bool connectWifi() {
   Serial.print("Wi-Fi connected. IP: ");
   Serial.println(WiFi.localIP());
   return true;
+}
+
+static String wifiSetupPage(int networkCount, bool saved) {
+  String body = F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                  "<title>E-ink Wi-Fi Setup</title>"
+                  "<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;margin:24px;}"
+                  "label,input,select,button{display:block;width:100%;box-sizing:border-box;font-size:18px;margin-top:10px;}"
+                  "input,select{padding:10px}button{padding:12px;font-weight:700}.note{color:#555}</style>"
+                  "</head><body><h1>E-ink Wi-Fi Setup</h1>");
+
+  if (saved) {
+    body += F("<p>Saved. Device will restart now.</p>");
+  } else {
+    body += F("<p class='note'>Choose a 2.4GHz Wi-Fi network.</p>"
+              "<form method='POST' action='/save'><label>Network</label><select name='ssid'>");
+    for (int i = 0; i < networkCount; i++) {
+      const String ssid = WiFi.SSID(i);
+      if (ssid.length() == 0) {
+        continue;
+      }
+      body += F("<option value=\"");
+      body += htmlEscape(ssid);
+      body += F("\">");
+      body += htmlEscape(ssid);
+      body += F(" (");
+      body += WiFi.RSSI(i);
+      body += F(" dBm)</option>");
+    }
+    body += F("</select><label>Password</label><input name='password' type='password' autocomplete='current-password'>"
+              "<button type='submit'>Save and Restart</button></form>"
+              "<form method='GET' action='/'><button type='submit'>Rescan</button></form>");
+  }
+
+  body += F("</body></html>");
+  return body;
+}
+
+static void startWifiSetupPortal() {
+  deviceState = "wifi-setup";
+  lastErrorCode = 0;
+
+  const String suffix = WiFi.macAddress().substring(12);
+  const String apName = "EINK-SETUP-" + suffix;
+  const IPAddress apIP(192, 168, 4, 1);
+  const IPAddress netmask(255, 255, 255, 0);
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(apIP, apIP, netmask);
+  WiFi.softAP(apName.c_str());
+
+  const int networkCount = WiFi.scanNetworks();
+  Serial.printf("Wi-Fi setup AP: %s, open http://192.168.4.1\n", apName.c_str());
+  if (ENABLE_DISPLAY) {
+    setupDisplay();
+    drawStatus("Wi-Fi setup", "Connect to " + apName + " then open 192.168.4.1");
+  }
+
+  DNSServer dnsServer;
+  WebServer server(80);
+  bool saved = false;
+
+  dnsServer.start(53, "*", apIP);
+  server.on("/", HTTP_GET, [&]() {
+    server.send(200, "text/html", wifiSetupPage(networkCount, saved));
+  });
+  server.on("/save", HTTP_POST, [&]() {
+    const String ssid = server.arg("ssid");
+    const String password = server.arg("password");
+    if (ssid.length() == 0) {
+      server.send(400, "text/plain", "SSID is required");
+      return;
+    }
+
+    saveWifiCredentials(ssid, password);
+    saved = true;
+    server.send(200, "text/html", wifiSetupPage(networkCount, true));
+    Serial.printf("Wi-Fi credentials saved: %s\n", ssid.c_str());
+  });
+  server.onNotFound([&]() {
+    server.sendHeader("Location", String("http://") + apIP.toString(), true);
+    server.send(302, "text/plain", "");
+  });
+  server.begin();
+
+  const uint32_t startedAt = millis();
+  while (!saved && millis() - startedAt < WIFI_SETUP_TIMEOUT_SECONDS * 1000UL) {
+    dnsServer.processNextRequest();
+    server.handleClient();
+    delay(10);
+  }
+
+  server.stop();
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.scanDelete();
+
+  if (saved) {
+    delay(800);
+    ESP.restart();
+  }
+
+  Serial.println("Wi-Fi setup timed out");
+  if (ENABLE_DISPLAY) {
+    drawStatus("Wi-Fi setup", "Timed out; returning to dashboard");
+  }
 }
 
 static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer, int &size) {
@@ -420,7 +615,7 @@ static void setupDisplay() {
     displayInitialized = true;
 }
 
-static bool refreshScreen() {
+static bool refreshScreen(bool forceServerRefresh = false) {
   if (!ENABLE_DISPLAY) {
     deviceState = "display-disabled";
     Serial.println("Display disabled for serial/debug check");
@@ -452,7 +647,7 @@ static bool refreshScreen() {
 
   std::unique_ptr<uint8_t[]> bitmapBuffer;
   int bitmapSize = 0;
-  if (!fetchBitmap(endpointWithTelemetry(telemetry), bitmapBuffer, bitmapSize)) {
+  if (!fetchBitmap(endpointWithTelemetry(telemetry, forceServerRefresh), bitmapBuffer, bitmapSize)) {
     deviceState = "fetch-failed";
     if (!ENABLE_DISPLAY) {
       return false;
@@ -492,6 +687,11 @@ void setup() {
 void loop() {
   const WaitAction action = sleepOrWait(FALLBACK_SLEEP_SECONDS);
   if (action == WaitAction::Refresh) {
-    refreshScreen();
+    refreshScreen(false);
+  } else if (action == WaitAction::ForceRefresh) {
+    refreshScreen(true);
+  } else if (action == WaitAction::WifiSetup) {
+    startWifiSetupPortal();
+    refreshScreen(true);
   }
 }
