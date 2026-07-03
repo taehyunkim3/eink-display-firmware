@@ -32,6 +32,7 @@
 #define BUTTON_REFRESH_PIN 3
 #define BUTTON_DEBOUNCE_MS 30
 #define BUTTON_CHORD_GRACE_MS 150
+#define WIFI_SETUP_CHORD_GRACE_MS 700
 #define WIFI_SETUP_HOLD_MS 1800
 
 // reTerminal E1001 battery telemetry pins from the official schematic.

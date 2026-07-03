@@ -26,6 +26,10 @@
 #define BUTTON_CHORD_GRACE_MS 150
 #endif
 
+#ifndef WIFI_SETUP_CHORD_GRACE_MS
+#define WIFI_SETUP_CHORD_GRACE_MS 700
+#endif
+
 #ifndef WIFI_SETUP_HOLD_MS
 #define WIFI_SETUP_HOLD_MS 1800
 #endif
@@ -401,28 +405,6 @@ static void waitForTopButtonsRelease() {
   }
 }
 
-static bool setupButtonComboStarted() {
-  if (!ENABLE_BUTTONS || heldTopButtonCount() == 0) {
-    return false;
-  }
-
-  const uint32_t startedAt = millis();
-  while (millis() - startedAt < BUTTON_CHORD_GRACE_MS) {
-    if (heldTopButtonCount() >= 2) {
-      delay(BUTTON_DEBOUNCE_MS);
-      return heldTopButtonCount() >= 2;
-    }
-
-    if (heldTopButtonCount() == 0) {
-      break;
-    }
-
-    delay(20);
-  }
-
-  return false;
-}
-
 static bool setupButtonComboHeldFor(uint32_t holdMs) {
   const uint32_t startedAt = millis();
   while (heldTopButtonCount() >= 2) {
@@ -452,20 +434,35 @@ static ButtonIntent readPageButtonIntent() {
     return ButtonIntent::None;
   }
 
-  bool sawLeft = buttonHeld(BUTTON_LEFT_PIN);
-  bool sawRight = buttonHeld(BUTTON_RIGHT_PIN);
+  const bool initialLeft = buttonHeld(BUTTON_LEFT_PIN);
+  const bool initialRight = buttonHeld(BUTTON_RIGHT_PIN);
+  bool sawLeft = initialLeft;
+  bool sawRight = initialRight;
   const uint32_t startedAt = millis();
 
-  while (millis() - startedAt < BUTTON_CHORD_GRACE_MS) {
-    sawLeft = sawLeft || buttonHeld(BUTTON_LEFT_PIN);
-    sawRight = sawRight || buttonHeld(BUTTON_RIGHT_PIN);
+  if (sawLeft && sawRight) {
+    delay(BUTTON_DEBOUNCE_MS);
+    return buttonHeld(BUTTON_LEFT_PIN) && buttonHeld(BUTTON_RIGHT_PIN) ? ButtonIntent::PageChord
+                                                                      : ButtonIntent::None;
+  }
 
-    if (sawLeft && sawRight) {
+  while (millis() - startedAt < WIFI_SETUP_CHORD_GRACE_MS) {
+    const bool leftNow = buttonHeld(BUTTON_LEFT_PIN);
+    const bool rightNow = buttonHeld(BUTTON_RIGHT_PIN);
+    sawLeft = sawLeft || leftNow;
+    sawRight = sawRight || rightNow;
+
+    if (leftNow && rightNow) {
       delay(BUTTON_DEBOUNCE_MS);
-      return ButtonIntent::PageChord;
+      return buttonHeld(BUTTON_LEFT_PIN) && buttonHeld(BUTTON_RIGHT_PIN) ? ButtonIntent::PageChord
+                                                                        : ButtonIntent::None;
     }
 
-    if (!buttonHeld(BUTTON_LEFT_PIN) && !buttonHeld(BUTTON_RIGHT_PIN)) {
+    if (!leftNow && !rightNow) {
+      break;
+    }
+
+    if ((initialLeft && !leftNow) || (initialRight && !rightNow)) {
       break;
     }
 
@@ -759,16 +756,6 @@ static WaitAction sleepOrWait(uint32_t seconds) {
 
     const uint32_t heartbeatStartedAt = millis();
     while (millis() - heartbeatStartedAt < DEBUG_HEARTBEAT_SECONDS * 1000UL) {
-      if (setupButtonComboStarted()) {
-        Serial.println("Button: Wi-Fi setup combo detected");
-        if (setupButtonComboHeldFor(WIFI_SETUP_HOLD_MS)) {
-          Serial.println("Button: Wi-Fi setup");
-          waitForTopButtonsRelease();
-          return WaitAction::WifiSetup;
-        }
-        waitForTopButtonsRelease();
-      }
-
       if (buttonPressed(BUTTON_REFRESH_PIN)) {
         Serial.println("Button: refresh");
         waitForButtonRelease(BUTTON_REFRESH_PIN);
