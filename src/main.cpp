@@ -27,6 +27,49 @@ struct DeviceTelemetry {
   float batteryVoltage;
 };
 
+class MemoryWriteStream : public Stream {
+public:
+  MemoryWriteStream(uint8_t *target, size_t capacity) : target_(target), capacity_(capacity) {}
+
+  size_t write(uint8_t value) override {
+    if (size_ >= capacity_) {
+      overflowed_ = true;
+      return 0;
+    }
+
+    target_[size_++] = value;
+    return 1;
+  }
+
+  size_t write(const uint8_t *buffer, size_t size) override {
+    const size_t writable = min(size, capacity_ - size_);
+    if (writable > 0) {
+      memcpy(target_ + size_, buffer, writable);
+      size_ += writable;
+    }
+
+    if (writable < size) {
+      overflowed_ = true;
+    }
+
+    return writable;
+  }
+
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+
+  size_t size() const { return size_; }
+  bool overflowed() const { return overflowed_; }
+
+private:
+  uint8_t *target_;
+  size_t capacity_;
+  size_t size_ = 0;
+  bool overflowed_ = false;
+};
+
 static bool isHttpsEndpoint() {
   String endpoint = DEVICE_ENDPOINT;
   endpoint.toLowerCase();
@@ -224,44 +267,42 @@ static bool fetchPng(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer,
 
   const int contentLength = http.getSize();
   Serial.printf("PNG content length: %d\n", contentLength);
-  if (contentLength <= 0 || contentLength > MAX_IMAGE_BYTES) {
-    Serial.println("PNG response is missing length or exceeds MAX_IMAGE_BYTES");
+  if (contentLength > MAX_IMAGE_BYTES) {
+    Serial.println("PNG response exceeds MAX_IMAGE_BYTES");
     http.end();
     return false;
   }
 
-  buffer.reset(new (std::nothrow) uint8_t[contentLength]);
+  const int bufferCapacity = contentLength > 0 ? contentLength : MAX_IMAGE_BYTES;
+  buffer.reset(new (std::nothrow) uint8_t[bufferCapacity]);
   if (!buffer) {
     Serial.println("PNG buffer allocation failed");
     http.end();
     return false;
   }
 
-  WiFiClient *stream = http.getStreamPtr();
-  int offset = 0;
-  while (http.connected() && offset < contentLength) {
-    const int available = stream->available();
-    if (available <= 0) {
-      delay(1);
-      continue;
-    }
-
-    const int chunkSize = min(available, contentLength - offset);
-    const int readBytes = stream->readBytes(buffer.get() + offset, chunkSize);
-    if (readBytes <= 0) {
-      break;
-    }
-    offset += readBytes;
-  }
+  MemoryWriteStream pngStream(buffer.get(), bufferCapacity);
+  const int written = http.writeToStream(&pngStream);
 
   http.end();
 
-  if (offset != contentLength) {
-    Serial.printf("PNG download incomplete: %d/%d\n", offset, contentLength);
+  if (written < 0 || pngStream.overflowed() || pngStream.size() == 0) {
+    Serial.printf("PNG download failed: written=%d, received=%u, overflow=%s\n",
+                  written,
+                  static_cast<unsigned int>(pngStream.size()),
+                  pngStream.overflowed() ? "yes" : "no");
     return false;
   }
 
-  size = contentLength;
+  if (contentLength > 0 && static_cast<int>(pngStream.size()) != contentLength) {
+    Serial.printf("PNG download incomplete: %u/%d\n",
+                  static_cast<unsigned int>(pngStream.size()),
+                  contentLength);
+    return false;
+  }
+
+  size = static_cast<int>(pngStream.size());
+  Serial.printf("PNG received bytes: %d\n", size);
   return true;
 }
 
