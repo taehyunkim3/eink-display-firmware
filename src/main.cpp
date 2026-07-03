@@ -131,6 +131,28 @@ static void drawStatus(const String &title, const String &detail) {
   } while (display.nextPage());
 }
 
+static void drawBootTest() {
+  display.setRotation(0);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.drawRect(0, 0, display.width(), display.height(), GxEPD_BLACK);
+    display.drawRect(8, 8, display.width() - 16, display.height() - 16, GxEPD_BLACK);
+    display.drawLine(0, 0, display.width() - 1, display.height() - 1, GxEPD_BLACK);
+    display.drawLine(display.width() - 1, 0, 0, display.height() - 1, GxEPD_BLACK);
+    display.setTextColor(GxEPD_BLACK);
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(32, 64);
+    display.print("ESP32 e-ink dashboard");
+    display.setFont(&FreeMono9pt7b);
+    display.setCursor(32, 104);
+    display.print("Display boot test");
+    display.setCursor(32, 136);
+    display.print("If this is visible, panel pins work.");
+  } while (display.nextPage());
+}
+
 static void sleepOrWait(uint32_t seconds) {
   if (ENABLE_DEEP_SLEEP) {
     Serial.printf("Deep sleep for %lu seconds\n", static_cast<unsigned long>(seconds));
@@ -284,6 +306,9 @@ void setup() {
 
   SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
   display.init(115200, true, 2, false);
+  Serial.println("Drawing boot test screen");
+  drawBootTest();
+  delay(BOOT_TEST_SECONDS * 1000UL);
 
   if (!connectWifi()) {
     drawStatus("Wi-Fi failed", "Check WIFI_SSID / WIFI_PASSWORD");
