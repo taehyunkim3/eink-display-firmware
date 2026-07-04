@@ -2741,7 +2741,8 @@ static bool overviewMarketMatch(JsonObjectConst stock, int slot) {
   if (slot == 1) {
     return name == "KOSDAQ" || code == "^KQ11";
   }
-  return name.indexOf("WTI") >= 0 || code == "CL=F";
+  return name.indexOf("USD/KRW") >= 0 || code == "KRW=X" || name.indexOf("WTI") >= 0 ||
+         code == "CL=F";
 }
 
 static JsonObjectConst overviewMarketSlot(JsonArrayConst stocks, int slot) {
