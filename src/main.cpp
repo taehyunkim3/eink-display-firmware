@@ -2194,9 +2194,13 @@ static void setupDisplay() {
     koreanFonts.setFontMode(1);
     koreanFonts.setFontDirection(0);
     setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
-    Serial.println("Drawing boot test screen");
-    drawBootTest();
-    delay(BOOT_TEST_SECONDS * 1000UL);
+    if (BOOT_TEST_SECONDS > 0) {
+      Serial.println("Drawing boot test screen");
+      drawBootTest();
+      delay(BOOT_TEST_SECONDS * 1000UL);
+    } else {
+      Serial.println("Skipping boot test screen");
+    }
     displayInitialized = true;
 }
 
