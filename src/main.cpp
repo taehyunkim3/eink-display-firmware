@@ -1658,12 +1658,20 @@ static void drawQrCode(int16_t x, int16_t y, const char *text, uint8_t version, 
   }
 }
 
-static String setupTimerLine(uint32_t remainingSeconds) {
+static String setupTimerText(uint32_t remainingSeconds) {
   char timer[8];
   snprintf(timer, sizeof(timer), "%lu:%02lu",
            static_cast<unsigned long>(remainingSeconds / 60),
            static_cast<unsigned long>(remainingSeconds % 60));
-  return String("자동 종료까지 ") + timer + " · PIN 3회 오류 시 즉시 종료";
+  return String(timer);
+}
+
+// Countdown box under the QR code. Kept in its own drawing helper so both
+// the full-screen render and the 3-second partial tick share the layout.
+static void drawSetupTimerBox(uint32_t remainingSeconds) {
+  const int16_t x = SCREEN_WIDTH - 236;
+  drawKorean(x, 372, "남은 시간 (자동 종료)", TextSize::Tiny);
+  drawKorean(x, 406, setupTimerText(remainingSeconds), TextSize::Large);
 }
 
 static void drawSetupGuideScreen(const String &deviceName, const String &pin, const String &statusLine,
@@ -1701,26 +1709,26 @@ static void drawSetupGuideScreen(const String &deviceName, const String &pin, co
     drawKorean(28, 406, String("휴대폰 Wi-Fi에서 '") + deviceName + "' 연결 후 http://192.168.4.1 접속", TextSize::Tiny);
 
     display.drawLine(28, SCREEN_HEIGHT - 64, SCREEN_WIDTH - 28, SCREEN_HEIGHT - 64, GxEPD_BLACK);
-    drawKorean(28, SCREEN_HEIGHT - 42, setupTimerLine(remainingSeconds), TextSize::Tiny);
+    drawKorean(28, SCREEN_HEIGHT - 42, "보안: 시간 초과 시 자동 종료 · PIN 3회 오류 시 즉시 종료", TextSize::Tiny);
     drawKorean(28, SCREEN_HEIGHT - 20, String("상태: ") + statusLine + "   (닫기: 새로고침 버튼)", TextSize::Tiny);
 
     drawQrCode(SCREEN_WIDTH - 236, 128, SETUP_PAGE_URL, 6, 4);
     drawKorean(SCREEN_WIDTH - 236, 336, "설정 페이지 QR", TextSize::Tiny);
+    drawSetupTimerBox(remainingSeconds);
   } while (display.nextPage());
 }
 
-// Fast countdown update: repaints only the footer band (timer + status) with
-// a partial window so the panel never runs a full refresh for the clock.
-static void drawSetupGuideFooterPartial(uint32_t remainingSeconds, const String &statusLine) {
+// Fast countdown tick: repaints only the timer box under the QR code with a
+// partial window so the panel never runs a full refresh for the clock.
+static void drawSetupTimerPartial(uint32_t remainingSeconds) {
   if (!ENABLE_DISPLAY) {
     return;
   }
-  display.setPartialWindow(24, SCREEN_HEIGHT - 56, SCREEN_WIDTH - 48, 44);
+  display.setPartialWindow(SCREEN_WIDTH - 240, 356, 216, 56);
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
-    drawKorean(28, SCREEN_HEIGHT - 42, setupTimerLine(remainingSeconds), TextSize::Tiny);
-    drawKorean(28, SCREEN_HEIGHT - 20, String("상태: ") + statusLine + "   (닫기: 새로고침 버튼)", TextSize::Tiny);
+    drawSetupTimerBox(remainingSeconds);
   } while (display.nextPage());
 }
 
@@ -1852,9 +1860,9 @@ static void startSettingsPortal() {
       lastTimerDrawAt = millis();
       drawSetupGuideScreen(deviceName, context.pin, context.statusLine, remainingSeconds());
     } else if (millis() - lastTimerDrawAt >= 3000) {
-      // Countdown tick: partial-window repaint of the footer only.
+      // Countdown tick: partial-window repaint of the timer box only.
       lastTimerDrawAt = millis();
-      drawSetupGuideFooterPartial(remainingSeconds(), context.statusLine);
+      drawSetupTimerPartial(remainingSeconds());
     }
 
     delay(BUTTON_SCAN_INTERVAL_MS);
