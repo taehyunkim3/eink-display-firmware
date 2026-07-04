@@ -5,6 +5,7 @@
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <Preferences.h>
+#include <Update.h>
 #include <SD.h>
 #include <SPI.h>
 #include <WebServer.h>
@@ -218,6 +219,7 @@ enum class TextSize {
 static void setupDisplay();
 static void drawKorean(int16_t x, int16_t y, const String &text, TextSize size = TextSize::Small);
 static void drawTrendPage(JsonObjectConst root);
+static bool flashFirmwareFromSd(const char *path);
 
 static void setLastError(int code, const String &detail) {
   lastErrorCode = code;
@@ -2755,6 +2757,23 @@ static void setupSdAssets() {
   SD.mkdir("/eink");
   SD.mkdir("/eink/icons");
   SD.mkdir("/eink/fonts");
+
+  // Offline manual update: drop a build as /eink/update/manual.bin on the
+  // card and reboot; the file is renamed afterwards so it never loops.
+  const char *manualPath = "/eink/update/manual.bin";
+  if (SD.exists(manualPath)) {
+    Serial.println("Manual firmware image found on SD, flashing");
+    drawStatus("SD 펌웨어 설치 중", "manual.bin 적용 후 자동으로 재시작합니다.\n전원을 끄지 마세요.");
+    if (flashFirmwareFromSd(manualPath)) {
+      SD.remove("/eink/update/manual.applied");
+      SD.rename(manualPath, "/eink/update/manual.applied");
+      ESP.restart();
+    }
+    SD.remove("/eink/update/manual.failed");
+    SD.rename(manualPath, "/eink/update/manual.failed");
+    drawStatus("SD 펌웨어 설치 실패", "manual.bin이 손상되었거나 올바른 이미지가 아닙니다.");
+    delay(3000);
+  }
 }
 
 enum class WeatherGlyph {
@@ -3817,10 +3836,116 @@ static String firmwareVersionEndpoint() {
   return endpoint.substring(0, apiIndex) + "/firmware/version.json";
 }
 
+// Writes the inactive OTA app slot from a firmware image stored on SD.
+static bool flashFirmwareFromSd(const char *path) {
+  File file = SD.open(path, FILE_READ);
+  if (!file) {
+    return false;
+  }
+  const size_t size = file.size();
+  // Sanity floor so a truncated/placeholder file never gets flashed.
+  if (size < 500000) {
+    Serial.printf("SD flash: image too small (%u bytes)\n", static_cast<unsigned>(size));
+    file.close();
+    return false;
+  }
+  if (!Update.begin(size)) {
+    Serial.printf("SD flash: Update.begin failed: %s\n", Update.errorString());
+    file.close();
+    return false;
+  }
+
+  uint8_t buffer[4096];
+  size_t total = 0;
+  while (file.available()) {
+    const int bytesRead = file.read(buffer, sizeof(buffer));
+    if (bytesRead <= 0) {
+      break;
+    }
+    if (Update.write(buffer, static_cast<size_t>(bytesRead)) !=
+        static_cast<size_t>(bytesRead)) {
+      Serial.printf("SD flash: write failed: %s\n", Update.errorString());
+      Update.abort();
+      file.close();
+      return false;
+    }
+    total += static_cast<size_t>(bytesRead);
+  }
+  file.close();
+
+  if (total != size || !Update.end(true)) {
+    Serial.printf("SD flash: finalize failed: %s\n", Update.errorString());
+    return false;
+  }
+  Serial.printf("SD flash: %u bytes written OK\n", static_cast<unsigned>(total));
+  return true;
+}
+
+static const char *OTA_STAGE_PATH = "/eink/update/firmware.bin";
+
+// Streams the OTA image to the SD card first so a flaky download never
+// touches flash; the image is verified against Content-Length before use.
+static bool downloadFirmwareToSd(const String &url) {
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+  WiFiClient plainClient;
+  WiFiClient &client = url.startsWith("https://")
+                           ? static_cast<WiFiClient &>(secureClient)
+                           : plainClient;
+
+  HTTPClient http;
+  http.setTimeout(60000);
+  if (!http.begin(client, url)) {
+    return false;
+  }
+  const int statusCode = http.GET();
+  if (statusCode != HTTP_CODE_OK) {
+    Serial.printf("OTA download: HTTP %d\n", statusCode);
+    http.end();
+    return false;
+  }
+  const int contentLength = http.getSize();
+
+  SD.mkdir("/eink/update");
+  SD.remove(OTA_STAGE_PATH);
+  File file = SD.open(OTA_STAGE_PATH, FILE_WRITE);
+  if (!file) {
+    http.end();
+    return false;
+  }
+  const int written = http.writeToStream(&file);
+  file.close();
+  http.end();
+
+  if (written <= 0 || (contentLength > 0 && written != contentLength)) {
+    Serial.printf("OTA download: incomplete (%d/%d bytes)\n", written, contentLength);
+    SD.remove(OTA_STAGE_PATH);
+    return false;
+  }
+  Serial.printf("OTA download: staged %d bytes on SD\n", written);
+  return true;
+}
+
 static void performOtaUpdate(const String &url, const String &remoteVersion) {
   drawStatus("펌웨어 업데이트 중",
              String(FIRMWARE_VERSION) + " → " + remoteVersion +
                  "\n전원을 끄지 마세요. 완료되면 자동으로 재시작합니다.");
+
+  // Preferred path: stage the download on SD, then flash from the verified
+  // file. Falls back to direct streaming when no SD card is present.
+  if (sdAssetsAvailable) {
+    if (downloadFirmwareToSd(url)) {
+      if (flashFirmwareFromSd(OTA_STAGE_PATH)) {
+        SD.remove(OTA_STAGE_PATH);
+        ESP.restart();
+      }
+      SD.remove(OTA_STAGE_PATH);
+      drawStatus("펌웨어 업데이트 실패", "SD에 받은 이미지 설치에 실패했습니다.");
+      delay(3000);
+      return;
+    }
+    Serial.println("OTA: SD staging failed, falling back to direct update");
+  }
 
   WiFiClientSecure secureClient;
   secureClient.setInsecure();
