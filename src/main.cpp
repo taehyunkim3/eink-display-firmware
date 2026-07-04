@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <DNSServer.h>
+#include <driver/rtc_io.h>
 #include <FS.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
@@ -1211,6 +1212,23 @@ static WaitAction sleepOrWait(const DeviceSettings &settings) {
   const uint32_t seconds = settings.refreshSeconds;
   if (settings.deepSleep) {
     Serial.printf("Deep sleep for %lu seconds\n", static_cast<unsigned long>(seconds));
+    if (ENABLE_BUTTONS) {
+      // Buttons wake the device too (all three pins are RTC-capable on the
+      // S3). Internal RTC pull-ups must stay powered during deep sleep so the
+      // lines idle high.
+      const uint64_t buttonMask = (1ULL << BUTTON_LEFT_PIN) |
+                                  (1ULL << BUTTON_RIGHT_PIN) |
+                                  (1ULL << BUTTON_REFRESH_PIN);
+      esp_sleep_enable_ext1_wakeup(buttonMask, ESP_EXT1_WAKEUP_ANY_LOW);
+      const gpio_num_t buttonPins[] = {static_cast<gpio_num_t>(BUTTON_LEFT_PIN),
+                                       static_cast<gpio_num_t>(BUTTON_RIGHT_PIN),
+                                       static_cast<gpio_num_t>(BUTTON_REFRESH_PIN)};
+      for (const gpio_num_t pin : buttonPins) {
+        rtc_gpio_pullup_en(pin);
+        rtc_gpio_pulldown_dis(pin);
+      }
+      esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    }
     esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(seconds) * 1000000ULL);
     esp_deep_sleep_start();
   }
@@ -3221,8 +3239,53 @@ void setup() {
   if (!pageVisible(bootSettings, screenPage)) {
     screenPage = nextVisiblePage(bootSettings, screenPage, 1);
   }
+
+  // Deep sleep button wake-up: figure out which button pulled us out of
+  // sleep and act on it (page navigation / forced refresh / settings mode).
+  bool openSettings = false;
+  const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+  if (ENABLE_BUTTONS && wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
+    const uint64_t wakeStatus = esp_sleep_get_ext1_wakeup_status();
+    const gpio_num_t buttonPins[] = {static_cast<gpio_num_t>(BUTTON_LEFT_PIN),
+                                     static_cast<gpio_num_t>(BUTTON_RIGHT_PIN),
+                                     static_cast<gpio_num_t>(BUTTON_REFRESH_PIN)};
+    for (const gpio_num_t pin : buttonPins) {
+      rtc_gpio_deinit(pin);
+    }
+    setupButtons();
+
+    // Give the user a moment to press the second button of the settings
+    // chord; ext1 status alone rarely captures both pins at once.
+    delay(250);
+    const bool leftActive =
+        (wakeStatus & (1ULL << BUTTON_LEFT_PIN)) || rawButtonDown(BUTTON_LEFT_PIN);
+    const bool rightActive =
+        (wakeStatus & (1ULL << BUTTON_RIGHT_PIN)) || rawButtonDown(BUTTON_RIGHT_PIN);
+    const bool refreshActive = wakeStatus & (1ULL << BUTTON_REFRESH_PIN);
+    Serial.printf("Wake by button: left=%d right=%d refresh=%d\n",
+                  leftActive,
+                  rightActive,
+                  refreshActive);
+
+    if (leftActive && rightActive) {
+      openSettings = true;
+    } else if (leftActive) {
+      screenPage = nextVisiblePage(bootSettings, screenPage, -1);
+      saveScreenPage();
+    } else if (rightActive) {
+      screenPage = nextVisiblePage(bootSettings, screenPage, 1);
+      saveScreenPage();
+    }
+    // Refresh button: fall through, the boot refresh below is already forced.
+    buttonManager.waitForAllReleased();
+  } else {
+    setupButtons();
+  }
+
   Serial.printf("Screen page: %d\n", screenPage);
-  setupButtons();
+  if (openSettings) {
+    startSettingsPortal();
+  }
   refreshScreen();
 }
 
