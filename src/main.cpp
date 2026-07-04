@@ -3,6 +3,7 @@
 #include <driver/rtc_io.h>
 #include <FS.h>
 #include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <Preferences.h>
 #include <SD.h>
 #include <SPI.h>
@@ -23,6 +24,7 @@
 #include <qrcode.h>
 
 #include "config.h"
+#include "version.h"
 #include "generated/galmuri_7_bitmap.h"
 #include "generated/galmuri_9_bitmap.h"
 #include "generated/galmuri_11_bitmap.h"
@@ -190,6 +192,9 @@ static String lastFetchHeaderLine = "";
 // header plus the millis() tick at that moment. -1 = never synced.
 static int32_t lastFetchKstMinutes = -1;
 static uint32_t lastFetchTickMs = 0;
+// KST epoch of the last successful JSON fetch; survives via NVS comparisons
+// only (RAM value resets on deep sleep, refreshed on the next fetch).
+static time_t lastFetchEpoch = 0;
 
 static int32_t currentKstMinutesEstimate() {
   if (lastFetchKstMinutes < 0) {
@@ -246,6 +251,7 @@ struct DeviceSettings {
   bool deepSleep;
   int32_t nightStartHour;  // -1 = night mode off
   int32_t nightEndHour;    // KST hour; window may wrap past midnight
+  uint32_t otaHours;       // OTA update check interval; 0 = off
 };
 
 constexpr uint32_t ALL_PAGES_MASK = (1UL << SCREEN_PAGE_COUNT) - 1UL;
@@ -405,6 +411,7 @@ static DeviceSettings defaultDeviceSettings() {
       ENABLE_DEEP_SLEEP,
       -1,
       6,
+      24,
   };
 }
 
@@ -436,6 +443,9 @@ static DeviceSettings sanitizeDeviceSettings(DeviceSettings settings) {
   if (settings.nightStartHour == settings.nightEndHour) {
     settings.nightStartHour = -1;
   }
+  if (settings.otaHours > 0) {
+    settings.otaHours = clampSetting(settings.otaHours, 1, 720);
+  }
   return settings;
 }
 
@@ -452,6 +462,7 @@ static DeviceSettings loadDeviceSettings() {
       preferences.getBool("deepSleep", defaults.deepSleep),
       preferences.getInt("nightStart", defaults.nightStartHour),
       preferences.getInt("nightEnd", defaults.nightEndHour),
+      preferences.getUInt("otaHours", defaults.otaHours),
   };
   preferences.end();
   return sanitizeDeviceSettings(settings);
@@ -469,6 +480,7 @@ static void saveDeviceSettings(const DeviceSettings &rawSettings) {
   preferences.putBool("deepSleep", settings.deepSleep);
   preferences.putInt("nightStart", settings.nightStartHour);
   preferences.putInt("nightEnd", settings.nightEndHour);
+  preferences.putUInt("otaHours", settings.otaHours);
   preferences.end();
 }
 
@@ -1491,6 +1503,8 @@ static void handleBleConfigWrite(const std::string &payload) {
     config["deepSleep"] = settings.deepSleep;
     config["nightStart"] = settings.nightStartHour;
     config["nightEnd"] = settings.nightEndHour;
+    config["otaHours"] = settings.otaHours;
+    config["fwVersion"] = FIRMWARE_VERSION;
     config["pageCount"] = SCREEN_PAGE_COUNT;
     String serialized;
     serializeJson(response, serialized);
@@ -1572,6 +1586,10 @@ static void handleBleConfigWrite(const std::string &payload) {
   }
   if (!document["nightEnd"].isNull()) {
     settings.nightEndHour = document["nightEnd"] | 6;
+    settingsChanged = true;
+  }
+  if (!document["otaHours"].isNull()) {
+    settings.otaHours = document["otaHours"] | 24;
     settingsChanged = true;
   }
   if (settingsChanged) {
@@ -1965,10 +1983,12 @@ static String kstHeaderLineFromHttpDate(const String &httpDate) {
   timeInfo.tm_min = minute;
   timeInfo.tm_sec = second;
   timeInfo.tm_isdst = 0;
-  if (mktime(&timeInfo) == static_cast<time_t>(-1)) {
+  const time_t epoch = mktime(&timeInfo);
+  if (epoch == static_cast<time_t>(-1)) {
     return "";
   }
 
+  lastFetchEpoch = epoch;
   lastFetchKstMinutes = timeInfo.tm_hour * 60 + timeInfo.tm_min;
   lastFetchTickMs = millis();
 
@@ -3390,6 +3410,108 @@ static bool renderDashboardFromCache(bool partialDisplayRefresh) {
   return true;
 }
 
+// ---- OTA firmware update ----------------------------------------------
+// version.json is served next to the dashboard API:
+//   https://<host>/firmware/version.json -> {"version":"1.2.0","url":"..."}
+static String firmwareVersionEndpoint() {
+  String endpoint = dashboardJsonEndpoint();
+  const int apiIndex = endpoint.indexOf("/api/");
+  if (apiIndex < 0) {
+    return "";
+  }
+  return endpoint.substring(0, apiIndex) + "/firmware/version.json";
+}
+
+static void performOtaUpdate(const String &url, const String &remoteVersion) {
+  drawStatus("펌웨어 업데이트 중",
+             String(FIRMWARE_VERSION) + " → " + remoteVersion +
+                 "\n전원을 끄지 마세요. 완료되면 자동으로 재시작합니다.");
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+  WiFiClient plainClient;
+  WiFiClient &client = url.startsWith("https://")
+                           ? static_cast<WiFiClient &>(secureClient)
+                           : plainClient;
+
+  httpUpdate.rebootOnUpdate(true);
+  const t_httpUpdate_return result = httpUpdate.update(client, url);
+  // Reaching this point means the update did not complete (success reboots).
+  Serial.printf("OTA failed: %d %s\n",
+                httpUpdate.getLastError(),
+                httpUpdate.getLastErrorString().c_str());
+  (void)result;
+  drawStatus("펌웨어 업데이트 실패", httpUpdate.getLastErrorString());
+  delay(3000);
+}
+
+// Checks the server for a newer firmware build at most once per
+// settings.otaHours (persisted, so deep sleep reboots don't reset the timer).
+static void maybeCheckOtaUpdate() {
+  const DeviceSettings settings = loadDeviceSettings();
+  if (settings.otaHours == 0 || lastFetchEpoch == 0 || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  Preferences preferences;
+  preferences.begin("state", false);
+  const int64_t lastCheckEpoch = preferences.getLong64("lastOtaEpoch", 0);
+  const int64_t intervalSeconds = static_cast<int64_t>(settings.otaHours) * 3600;
+  if (lastCheckEpoch > 0 &&
+      static_cast<int64_t>(lastFetchEpoch) - lastCheckEpoch < intervalSeconds) {
+    preferences.end();
+    return;
+  }
+  preferences.putLong64("lastOtaEpoch", static_cast<int64_t>(lastFetchEpoch));
+  preferences.end();
+
+  const String versionUrl = firmwareVersionEndpoint();
+  if (versionUrl.length() == 0) {
+    return;
+  }
+  Serial.printf("OTA check: %s\n", versionUrl.c_str());
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+  WiFiClient plainClient;
+  WiFiClient &client = versionUrl.startsWith("https://")
+                           ? static_cast<WiFiClient &>(secureClient)
+                           : plainClient;
+
+  HTTPClient http;
+  http.setTimeout(10000);
+  if (!http.begin(client, versionUrl)) {
+    return;
+  }
+  const int statusCode = http.GET();
+  if (statusCode != HTTP_CODE_OK) {
+    Serial.printf("OTA check skipped: HTTP %d\n", statusCode);
+    http.end();
+    return;
+  }
+  const String body = http.getString();
+  http.end();
+
+  JsonDocument document;
+  if (deserializeJson(document, body)) {
+    return;
+  }
+  const String remoteVersion = document["version"] | "";
+  String binaryUrl = document["url"] | "";
+  if (binaryUrl.length() == 0) {
+    const int apiIndex = versionUrl.lastIndexOf("/version.json");
+    binaryUrl = versionUrl.substring(0, apiIndex) + "/firmware.bin";
+  }
+
+  if (remoteVersion.length() == 0 || remoteVersion == FIRMWARE_VERSION) {
+    Serial.printf("OTA: up to date (%s)\n", FIRMWARE_VERSION);
+    return;
+  }
+  Serial.printf("OTA: new version %s (current %s)\n",
+                remoteVersion.c_str(), FIRMWARE_VERSION);
+  performOtaUpdate(binaryUrl, remoteVersion);
+}
+
 static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRefresh = false) {
   lastContentLength = 0;
   lastReceivedBytes = 0;
@@ -3476,6 +3598,7 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
 
   deviceState = "screen-updated";
   Serial.println("Screen updated");
+  maybeCheckOtaUpdate();
   return true;
 }
 
