@@ -2785,7 +2785,9 @@ static void drawOverviewPage(JsonObjectConst root) {
   // ── 날씨 카드 (좌상단) ──
   const int16_t wx = 12, wy = 40, ww = 380, wh = 210;
   display.drawRect(wx, wy, ww, wh, GxEPD_BLACK);
-  drawCardTitle(wx, wy, ww, "오늘 날씨", jsonString(weather["label"]));
+  const String weatherAlert = jsonString(root["weatherAlert"]);
+  drawCardTitle(wx, wy, ww, "오늘 날씨",
+                weatherAlert.length() > 0 ? weatherAlert : jsonString(weather["label"]));
 
   drawWeatherIcon(wx + 14, wy + 32, weather["weatherCode"].isNull() ? 3 : weather["weatherCode"].as<int>(), 48);
   drawText(wx + 76, wy + 66, formatValue(weather["temperatureC"], "C"), 0, TextSize::Large);
