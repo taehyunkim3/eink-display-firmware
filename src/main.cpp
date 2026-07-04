@@ -2300,6 +2300,31 @@ static String compactChartPrice(float value) {
   return String(value, 2);
 }
 
+static String removeNumberSeparators(String value) {
+  value.replace(",", "");
+  value.replace("，", "");
+  return value;
+}
+
+static String stockDirectionWord(JsonObjectConst stock) {
+  const String direction = jsonString(stock["direction"]);
+  if (direction == "up") return "상승";
+  if (direction == "down") return "하락";
+  if (direction == "flat") return "보합";
+  return "변동";
+}
+
+static String signedStockValue(JsonObjectConst stock, const String &value, const String &suffix = "") {
+  String cleaned = removeNumberSeparators(value);
+  while (cleaned.startsWith("+") || cleaned.startsWith("-")) {
+    cleaned.remove(0, 1);
+  }
+  const String direction = jsonString(stock["direction"]);
+  if (direction == "up") return "+" + cleaned + suffix;
+  if (direction == "down") return "-" + cleaned + suffix;
+  return cleaned + suffix;
+}
+
 static void drawChartPointLabels(JsonObjectConst stock,
                                  int16_t x,
                                  int16_t y,
@@ -2315,7 +2340,7 @@ static void drawChartPointLabels(JsonObjectConst stock,
     for (int i = 0; i < 3; i++) {
       JsonObjectConst candle = candles[indexes[i]];
       const String time = jsonString(candle["t"], "--:--");
-      const String price = compactChartPrice(candle["c"].as<float>());
+      const String price = removeNumberSeparators(compactChartPrice(candle["c"].as<float>()));
       drawText(labelX[i], y, time + " " + price, 12, TextSize::Tiny);
     }
     return;
@@ -2332,7 +2357,7 @@ static void drawChartPointLabels(JsonObjectConst stock,
   for (int i = 0; i < 3; i++) {
     drawText(labelX[i],
              y,
-             String(labels[i]) + " " + compactChartPrice(history[indexes[i]].as<float>()),
+             String(labels[i]) + " " + removeNumberSeparators(compactChartPrice(history[indexes[i]].as<float>())),
              10,
              TextSize::Tiny);
   }
@@ -2689,12 +2714,12 @@ static void drawMonthCalendarPage(JsonObjectConst root) {
   JsonArrayConst events = root["events"];
 
   for (int i = 0; i < 7; i++) {
-    drawText(52 + i * 112, 55, WEEKDAY_LABELS[i]);
+    drawText(52 + i * 112, 53, WEEKDAY_LABELS[i], 0, TextSize::Tiny);
   }
 
-  const int top = 62;
+  const int top = 56;
   const int cellW = SCREEN_WIDTH / 7;
-  const int cellH = (SCREEN_HEIGHT - top - 4) / 6;
+  const int cellH = (SCREEN_HEIGHT - top - 1) / 6;
   for (int row = 0; row < 6; row++) {
     for (int col = 0; col < 7; col++) {
       const int x = col * cellW;
@@ -2703,21 +2728,29 @@ static void drawMonthCalendarPage(JsonObjectConst root) {
       const String key = dateKeyFromCivil(date);
       display.drawRect(x, y, cellW + 1, cellH + 1, GxEPD_BLACK);
       if (key == todayKey) {
-        display.drawRect(x + 4, y + 4, cellW - 8, cellH - 8, GxEPD_BLACK);
-        display.drawRect(x + 5, y + 5, cellW - 10, cellH - 10, GxEPD_BLACK);
+        display.fillRect(x + 1, y + 1, cellW - 2, 3, GxEPD_BLACK);
+        display.fillRect(x + 1, y + 1, 3, cellH - 2, GxEPD_BLACK);
       }
-      drawText(x + 8, y + 22, date.day == 1 ? String(date.month) + "월 1일" : String(date.day), 6);
+      drawText(x + 3, y + 13, date.day == 1 ? String(date.month) + "월1일" : String(date.day), 5, TextSize::Tiny);
 
-      int eventY = y + 44;
+      int eventY = y + 26;
       int shown = 0;
       for (JsonObjectConst event : events) {
         if (!sameEventDay(event, key)) continue;
-        display.fillRect(x + 8, eventY - 14, 3, 18, GxEPD_BLACK);
-      drawText(x + 16, eventY, jsonString(event["title"]), 6, TextSize::Tiny);
-      drawText(x + 16, eventY + 16, formatIsoTime(jsonString(event["startsAt"])), 5, TextSize::Tiny);
-      eventY += 32;
+        const String time = event["allDay"].as<bool>() ? "" : formatIsoTime(jsonString(event["startsAt"])) + " ";
+        drawText(x + 4, eventY, time + jsonString(event["title"]), 10, TextSize::Tiny);
+        eventY += 13;
         shown++;
-        if (shown >= 2) break;
+        if (shown >= 4) break;
+      }
+      if (events.size() > 0 && shown >= 4) {
+        int remaining = 0;
+        for (JsonObjectConst event : events) {
+          if (sameEventDay(event, key)) remaining++;
+        }
+        if (remaining > shown) {
+          drawText(x + 4, eventY, "+" + String(remaining - shown), 4, TextSize::Tiny);
+        }
       }
     }
   }
@@ -2738,26 +2771,25 @@ static void drawWeekCalendarPage(JsonObjectConst root) {
     const String key = dateKeyFromCivil(date);
     display.drawRect(x, top, colW + 1, SCREEN_HEIGHT - top - 2, GxEPD_BLACK);
     if (key == todayKey) {
-      display.drawRect(x + 4, top + 4, colW - 8, SCREEN_HEIGHT - top - 10, GxEPD_BLACK);
-      display.drawRect(x + 5, top + 5, colW - 10, SCREEN_HEIGHT - top - 12, GxEPD_BLACK);
+      display.fillRect(x + 1, top + 1, colW - 2, 3, GxEPD_BLACK);
+      display.fillRect(x + 1, top + 1, 3, SCREEN_HEIGHT - top - 4, GxEPD_BLACK);
     }
-    drawText(x + 8, 60, String(WEEKDAY_LABELS[col]));
-    drawText(x + 8, 82, String(date.month) + "/" + String(date.day));
-    display.drawLine(x, 92, x + colW, 92, GxEPD_BLACK);
+    drawText(x + 4, 58, String(WEEKDAY_LABELS[col]), 0, TextSize::Tiny);
+    drawText(x + 4, 76, String(date.month) + "/" + String(date.day), 5, TextSize::Tiny);
+    display.drawLine(x, 84, x + colW, 84, GxEPD_BLACK);
 
-    int y = 126;
+    int y = 102;
     int shown = 0;
     for (JsonObjectConst event : events) {
       if (!sameEventDay(event, key)) continue;
-      display.fillRect(x + 8, y - 15, 3, 20, GxEPD_BLACK);
-      drawText(x + 16, y, jsonString(event["title"]), 6, TextSize::Tiny);
-      drawText(x + 16, y + 17, formatIsoTime(jsonString(event["startsAt"])), 5, TextSize::Tiny);
-      y += 48;
+      const String time = event["allDay"].as<bool>() ? "" : formatIsoTime(jsonString(event["startsAt"])) + " ";
+      drawText(x + 5, y, time + jsonString(event["title"]), 10, TextSize::Tiny);
+      y += 14;
       shown++;
-      if (shown >= 6) break;
+      if (shown >= 25) break;
     }
     if (shown == 0) {
-      drawText(x + 22, 274, "일정 없음", 5);
+      drawText(x + 14, 274, "일정 없음", 5, TextSize::Tiny);
     }
   }
 }
@@ -2785,14 +2817,22 @@ static void drawStocksPage(JsonObjectConst root) {
     if (i >= static_cast<int>(stocks.size())) continue;
     JsonObjectConst stock = stocks[i];
     drawInvertedText(x + 1, y + 24, tileW - 1, 24, jsonString(stock["name"]), 10);
-    drawText(x + 8, y + 52, jsonString(stock["price"]), 12);
-    drawText(x + 150, y + 52, jsonString(stock["changePercent"]) + "%", 8);
-    drawPercentLineChart(stock, x + 10, y + 62, tileW - 20, 26);
+    drawText(x + 8, y + 54, removeNumberSeparators(jsonString(stock["price"], "--")), 12, TextSize::Bold);
+    drawText(x + 138,
+             y + 54,
+             stockDirectionWord(stock) + " " + signedStockValue(stock, jsonString(stock["changePercent"], "--"), "%"),
+             11,
+             TextSize::Bold);
+    drawText(x + 8,
+             y + 76,
+             "변동 " + signedStockValue(stock, jsonString(stock["change"], "--")),
+             14,
+             TextSize::Tiny);
     JsonObjectConst flow = stock["investorFlow"];
     if (!flow.isNull()) {
-      drawText(x + 8, y + 104, "개인 " + flowValue(flow["retail"]), 9);
-      drawText(x + 88, y + 104, "기관 " + flowValue(flow["institutional"]), 9);
-      drawText(x + 168, y + 104, "외인 " + flowValue(flow["foreign"]), 9);
+      drawText(x + 8, y + 98, "개인 " + flowValue(flow["retail"]), 10, TextSize::Tiny);
+      drawText(x + 92, y + 98, "기관 " + flowValue(flow["institutional"]), 10, TextSize::Tiny);
+      drawText(x + 176, y + 98, "외인 " + flowValue(flow["foreign"]), 10, TextSize::Tiny);
     }
   }
 }
@@ -2809,7 +2849,8 @@ static void drawStockChartTile(JsonObjectConst stock,
   drawGridCellFrame(x, y, w, h, row, col);
   drawText(x + 10, y + 24, String(globalIndex + 1) + ". " + jsonString(stock["name"]), 14, TextSize::Bold);
   drawText(x + 10, y + 46,
-           jsonString(stock["price"], "--") + "  " + jsonString(stock["changePercent"], "--") + "%",
+           removeNumberSeparators(jsonString(stock["price"], "--")) + "  " +
+               signedStockValue(stock, jsonString(stock["changePercent"], "--"), "%"),
            18);
 
   const int chartX = x + 10;
