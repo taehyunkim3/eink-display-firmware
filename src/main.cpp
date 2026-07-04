@@ -165,6 +165,16 @@ static String lastErrorDetail = "";
 static bool displayInitialized = false;
 static bool sdAssetsInitialized = false;
 static bool sdAssetsAvailable = false;
+
+// Last successfully fetched dashboard JSON. Page transitions re-render from
+// this cache instead of re-downloading, which is the main speedup for button
+// navigation. Only used when deep sleep is disabled (RAM survives).
+static std::unique_ptr<uint8_t[]> cachedDashboardJson;
+static int cachedDashboardJsonSize = 0;
+static uint32_t cachedDashboardJsonAt = 0;
+// HH:MM (KST) when the device last downloaded the dashboard JSON.
+static String lastFetchReceiptTime = "";
+constexpr uint32_t DASHBOARD_CACHE_TTL_MS = 30UL * 60UL * 1000UL;
 RTC_DATA_ATTR static int screenPage = 0;
 RTC_DATA_ATTR static uint32_t pageTransitionRefreshCount = 0;
 
@@ -1817,6 +1827,22 @@ static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buff
   return false;
 }
 
+// "Sat, 04 Jul 2026 07:22:24 GMT" -> "16:22" (KST).
+static String kstTimeFromHttpDate(const String &httpDate) {
+  const int colon = httpDate.indexOf(':');
+  if (colon < 2 || httpDate.length() < colon + 3) {
+    return "";
+  }
+  int hours = httpDate.substring(colon - 2, colon).toInt() + 9;
+  const int minutes = httpDate.substring(colon + 1, colon + 3).toInt();
+  if (hours >= 24) {
+    hours -= 24;
+  }
+  char formatted[6];
+  snprintf(formatted, sizeof(formatted), "%02d:%02d", hours, minutes);
+  return String(formatted);
+}
+
 static bool fetchJsonOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer, int &size) {
   WiFiClient plainClient;
   WiFiClientSecure secureClient;
@@ -1837,6 +1863,8 @@ static bool fetchJsonOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &bu
   }
 
   http.addHeader("Authorization", String("Bearer ") + DEVICE_AUTH_TOKEN);
+  static const char *collectedHeaders[] = {"Date"};
+  http.collectHeaders(collectedHeaders, 1);
   http.setConnectTimeout(DEVICE_HTTP_CONNECT_TIMEOUT_MS);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.setReuse(false);
@@ -1878,7 +1906,11 @@ static bool fetchJsonOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &bu
 
   MemoryWriteStream jsonStream(buffer.get(), bufferCapacity);
   const int written = http.writeToStream(&jsonStream);
+  const String receiptTime = kstTimeFromHttpDate(http.header("Date"));
   http.end();
+  if (receiptTime.length() > 0) {
+    lastFetchReceiptTime = receiptTime;
+  }
 
   lastReceivedBytes = static_cast<int>(jsonStream.size());
   if (written < 0 || jsonStream.overflowed() || jsonStream.size() == 0) {
@@ -2173,6 +2205,9 @@ static void drawNativeHeader(JsonObjectConst root, const String &title, const De
   drawInvertedText(8, 20, 82, 20, title, 5, TextSize::Tiny);
   drawText(100, 20, String(screenPage + 1) + "/" + String(SCREEN_PAGE_COUNT), 0, TextSize::Tiny);
   drawText(146, 20, formatIsoDateTimeKst(jsonString(root["generatedAt"])) + " 업데이트", 0, TextSize::Tiny);
+  if (lastFetchReceiptTime.length() > 0) {
+    drawText(536, 20, "수신 " + lastFetchReceiptTime, 0, TextSize::Micro);
+  }
 
   drawWifiSignalIcon(614, 24, telemetry.rssi);
   drawText(652, 20, telemetry.ssid.length() > 0 ? telemetry.ssid.substring(0, 7) : "Wi-Fi", 8, TextSize::Tiny);
@@ -3004,14 +3039,6 @@ static void setupDisplay() {
     setupSdAssets();
     displayInitialized = true;
 }
-
-// Last successfully fetched dashboard JSON. Page transitions re-render from
-// this cache instead of re-downloading, which is the main speedup for button
-// navigation. Only used when deep sleep is disabled (RAM survives).
-static std::unique_ptr<uint8_t[]> cachedDashboardJson;
-static int cachedDashboardJsonSize = 0;
-static uint32_t cachedDashboardJsonAt = 0;
-constexpr uint32_t DASHBOARD_CACHE_TTL_MS = 30UL * 60UL * 1000UL;
 
 static bool renderDashboardFromCache(bool partialDisplayRefresh) {
   if (!cachedDashboardJson || cachedDashboardJsonSize <= 0) {
