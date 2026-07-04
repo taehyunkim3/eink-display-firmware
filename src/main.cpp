@@ -2879,15 +2879,28 @@ static void drawOverviewPage(JsonObjectConst root) {
   drawKorean(nx + 13, ny + 41, "뉴스", TextSize::Tiny);
   setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
 
-  if (news.isNull() || news.size() == 0) {
+  // Line 1: latest headline. Line 2: daily quote if the server sent one,
+  // otherwise the second headline.
+  const String dailyQuote = jsonString(root["quote"]);
+  if ((news.isNull() || news.size() == 0) && dailyQuote.length() == 0) {
     drawText(nx + 74, ny + 41, "뉴스 정보 없음", 0, TextSize::Tiny);
   } else {
-    for (size_t i = 0; i < news.size() && i < 2; i++) {
+    int line = 0;
+    for (size_t i = 0; !news.isNull() && i < news.size() && line < 2; i++) {
+      if (line == 1 && dailyQuote.length() > 0) {
+        break;
+      }
       JsonObjectConst item = news[i];
-      const int16_t lineY = ny + 27 + static_cast<int16_t>(i) * 27;
+      const int16_t lineY = ny + 27 + static_cast<int16_t>(line) * 27;
       const String time = formatIsoTime(jsonString(item["publishedAt"]));
       drawText(nx + 74, lineY, time.length() > 0 ? time : "--:--", 0, TextSize::Micro);
       drawText(nx + 122, lineY, jsonString(item["title"]), 42, TextSize::Tiny);
+      line++;
+    }
+    if (dailyQuote.length() > 0 && line < 2) {
+      const int16_t lineY = ny + 27 + static_cast<int16_t>(line) * 27;
+      drawText(nx + 74, lineY, "명언", 0, TextSize::Micro);
+      drawText(nx + 122, lineY, dailyQuote, 44, TextSize::Tiny);
     }
   }
 }
