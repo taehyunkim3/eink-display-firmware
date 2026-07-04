@@ -116,12 +116,32 @@ constexpr int SCREEN_BYTES_PER_ROW = SCREEN_WIDTH / 8;
 constexpr int SCREEN_BITMAP_BYTES = SCREEN_BYTES_PER_ROW * SCREEN_HEIGHT;
 static const char *deviceState = "booting";
 static int lastErrorCode = 0;
+static int lastContentLength = 0;
+static int lastReceivedBytes = 0;
+static int lastFetchAttempt = 0;
+static String lastErrorDetail = "";
 static bool displayInitialized = false;
 RTC_DATA_ATTR static int screenPage = 0;
 RTC_DATA_ATTR static uint32_t pageTransitionRefreshCount = 0;
 
 static void setupDisplay();
 static void drawKorean(int16_t x, int16_t y, const String &text);
+
+static void setLastError(int code, const String &detail) {
+  lastErrorCode = code;
+  lastErrorDetail = detail;
+}
+
+static String fetchFailureDetail() {
+  String detail = lastErrorDetail.length() > 0 ? lastErrorDetail : String("알 수 없는 오류");
+  detail += "\nerr=" + String(lastErrorCode) + " try=" + String(lastFetchAttempt);
+
+  if (lastContentLength > 0 || lastReceivedBytes > 0) {
+    detail += " bytes=" + String(lastReceivedBytes) + "/" + String(lastContentLength);
+  }
+
+  return detail;
+}
 
 struct DeviceTelemetry {
   String ssid;
@@ -592,7 +612,18 @@ static void drawStatus(const String &title, const String &detail, bool partialRe
     display.setTextColor(GxEPD_BLACK);
     display.drawRect(10, 10, SCREEN_WIDTH - 20, SCREEN_HEIGHT - 20, GxEPD_BLACK);
     drawKorean(32, 72, title);
-    drawKorean(32, 116, detail);
+    int16_t y = 116;
+    int start = 0;
+    while (start <= detail.length() && y <= SCREEN_HEIGHT - 44) {
+      const int end = detail.indexOf('\n', start);
+      const String line = end >= 0 ? detail.substring(start, end) : detail.substring(start);
+      drawKorean(32, y, line);
+      if (end < 0) {
+        break;
+      }
+      start = end + 1;
+      y += 34;
+    }
   } while (display.nextPage());
 }
 
@@ -968,11 +999,16 @@ static WaitAction sleepOrWait(uint32_t seconds) {
     }
   }
 
-  return WaitAction::None;
+  Serial.println("Refresh interval elapsed");
+  return WaitAction::ForceRefresh;
 }
 
 static bool connectWifi() {
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.disconnect(false, false);
+  delay(200);
+
   const String savedSsid = storedWifiSsid();
   const String savedPassword = storedWifiPassword();
   const String ssid = savedSsid.length() > 0 ? savedSsid : String(WIFI_SSID);
@@ -988,10 +1024,12 @@ static bool connectWifi() {
   Serial.println();
 
   if (WiFi.status() != WL_CONNECTED) {
+    setLastError(static_cast<int>(WiFi.status()), String("Wi-Fi 연결 실패\nSSID: ") + ssid);
     Serial.println("Wi-Fi connection failed");
     return false;
   }
 
+  setLastError(0, "");
   Serial.print("Wi-Fi connected. IP: ");
   Serial.println(WiFi.localIP());
   return true;
@@ -1332,7 +1370,7 @@ static bool fetchBitmapOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &
 
   Serial.printf("GET %s\n", endpoint.c_str());
   if (!http.begin(client, endpoint)) {
-    lastErrorCode = -1001;
+    setLastError(-1001, "HTTP 시작 실패\n주소 또는 TLS 확인");
     Serial.println("HTTP begin failed");
     return false;
   }
@@ -1345,16 +1383,27 @@ static bool fetchBitmapOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &
 
   const int statusCode = http.GET();
   if (statusCode != HTTP_CODE_OK) {
-    lastErrorCode = statusCode;
+    String detail = String("HTTP ") + String(statusCode);
+    if (statusCode == HTTP_CODE_UNAUTHORIZED) {
+      detail += "\n토큰 불일치";
+    } else if (statusCode >= 500) {
+      detail += "\nVercel 서버 오류";
+    } else if (statusCode < 0) {
+      detail += "\nWi-Fi/TLS/타임아웃";
+    } else {
+      detail += "\n서버 응답 확인";
+    }
+    setLastError(statusCode, detail);
     Serial.printf("HTTP failed: %d\n", statusCode);
     http.end();
     return false;
   }
 
   const int contentLength = http.getSize();
+  lastContentLength = contentLength;
   Serial.printf("Bitmap content length: %d\n", contentLength);
   if (contentLength > MAX_IMAGE_BYTES) {
-    lastErrorCode = -1002;
+    setLastError(-1002, "응답 크기 초과\nMAX_IMAGE_BYTES 확인");
     Serial.println("Bitmap response exceeds MAX_IMAGE_BYTES");
     http.end();
     return false;
@@ -1363,7 +1412,7 @@ static bool fetchBitmapOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &
   const int bufferCapacity = contentLength > 0 ? contentLength : MAX_IMAGE_BYTES;
   buffer.reset(new (std::nothrow) uint8_t[bufferCapacity]);
   if (!buffer) {
-    lastErrorCode = -1003;
+    setLastError(-1003, "메모리 할당 실패\n버퍼 크기 확인");
     Serial.println("Bitmap buffer allocation failed");
     http.end();
     return false;
@@ -1375,7 +1424,8 @@ static bool fetchBitmapOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &
   http.end();
 
   if (written < 0 || bitmapStream.overflowed() || bitmapStream.size() == 0) {
-    lastErrorCode = written < 0 ? written : -1004;
+    lastReceivedBytes = static_cast<int>(bitmapStream.size());
+    setLastError(written < 0 ? written : -1004, "비트맵 다운로드 실패\nWi-Fi 신호/타임아웃 확인");
     Serial.printf("Bitmap download failed: written=%d, received=%u, overflow=%s\n",
                   written,
                   static_cast<unsigned int>(bitmapStream.size()),
@@ -1384,7 +1434,8 @@ static bool fetchBitmapOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &
   }
 
   if (contentLength > 0 && static_cast<int>(bitmapStream.size()) != contentLength) {
-    lastErrorCode = -1005;
+    lastReceivedBytes = static_cast<int>(bitmapStream.size());
+    setLastError(-1005, "비트맵 일부만 수신\nWi-Fi 신호 확인");
     Serial.printf("Bitmap download incomplete: %u/%d\n",
                   static_cast<unsigned int>(bitmapStream.size()),
                   contentLength);
@@ -1392,19 +1443,21 @@ static bool fetchBitmapOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &
   }
 
   size = static_cast<int>(bitmapStream.size());
+  lastReceivedBytes = size;
   Serial.printf("Bitmap received bytes: %d\n", size);
   if (size != SCREEN_BITMAP_BYTES) {
-    lastErrorCode = -1006;
+    setLastError(-1006, "비트맵 크기 불일치\nscreen.bin 확인");
     Serial.printf("Bitmap size mismatch: expected=%d, got=%d\n", SCREEN_BITMAP_BYTES, size);
     return false;
   }
 
-  lastErrorCode = 0;
+  setLastError(0, "");
   return true;
 }
 
 static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer, int &size) {
   for (int attempt = 1; attempt <= DEVICE_FETCH_ATTEMPTS; attempt++) {
+    lastFetchAttempt = attempt;
     Serial.printf("Bitmap fetch attempt %d/%d\n", attempt, DEVICE_FETCH_ATTEMPTS);
     if (fetchBitmapOnce(endpoint, buffer, size)) {
       return true;
@@ -1466,6 +1519,11 @@ static void setupDisplay() {
 }
 
 static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRefresh = false) {
+  lastContentLength = 0;
+  lastReceivedBytes = 0;
+  lastFetchAttempt = 0;
+  setLastError(0, "");
+
   if (!ENABLE_DISPLAY) {
     deviceState = "display-disabled";
     Serial.println("Display disabled for serial/debug check");
@@ -1478,7 +1536,7 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
     if (!ENABLE_DISPLAY) {
       return false;
     }
-    drawStatus("와이파이 연결 실패", "와이파이 이름과 비밀번호를 확인하세요.");
+    drawStatus("와이파이 연결 실패", fetchFailureDetail());
     return false;
   }
 
@@ -1503,7 +1561,7 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
     if (!ENABLE_DISPLAY) {
       return false;
     }
-    drawStatus("화면 가져오기 실패", String("재시도 실패 err=") + String(lastErrorCode) + ". Serial 로그 확인.");
+    drawStatus("화면 가져오기 실패", fetchFailureDetail());
     return false;
   }
   deviceState = "bitmap-received";
