@@ -3410,6 +3410,87 @@ static bool renderDashboardFromCache(bool partialDisplayRefresh) {
   return true;
 }
 
+// ---- SD offline cache ---------------------------------------------------
+// The last good dashboard JSON is mirrored to the SD card so the device can
+// keep showing (stale) data when Wi-Fi or the server is unreachable —
+// including after a deep sleep reboot, which wipes the RAM cache.
+static const char *SD_CACHE_JSON_PATH = "/eink/cache/dashboard.json";
+static const char *SD_CACHE_META_PATH = "/eink/cache/meta.txt";
+
+static void saveDashboardToSd(const uint8_t *data, int size) {
+  if (!sdAssetsAvailable || data == nullptr || size <= 0) {
+    return;
+  }
+  SD.mkdir("/eink/cache");
+  File file = SD.open(SD_CACHE_JSON_PATH, FILE_WRITE);
+  if (!file) {
+    Serial.println("SD cache: open for write failed");
+    return;
+  }
+  const size_t written = file.write(data, static_cast<size_t>(size));
+  file.close();
+  if (written != static_cast<size_t>(size)) {
+    Serial.println("SD cache: short write, discarding");
+    SD.remove(SD_CACHE_JSON_PATH);
+    return;
+  }
+
+  File meta = SD.open(SD_CACHE_META_PATH, FILE_WRITE);
+  if (meta) {
+    meta.println(lastFetchHeaderLine);
+    meta.close();
+  }
+  Serial.printf("SD cache: saved %d bytes\n", size);
+}
+
+static bool renderDashboardFromSdCache(bool partialDisplayRefresh) {
+  if (!ENABLE_DISPLAY || !sdAssetsAvailable) {
+    return false;
+  }
+  File file = SD.open(SD_CACHE_JSON_PATH, FILE_READ);
+  if (!file) {
+    return false;
+  }
+  const size_t size = file.size();
+  if (size == 0 || size > MAX_JSON_BYTES) {
+    file.close();
+    return false;
+  }
+  std::unique_ptr<uint8_t[]> buffer(new (std::nothrow) uint8_t[size]);
+  if (!buffer || file.read(buffer.get(), size) != static_cast<int>(size)) {
+    file.close();
+    return false;
+  }
+  file.close();
+
+  // Restore the original receipt timestamp so the header makes the
+  // staleness of the offline data visible.
+  File meta = SD.open(SD_CACHE_META_PATH, FILE_READ);
+  if (meta) {
+    String line = meta.readStringUntil('\n');
+    meta.close();
+    line.trim();
+    if (line.length() > 0) {
+      lastFetchHeaderLine = line + " (오프라인)";
+    }
+  }
+
+  JsonDocument document;
+  if (deserializeJson(document,
+                      reinterpret_cast<const char *>(buffer.get()),
+                      size)) {
+    return false;
+  }
+
+  Serial.println("Rendering offline dashboard from SD cache");
+  const DeviceTelemetry telemetry = readDeviceTelemetry();
+  if (!renderDashboard(document.as<JsonObjectConst>(), telemetry, partialDisplayRefresh)) {
+    return false;
+  }
+  deviceState = "offline-cache";
+  return true;
+}
+
 // ---- OTA firmware update ----------------------------------------------
 // version.json is served next to the dashboard API:
 //   https://<host>/firmware/version.json -> {"version":"1.2.0","url":"..."}
@@ -3534,6 +3615,9 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
     if (!ENABLE_DISPLAY) {
       return false;
     }
+    if (renderDashboardFromSdCache(partialDisplayRefresh)) {
+      return true;
+    }
     drawStatus("와이파이 연결 실패", fetchFailureDetail());
     return false;
   }
@@ -3559,6 +3643,9 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
     if (!ENABLE_DISPLAY) {
       return false;
     }
+    if (renderDashboardFromSdCache(partialDisplayRefresh)) {
+      return true;
+    }
     drawStatus("화면 가져오기 실패", fetchFailureDetail());
     return false;
   }
@@ -3574,6 +3661,7 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
   cachedDashboardJson = std::move(jsonBuffer);
   cachedDashboardJsonSize = jsonSize;
   cachedDashboardJsonAt = millis();
+  saveDashboardToSd(cachedDashboardJson.get(), jsonSize);
 
   JsonDocument document;
   const DeserializationError jsonError = deserializeJson(
