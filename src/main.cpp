@@ -18,7 +18,8 @@
 #include <U8g2_for_Adafruit_GFX.h>
 
 #include "config.h"
-#include "generated/nanum_gothic_coding_bitmap.h"
+#include "generated/nanum_gothic_coding_14_bitmap.h"
+#include "generated/nanum_gothic_coding_18_bitmap.h"
 
 #ifndef BUTTON_DEBOUNCE_MS
 #define BUTTON_DEBOUNCE_MS 30
@@ -132,8 +133,13 @@ static bool displayInitialized = false;
 RTC_DATA_ATTR static int screenPage = 0;
 RTC_DATA_ATTR static uint32_t pageTransitionRefreshCount = 0;
 
+enum class TextSize {
+  Small,
+  Large,
+};
+
 static void setupDisplay();
-static void drawKorean(int16_t x, int16_t y, const String &text);
+static void drawKorean(int16_t x, int16_t y, const String &text, TextSize size = TextSize::Small);
 
 static void setLastError(int code, const String &detail) {
   lastErrorCode = code;
@@ -292,7 +298,7 @@ static uint32_t clampSetting(uint32_t value, uint32_t minimum, uint32_t maximum)
 
 static DeviceSettings defaultDeviceSettings() {
   return {
-      clampSetting(PAGE_FULL_REFRESH_INTERVAL, 1, 20),
+      clampSetting(PAGE_FULL_REFRESH_INTERVAL, 2, 20),
       clampSetting(FALLBACK_SLEEP_SECONDS, SETTINGS_REFRESH_SECONDS_MIN, SETTINGS_REFRESH_SECONDS_MAX),
   };
 }
@@ -306,8 +312,11 @@ static DeviceSettings loadDeviceSettings() {
   const uint32_t refreshSeconds = preferences.getUInt("refreshSec", defaults.refreshSeconds);
   preferences.end();
 
+  const uint32_t normalizedFullRefreshInterval =
+      fullRefreshInterval < 2 ? defaults.fullRefreshInterval : fullRefreshInterval;
+
   return {
-      clampSetting(fullRefreshInterval, 1, 20),
+      clampSetting(normalizedFullRefreshInterval, 2, 20),
       clampSetting(refreshSeconds, SETTINGS_REFRESH_SECONDS_MIN, SETTINGS_REFRESH_SECONDS_MAX),
   };
 }
@@ -315,7 +324,7 @@ static DeviceSettings loadDeviceSettings() {
 static void saveDeviceSettings(const DeviceSettings &settings) {
   Preferences preferences;
   preferences.begin("settings", false);
-  preferences.putUInt("fullEvery", clampSetting(settings.fullRefreshInterval, 1, 20));
+  preferences.putUInt("fullEvery", clampSetting(settings.fullRefreshInterval, 2, 20));
   preferences.putUInt("refreshSec",
                       clampSetting(settings.refreshSeconds,
                                    SETTINGS_REFRESH_SECONDS_MIN,
@@ -779,7 +788,7 @@ static String wifiPasswordChoiceLabel(int index) {
   return "취소";
 }
 
-static const uint32_t FULL_REFRESH_OPTIONS[] = {1, 3, 5, 10, 20};
+static const uint32_t FULL_REFRESH_OPTIONS[] = {2, 3, 5, 10, 20};
 static const uint32_t WEB_REFRESH_OPTIONS[] = {300, 600, 1800, 3600, 7200};
 
 static uint8_t optionIndexForValue(const uint32_t *options,
@@ -809,9 +818,6 @@ static String refreshSecondsLabel(uint32_t seconds) {
 }
 
 static String fullRefreshIntervalLabel(uint32_t interval) {
-  if (interval <= 1) {
-    return "항상 전체";
-  }
   return String(interval) + "번 전환마다";
 }
 
@@ -892,23 +898,57 @@ static void encodeUtf8(uint32_t codepoint, char *buffer) {
   }
 }
 
-static bool isNanumHangul(uint32_t codepoint) {
-  return codepoint >= NANUM_HANGUL_START &&
-         codepoint < NANUM_HANGUL_START + NANUM_HANGUL_COUNT;
+struct BitmapFont {
+  uint16_t hangulStart;
+  uint16_t hangulCount;
+  uint8_t glyphSize;
+  uint8_t glyphBytesPerRow;
+  uint8_t glyphBytes;
+  const uint8_t *bitmaps;
+  uint8_t spaceWidth;
+};
+
+static BitmapFont bitmapFontForSize(TextSize size) {
+  if (size == TextSize::Large) {
+    return {
+        NANUM18_HANGUL_START,
+        NANUM18_HANGUL_COUNT,
+        NANUM18_GLYPH_SIZE,
+        NANUM18_GLYPH_BYTES_PER_ROW,
+        NANUM18_GLYPH_BYTES,
+        NANUM18_HANGUL_BITMAPS,
+        8,
+    };
+  }
+
+  return {
+      NANUM14_HANGUL_START,
+      NANUM14_HANGUL_COUNT,
+      NANUM14_GLYPH_SIZE,
+      NANUM14_GLYPH_BYTES_PER_ROW,
+      NANUM14_GLYPH_BYTES,
+      NANUM14_HANGUL_BITMAPS,
+      6,
+  };
 }
 
-static void drawNanumHangul(int16_t x, int16_t baseline, uint32_t codepoint) {
-  const uint32_t glyphIndex = codepoint - NANUM_HANGUL_START;
-  const uint32_t offset = glyphIndex * NANUM_GLYPH_BYTES;
-  const int16_t top = baseline - NANUM_GLYPH_SIZE + 2;
+static bool isNanumHangul(uint32_t codepoint, const BitmapFont &font) {
+  return codepoint >= font.hangulStart &&
+         codepoint < font.hangulStart + font.hangulCount;
+}
 
-  for (uint8_t row = 0; row < NANUM_GLYPH_SIZE; row++) {
-    for (uint8_t byteIndex = 0; byteIndex < NANUM_GLYPH_BYTES_PER_ROW; byteIndex++) {
-      const uint32_t byteOffset = offset + row * NANUM_GLYPH_BYTES_PER_ROW + byteIndex;
-      const uint8_t bits = pgm_read_byte(&NANUM_HANGUL_BITMAPS[byteOffset]);
+static void drawNanumHangul(int16_t x, int16_t baseline, uint32_t codepoint, const BitmapFont &font) {
+  const uint32_t glyphIndex = codepoint - font.hangulStart;
+  const uint32_t offset = glyphIndex * font.glyphBytes;
+  const int16_t top = baseline - font.glyphSize + 2;
+
+  for (uint8_t row = 0; row < font.glyphSize; row++) {
+    for (uint8_t byteIndex = 0; byteIndex < font.glyphBytesPerRow; byteIndex++) {
+      const uint32_t byteOffset = offset + row * font.glyphBytesPerRow + byteIndex;
+      const uint8_t bits = pgm_read_byte(&font.bitmaps[byteOffset]);
       for (uint8_t bit = 0; bit < 8; bit++) {
         const uint8_t col = byteIndex * 8 + bit;
-        if (col >= NANUM_GLYPH_SIZE) {
+        if (col >= font.glyphSize) {
           break;
         }
         if ((bits & (0x80 >> bit)) != 0) {
@@ -919,8 +959,9 @@ static void drawNanumHangul(int16_t x, int16_t baseline, uint32_t codepoint) {
   }
 }
 
-static void drawKorean(int16_t x, int16_t y, const String &text) {
+static void drawKorean(int16_t x, int16_t y, const String &text, TextSize size) {
   setKoreanFont();
+  const BitmapFont font = bitmapFontForSize(size);
   int16_t cursorX = x;
   size_t index = 0;
   const char *raw = text.c_str();
@@ -935,12 +976,12 @@ static void drawKorean(int16_t x, int16_t y, const String &text) {
       break;
     }
     if (codepoint == ' ') {
-      cursorX += 8;
+      cursorX += font.spaceWidth;
       continue;
     }
-    if (isNanumHangul(codepoint)) {
-      drawNanumHangul(cursorX, y, codepoint);
-      cursorX += NANUM_GLYPH_SIZE;
+    if (isNanumHangul(codepoint, font)) {
+      drawNanumHangul(cursorX, y, codepoint, font);
+      cursorX += font.glyphSize;
       continue;
     }
 
@@ -1861,14 +1902,24 @@ static bool sameEventDay(JsonObjectConst event, const String &dateKey) {
   return dateKeyFromIso(jsonString(event["startsAt"])) == dateKey;
 }
 
-static void drawText(int16_t x, int16_t y, const String &text, int maxChars = 0) {
-  drawKorean(x, y, maxChars > 0 ? utf8Prefix(text, maxChars) : text);
+static void drawText(int16_t x,
+                     int16_t y,
+                     const String &text,
+                     int maxChars = 0,
+                     TextSize size = TextSize::Small) {
+  drawKorean(x, y, maxChars > 0 ? utf8Prefix(text, maxChars) : text, size);
 }
 
-static void drawInvertedText(int16_t x, int16_t y, int16_t width, int16_t height, const String &text, int maxChars = 0) {
+static void drawInvertedText(int16_t x,
+                             int16_t y,
+                             int16_t width,
+                             int16_t height,
+                             const String &text,
+                             int maxChars = 0,
+                             TextSize size = TextSize::Large) {
   display.fillRect(x, y - height + 5, width, height, GxEPD_BLACK);
   setKoreanTextColors(GxEPD_WHITE, GxEPD_BLACK);
-  drawKorean(x + 5, y, maxChars > 0 ? utf8Prefix(text, maxChars) : text);
+  drawKorean(x + 5, y, maxChars > 0 ? utf8Prefix(text, maxChars) : text, size);
   setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
 }
 
@@ -1956,7 +2007,7 @@ static void drawWeatherIcon(int16_t x, int16_t y, int code) {
 
 static void drawOverviewPage(JsonObjectConst root) {
   JsonObjectConst weather = root["weather"];
-  drawText(24, 72, "오늘 요약");
+  drawText(24, 72, "오늘 요약", 0, TextSize::Large);
   drawWeatherIcon(28, 98, weather["weatherCode"].isNull() ? 3 : weather["weatherCode"].as<int>());
   drawText(72, 120, jsonString(weather["label"]) + " " + formatValue(weather["temperatureC"], "C"));
   drawText(72, 148, jsonString(weather["condition"], "날씨 정보 없음"), 18);
@@ -1965,7 +2016,7 @@ static void drawOverviewPage(JsonObjectConst root) {
   drawText(350, 196, "바람 " + formatValue(weather["windKph"], "km/h"));
 
   display.drawLine(20, 226, SCREEN_WIDTH - 20, 226, GxEPD_BLACK);
-  drawText(28, 258, "다가오는 일정");
+  drawText(28, 258, "다가오는 일정", 0, TextSize::Large);
   JsonArrayConst events = root["events"];
   int y = 292;
   for (size_t i = 0; i < events.size() && i < 3; i++) {
@@ -1975,7 +2026,7 @@ static void drawOverviewPage(JsonObjectConst root) {
     y += 54;
   }
 
-  drawText(450, 258, "시장");
+  drawText(450, 258, "시장", 0, TextSize::Large);
   JsonArrayConst stocks = root["stocks"];
   y = 292;
   for (size_t i = 0; i < stocks.size() && i < 3; i++) {
@@ -1989,7 +2040,7 @@ static void drawOverviewPage(JsonObjectConst root) {
 
 static void drawWeatherPage(JsonObjectConst root) {
   JsonObjectConst weather = root["weather"];
-  drawText(24, 68, jsonString(weather["label"]) + " 7일 예보");
+  drawText(24, 68, jsonString(weather["label"]) + " 7일 예보", 0, TextSize::Large);
   JsonArrayConst days = weather["daily"];
   int y = 92;
   for (size_t i = 0; i < days.size() && i < 7; i++) {
@@ -2129,7 +2180,7 @@ static void drawStocksPage(JsonObjectConst root) {
 }
 
 static void drawDevicePage(const DeviceTelemetry &telemetry) {
-  drawText(28, 76, "기기상태");
+  drawText(28, 76, "기기상태", 0, TextSize::Large);
   drawText(28, 118, String("Wi-Fi: ") + telemetry.ssid);
   drawText(28, 154, String("RSSI: ") + String(telemetry.rssi) + " dBm");
   if (telemetry.batteryPercent >= 0) {

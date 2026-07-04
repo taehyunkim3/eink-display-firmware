@@ -41,10 +41,11 @@ def glyph_bytes(font: ImageFont.FreeTypeFont, codepoint: int, size: int, thresho
     return bytes(packed)
 
 
-def write_header(font_path: Path, output_path: Path, size: int, threshold: int) -> None:
+def write_header(font_path: Path, output_path: Path, size: int, threshold: int, symbol_prefix: str) -> None:
     font = ImageFont.truetype(str(font_path), size)
     bytes_per_row = (size + 7) // 8
     bytes_per_glyph = bytes_per_row * size
+    prefix = symbol_prefix.upper()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as out:
@@ -52,12 +53,12 @@ def write_header(font_path: Path, output_path: Path, size: int, threshold: int) 
         out.write("// Source font: NanumGothicCoding, Open Font License.\n")
         out.write("#pragma once\n\n")
         out.write("#include <Arduino.h>\n\n")
-        out.write(f"static constexpr uint16_t NANUM_HANGUL_START = 0x{HANGUL_START:04X};\n")
-        out.write(f"static constexpr uint16_t NANUM_HANGUL_COUNT = {HANGUL_COUNT};\n")
-        out.write(f"static constexpr uint8_t NANUM_GLYPH_SIZE = {size};\n")
-        out.write(f"static constexpr uint8_t NANUM_GLYPH_BYTES_PER_ROW = {bytes_per_row};\n")
-        out.write(f"static constexpr uint8_t NANUM_GLYPH_BYTES = {bytes_per_glyph};\n\n")
-        out.write("static const uint8_t NANUM_HANGUL_BITMAPS[] PROGMEM = {\n")
+        out.write(f"static constexpr uint16_t {prefix}_HANGUL_START = 0x{HANGUL_START:04X};\n")
+        out.write(f"static constexpr uint16_t {prefix}_HANGUL_COUNT = {HANGUL_COUNT};\n")
+        out.write(f"static constexpr uint8_t {prefix}_GLYPH_SIZE = {size};\n")
+        out.write(f"static constexpr uint8_t {prefix}_GLYPH_BYTES_PER_ROW = {bytes_per_row};\n")
+        out.write(f"static constexpr uint8_t {prefix}_GLYPH_BYTES = {bytes_per_glyph};\n\n")
+        out.write(f"static const uint8_t {prefix}_HANGUL_BITMAPS[] PROGMEM = {{\n")
 
         line = "  "
         for index in range(HANGUL_COUNT):
@@ -79,8 +80,9 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--size", default=18, type=int)
     parser.add_argument("--threshold", default=96, type=int)
+    parser.add_argument("--symbol-prefix", default="NANUM")
     args = parser.parse_args()
-    write_header(args.font, args.output, args.size, args.threshold)
+    write_header(args.font, args.output, args.size, args.threshold, args.symbol_prefix)
 
 
 if __name__ == "__main__":
