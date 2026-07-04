@@ -1048,7 +1048,7 @@ static void drawBitmapGlyph(int16_t x,
   for (uint8_t row = 0; row < font.glyphSize; row++) {
     for (uint8_t byteIndex = 0; byteIndex < font.glyphBytesPerRow; byteIndex++) {
       const uint32_t byteOffset = offset + row * font.glyphBytesPerRow + byteIndex;
-      const uint8_t bits = pgm_read_byte(&font.bitmaps[byteOffset]);
+      const uint8_t bits = pgm_read_byte(&bitmaps[byteOffset]);
       for (uint8_t bit = 0; bit < 8; bit++) {
         const uint8_t col = byteIndex * 8 + bit;
         if (col >= font.glyphSize) {
