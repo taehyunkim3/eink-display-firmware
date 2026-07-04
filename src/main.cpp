@@ -18,6 +18,7 @@
 #include <U8g2_for_Adafruit_GFX.h>
 
 #include "config.h"
+#include "generated/nanum_gothic_coding_bitmap.h"
 
 #ifndef BUTTON_DEBOUNCE_MS
 #define BUTTON_DEBOUNCE_MS 30
@@ -114,6 +115,8 @@ static const char WIFI_PASSWORD_CHARSET[] =
 GxEPD2_BW<EPD_MODEL, EPD_MODEL::HEIGHT> display(
     EPD_MODEL(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
 U8G2_FOR_ADAFRUIT_GFX koreanFonts;
+static uint16_t koreanTextForeground = GxEPD_BLACK;
+static uint16_t koreanTextBackground = GxEPD_WHITE;
 
 constexpr int SCREEN_WIDTH = 800;
 constexpr int SCREEN_HEIGHT = 480;
@@ -812,17 +815,141 @@ static String fullRefreshIntervalLabel(uint32_t interval) {
   return String(interval) + "번 전환마다";
 }
 
+static void setKoreanTextColors(uint16_t foreground, uint16_t background) {
+  koreanTextForeground = foreground;
+  koreanTextBackground = background;
+  koreanFonts.setForegroundColor(foreground);
+  koreanFonts.setBackgroundColor(background);
+}
+
 static void setKoreanFont() {
   koreanFonts.setFont(u8g2_font_unifont_t_korean2);
   koreanFonts.setFontMode(1);
   koreanFonts.setFontDirection(0);
-  koreanFonts.setForegroundColor(GxEPD_BLACK);
-  koreanFonts.setBackgroundColor(GxEPD_WHITE);
+  koreanFonts.setForegroundColor(koreanTextForeground);
+  koreanFonts.setBackgroundColor(koreanTextBackground);
+}
+
+static bool readUtf8Codepoint(const char *text, size_t length, size_t &index, uint32_t &codepoint) {
+  if (index >= length) {
+    return false;
+  }
+
+  const uint8_t first = static_cast<uint8_t>(text[index++]);
+  if (first < 0x80) {
+    codepoint = first;
+    return true;
+  }
+
+  uint8_t expected = 0;
+  if ((first & 0xE0) == 0xC0) {
+    codepoint = first & 0x1F;
+    expected = 1;
+  } else if ((first & 0xF0) == 0xE0) {
+    codepoint = first & 0x0F;
+    expected = 2;
+  } else if ((first & 0xF8) == 0xF0) {
+    codepoint = first & 0x07;
+    expected = 3;
+  } else {
+    codepoint = first;
+    return true;
+  }
+
+  for (uint8_t i = 0; i < expected; i++) {
+    if (index >= length) {
+      return false;
+    }
+    const uint8_t next = static_cast<uint8_t>(text[index++]);
+    if ((next & 0xC0) != 0x80) {
+      codepoint = first;
+      return true;
+    }
+    codepoint = (codepoint << 6) | (next & 0x3F);
+  }
+  return true;
+}
+
+static void encodeUtf8(uint32_t codepoint, char *buffer) {
+  if (codepoint < 0x80) {
+    buffer[0] = static_cast<char>(codepoint);
+    buffer[1] = '\0';
+  } else if (codepoint < 0x800) {
+    buffer[0] = static_cast<char>(0xC0 | (codepoint >> 6));
+    buffer[1] = static_cast<char>(0x80 | (codepoint & 0x3F));
+    buffer[2] = '\0';
+  } else if (codepoint < 0x10000) {
+    buffer[0] = static_cast<char>(0xE0 | (codepoint >> 12));
+    buffer[1] = static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+    buffer[2] = static_cast<char>(0x80 | (codepoint & 0x3F));
+    buffer[3] = '\0';
+  } else {
+    buffer[0] = static_cast<char>(0xF0 | (codepoint >> 18));
+    buffer[1] = static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F));
+    buffer[2] = static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+    buffer[3] = static_cast<char>(0x80 | (codepoint & 0x3F));
+    buffer[4] = '\0';
+  }
+}
+
+static bool isNanumHangul(uint32_t codepoint) {
+  return codepoint >= NANUM_HANGUL_START &&
+         codepoint < NANUM_HANGUL_START + NANUM_HANGUL_COUNT;
+}
+
+static void drawNanumHangul(int16_t x, int16_t baseline, uint32_t codepoint) {
+  const uint32_t glyphIndex = codepoint - NANUM_HANGUL_START;
+  const uint32_t offset = glyphIndex * NANUM_GLYPH_BYTES;
+  const int16_t top = baseline - NANUM_GLYPH_SIZE + 2;
+
+  for (uint8_t row = 0; row < NANUM_GLYPH_SIZE; row++) {
+    for (uint8_t byteIndex = 0; byteIndex < NANUM_GLYPH_BYTES_PER_ROW; byteIndex++) {
+      const uint32_t byteOffset = offset + row * NANUM_GLYPH_BYTES_PER_ROW + byteIndex;
+      const uint8_t bits = pgm_read_byte(&NANUM_HANGUL_BITMAPS[byteOffset]);
+      for (uint8_t bit = 0; bit < 8; bit++) {
+        const uint8_t col = byteIndex * 8 + bit;
+        if (col >= NANUM_GLYPH_SIZE) {
+          break;
+        }
+        if ((bits & (0x80 >> bit)) != 0) {
+          display.drawPixel(x + col, top + row, koreanTextForeground);
+        }
+      }
+    }
+  }
 }
 
 static void drawKorean(int16_t x, int16_t y, const String &text) {
   setKoreanFont();
-  koreanFonts.drawUTF8(x, y, text.c_str());
+  int16_t cursorX = x;
+  size_t index = 0;
+  const char *raw = text.c_str();
+  const size_t length = text.length();
+
+  while (index < length) {
+    uint32_t codepoint = 0;
+    if (!readUtf8Codepoint(raw, length, index, codepoint)) {
+      break;
+    }
+    if (codepoint == '\n') {
+      break;
+    }
+    if (codepoint == ' ') {
+      cursorX += 8;
+      continue;
+    }
+    if (isNanumHangul(codepoint)) {
+      drawNanumHangul(cursorX, y, codepoint);
+      cursorX += NANUM_GLYPH_SIZE;
+      continue;
+    }
+
+    char utf8[5] = {};
+    encodeUtf8(codepoint, utf8);
+    koreanFonts.drawUTF8(cursorX, y, utf8);
+    const int16_t width = koreanFonts.getUTF8Width(utf8);
+    cursorX += width > 0 ? width : 8;
+  }
 }
 
 static void drawSettingsFrame(const String &apName) {
@@ -845,20 +972,12 @@ static void drawSelectionRow(int16_t x,
                              bool selected) {
   if (selected) {
     display.fillRect(x - 6, y - 20, width, 26, GxEPD_BLACK);
-    koreanFonts.setForegroundColor(GxEPD_WHITE);
-    koreanFonts.setBackgroundColor(GxEPD_BLACK);
+    setKoreanTextColors(GxEPD_WHITE, GxEPD_BLACK);
   } else {
-    koreanFonts.setForegroundColor(GxEPD_BLACK);
-    koreanFonts.setBackgroundColor(GxEPD_WHITE);
+    setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
   }
-  setKoreanFont();
-  if (selected) {
-    koreanFonts.setForegroundColor(GxEPD_WHITE);
-    koreanFonts.setBackgroundColor(GxEPD_BLACK);
-  }
-  koreanFonts.drawUTF8(x, y, text.c_str());
-  koreanFonts.setForegroundColor(GxEPD_BLACK);
-  koreanFonts.setBackgroundColor(GxEPD_WHITE);
+  drawKorean(x, y, text);
+  setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
 }
 
 static void drawSettingsScreen(SettingsStage stage,
@@ -906,19 +1025,11 @@ static void drawSettingsScreen(SettingsStage stage,
           const int16_t y = rowTop + i * rowHeight;
           if (i == selectedNetwork) {
             display.fillRect(22, y - 15, SCREEN_WIDTH - 52, 17, GxEPD_BLACK);
-            koreanFonts.setForegroundColor(GxEPD_WHITE);
-            koreanFonts.setBackgroundColor(GxEPD_BLACK);
+            setKoreanTextColors(GxEPD_WHITE, GxEPD_BLACK);
           } else {
-            koreanFonts.setForegroundColor(GxEPD_BLACK);
-            koreanFonts.setBackgroundColor(GxEPD_WHITE);
+            setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
           }
-
-          setKoreanFont();
-          if (i == selectedNetwork) {
-            koreanFonts.setForegroundColor(GxEPD_WHITE);
-            koreanFonts.setBackgroundColor(GxEPD_BLACK);
-          }
-          koreanFonts.drawUTF8(32, y, networks[i].ssid.substring(0, 22).c_str());
+          drawKorean(32, y, networks[i].ssid.substring(0, 22));
           display.setTextColor(i == selectedNetwork ? GxEPD_WHITE : GxEPD_BLACK);
           display.setFont(&FreeMono9pt7b);
           display.setCursor(604, y);
@@ -929,6 +1040,7 @@ static void drawSettingsScreen(SettingsStage stage,
                              networks[i].rssi,
                              i == selectedNetwork ? GxEPD_WHITE : GxEPD_BLACK);
           display.setTextColor(GxEPD_BLACK);
+          setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
         }
       }
     } else if (stage == SettingsStage::PasswordInput) {
@@ -1755,12 +1867,9 @@ static void drawText(int16_t x, int16_t y, const String &text, int maxChars = 0)
 
 static void drawInvertedText(int16_t x, int16_t y, int16_t width, int16_t height, const String &text, int maxChars = 0) {
   display.fillRect(x, y - height + 5, width, height, GxEPD_BLACK);
-  setKoreanFont();
-  koreanFonts.setForegroundColor(GxEPD_WHITE);
-  koreanFonts.setBackgroundColor(GxEPD_BLACK);
-  koreanFonts.drawUTF8(x + 5, y, (maxChars > 0 ? utf8Prefix(text, maxChars) : text).c_str());
-  koreanFonts.setForegroundColor(GxEPD_BLACK);
-  koreanFonts.setBackgroundColor(GxEPD_WHITE);
+  setKoreanTextColors(GxEPD_WHITE, GxEPD_BLACK);
+  drawKorean(x + 5, y, maxChars > 0 ? utf8Prefix(text, maxChars) : text);
+  setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
 }
 
 static void drawBatteryIcon(int16_t x, int16_t y, int percent, bool charging) {
@@ -2084,8 +2193,7 @@ static void setupDisplay() {
     koreanFonts.begin(display);
     koreanFonts.setFontMode(1);
     koreanFonts.setFontDirection(0);
-    koreanFonts.setForegroundColor(GxEPD_BLACK);
-    koreanFonts.setBackgroundColor(GxEPD_WHITE);
+    setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
     Serial.println("Drawing boot test screen");
     drawBootTest();
     delay(BOOT_TEST_SECONDS * 1000UL);
