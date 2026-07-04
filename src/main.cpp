@@ -186,6 +186,18 @@ static uint32_t cachedDashboardJsonAt = 0;
 // Full "YYYY년 MM월 DD일 X요일 HH:MM 수신" line (KST) built from the HTTP Date
 // header when the device last downloaded the dashboard JSON.
 static String lastFetchHeaderLine = "";
+// KST clock estimate (no RTC): minutes-of-day captured from the HTTP Date
+// header plus the millis() tick at that moment. -1 = never synced.
+static int32_t lastFetchKstMinutes = -1;
+static uint32_t lastFetchTickMs = 0;
+
+static int32_t currentKstMinutesEstimate() {
+  if (lastFetchKstMinutes < 0) {
+    return -1;
+  }
+  const uint32_t elapsedMinutes = (millis() - lastFetchTickMs) / 60000UL;
+  return static_cast<int32_t>((lastFetchKstMinutes + elapsedMinutes) % 1440UL);
+}
 constexpr uint32_t DASHBOARD_CACHE_TTL_MS = 30UL * 60UL * 1000UL;
 RTC_DATA_ATTR static int screenPage = 0;
 RTC_DATA_ATTR static uint32_t pageTransitionRefreshCount = 0;
@@ -228,10 +240,12 @@ struct DeviceTelemetry {
 struct DeviceSettings {
   uint32_t fullRefreshInterval;
   uint32_t refreshSeconds;
-  int32_t startPage;      // -1 = resume the last viewed page
-  uint32_t pageMask;      // bit i set = page i is visible
-  uint32_t rotateSeconds; // 0 = auto page rotation off
+  int32_t startPage;       // -1 = resume the last viewed page
+  uint32_t pageMask;       // bit i set = page i is visible
+  uint32_t rotateSeconds;  // 0 = auto page rotation off
   bool deepSleep;
+  int32_t nightStartHour;  // -1 = night mode off
+  int32_t nightEndHour;    // KST hour; window may wrap past midnight
 };
 
 constexpr uint32_t ALL_PAGES_MASK = (1UL << SCREEN_PAGE_COUNT) - 1UL;
@@ -389,6 +403,8 @@ static DeviceSettings defaultDeviceSettings() {
       ALL_PAGES_MASK,
       0,
       ENABLE_DEEP_SLEEP,
+      -1,
+      6,
   };
 }
 
@@ -411,6 +427,15 @@ static DeviceSettings sanitizeDeviceSettings(DeviceSettings settings) {
   if (settings.rotateSeconds > 0) {
     settings.rotateSeconds = clampSetting(settings.rotateSeconds, 30, 86400);
   }
+  if (settings.nightStartHour < -1 || settings.nightStartHour > 23) {
+    settings.nightStartHour = -1;
+  }
+  if (settings.nightEndHour < 0 || settings.nightEndHour > 23) {
+    settings.nightEndHour = 6;
+  }
+  if (settings.nightStartHour == settings.nightEndHour) {
+    settings.nightStartHour = -1;
+  }
   return settings;
 }
 
@@ -425,6 +450,8 @@ static DeviceSettings loadDeviceSettings() {
       preferences.getUInt("pageMask", defaults.pageMask),
       preferences.getUInt("rotateSec", defaults.rotateSeconds),
       preferences.getBool("deepSleep", defaults.deepSleep),
+      preferences.getInt("nightStart", defaults.nightStartHour),
+      preferences.getInt("nightEnd", defaults.nightEndHour),
   };
   preferences.end();
   return sanitizeDeviceSettings(settings);
@@ -440,6 +467,8 @@ static void saveDeviceSettings(const DeviceSettings &rawSettings) {
   preferences.putUInt("pageMask", settings.pageMask);
   preferences.putUInt("rotateSec", settings.rotateSeconds);
   preferences.putBool("deepSleep", settings.deepSleep);
+  preferences.putInt("nightStart", settings.nightStartHour);
+  preferences.putInt("nightEnd", settings.nightEndHour);
   preferences.end();
 }
 
@@ -1208,8 +1237,36 @@ static bool shouldUsePartialRefreshForScreenTransition() {
   return true;
 }
 
+// Seconds until the night window ends, or 0 when night mode is off /
+// inactive / the clock is not synced yet.
+static uint32_t nightSecondsRemaining(const DeviceSettings &settings) {
+  if (settings.nightStartHour < 0) {
+    return 0;
+  }
+  const int32_t nowMinutes = currentKstMinutesEstimate();
+  if (nowMinutes < 0) {
+    return 0;
+  }
+
+  const int32_t startMinutes = settings.nightStartHour * 60;
+  const int32_t endMinutes = settings.nightEndHour * 60;
+  const bool inNight = startMinutes <= endMinutes
+                           ? nowMinutes >= startMinutes && nowMinutes < endMinutes
+                           : nowMinutes >= startMinutes || nowMinutes < endMinutes;
+  if (!inNight) {
+    return 0;
+  }
+  return static_cast<uint32_t>(((endMinutes - nowMinutes + 1440) % 1440)) * 60UL;
+}
+
 static WaitAction sleepOrWait(const DeviceSettings &settings) {
-  const uint32_t seconds = settings.refreshSeconds;
+  uint32_t seconds = settings.refreshSeconds;
+  const uint32_t nightSeconds = nightSecondsRemaining(settings);
+  if (nightSeconds > seconds) {
+    seconds = nightSeconds;
+    Serial.printf("Night mode: extending sleep to %lu seconds\n",
+                  static_cast<unsigned long>(seconds));
+  }
   if (settings.deepSleep) {
     Serial.printf("Deep sleep for %lu seconds\n", static_cast<unsigned long>(seconds));
     if (ENABLE_BUTTONS) {
@@ -1432,6 +1489,8 @@ static void handleBleConfigWrite(const std::string &payload) {
     config["pageMask"] = settings.pageMask;
     config["rotateSec"] = settings.rotateSeconds;
     config["deepSleep"] = settings.deepSleep;
+    config["nightStart"] = settings.nightStartHour;
+    config["nightEnd"] = settings.nightEndHour;
     config["pageCount"] = SCREEN_PAGE_COUNT;
     String serialized;
     serializeJson(response, serialized);
@@ -1505,6 +1564,14 @@ static void handleBleConfigWrite(const std::string &payload) {
   }
   if (!document["deepSleep"].isNull()) {
     settings.deepSleep = document["deepSleep"] | false;
+    settingsChanged = true;
+  }
+  if (!document["nightStart"].isNull()) {
+    settings.nightStartHour = document["nightStart"] | -1;
+    settingsChanged = true;
+  }
+  if (!document["nightEnd"].isNull()) {
+    settings.nightEndHour = document["nightEnd"] | 6;
     settingsChanged = true;
   }
   if (settingsChanged) {
@@ -1901,6 +1968,9 @@ static String kstHeaderLineFromHttpDate(const String &httpDate) {
   if (mktime(&timeInfo) == static_cast<time_t>(-1)) {
     return "";
   }
+
+  lastFetchKstMinutes = timeInfo.tm_hour * 60 + timeInfo.tm_min;
+  lastFetchTickMs = millis();
 
   static const char *WEEKDAYS[] = {"일", "월", "화", "수", "목", "금", "토"};
   char line[64];
