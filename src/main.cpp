@@ -11,6 +11,7 @@
 #include <memory>
 #include <new>
 
+#include <ArduinoJson.h>
 #include <Fonts/FreeMono9pt7b.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <GxEPD2_BW.h>
@@ -100,6 +101,10 @@
 
 #ifndef DEVICE_FETCH_ATTEMPTS
 #define DEVICE_FETCH_ATTEMPTS 3
+#endif
+
+#ifndef MAX_JSON_BYTES
+#define MAX_JSON_BYTES 64000
 #endif
 
 static const char WIFI_PASSWORD_CHARSET[] =
@@ -427,8 +432,32 @@ static String endpointWithTelemetry(const DeviceTelemetry &telemetry) {
   return endpoint;
 }
 
+static String dashboardJsonEndpoint() {
+  String endpoint = DEVICE_ENDPOINT;
+  endpoint.replace("/api/screen.bin", "/api/screen.json");
+  endpoint.replace("/api/screen.png", "/api/screen.json");
+  return endpoint;
+}
+
+static String endpointWithTelemetry(const String &baseEndpoint, const DeviceTelemetry &telemetry) {
+  String endpoint = baseEndpoint;
+  endpoint += endpoint.indexOf('?') >= 0 ? '&' : '?';
+  endpoint += "wifi=connected";
+  endpoint += "&ssid=" + urlEncode(telemetry.ssid);
+  endpoint += "&rssi=" + String(telemetry.rssi);
+  endpoint += "&page=" + String(screenPage);
+
+  if (telemetry.batteryPercent >= 0) {
+    endpoint += "&battery=" + String(telemetry.batteryPercent);
+    endpoint += "&batteryVoltage=" + String(telemetry.batteryVoltage, 2);
+  }
+  endpoint += "&charge=" + telemetry.batteryChargeState;
+
+  return endpoint;
+}
+
 static String endpointWithTelemetry(const DeviceTelemetry &telemetry, bool forceServerRefresh) {
-  String endpoint = endpointWithTelemetry(telemetry);
+  String endpoint = endpointWithTelemetry(dashboardJsonEndpoint(), telemetry);
   if (forceServerRefresh) {
     endpoint += "&force=1";
     endpoint += "&nonce=" + String(millis());
@@ -1473,6 +1502,103 @@ static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buff
   return false;
 }
 
+static bool fetchJsonOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer, int &size) {
+  WiFiClient plainClient;
+  WiFiClientSecure secureClient;
+  HTTPClient http;
+
+  if (isHttpsEndpoint()) {
+    secureClient.setInsecure();
+  }
+
+  WiFiClient &client = isHttpsEndpoint()
+                           ? static_cast<WiFiClient &>(secureClient)
+                           : static_cast<WiFiClient &>(plainClient);
+
+  Serial.printf("GET %s\n", endpoint.c_str());
+  if (!http.begin(client, endpoint)) {
+    setLastError(-1101, "JSON HTTP 시작 실패\n주소 또는 TLS 확인");
+    return false;
+  }
+
+  http.addHeader("Authorization", String("Bearer ") + DEVICE_AUTH_TOKEN);
+  http.setConnectTimeout(DEVICE_HTTP_CONNECT_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setReuse(false);
+  http.setTimeout(DEVICE_HTTP_TIMEOUT_MS);
+
+  const int statusCode = http.GET();
+  if (statusCode != HTTP_CODE_OK) {
+    String detail = String("JSON HTTP ") + String(statusCode);
+    if (statusCode == HTTP_CODE_UNAUTHORIZED) {
+      detail += "\n토큰 불일치";
+    } else if (statusCode >= 500) {
+      detail += "\nVercel 서버 오류";
+    } else if (statusCode < 0) {
+      detail += "\nWi-Fi/TLS/타임아웃";
+    } else {
+      detail += "\n서버 응답 확인";
+    }
+    setLastError(statusCode, detail);
+    http.end();
+    return false;
+  }
+
+  const int contentLength = http.getSize();
+  lastContentLength = contentLength;
+  Serial.printf("JSON content length: %d\n", contentLength);
+  if (contentLength > MAX_JSON_BYTES) {
+    setLastError(-1102, "JSON 응답 크기 초과\nMAX_JSON_BYTES 확인");
+    http.end();
+    return false;
+  }
+
+  const int bufferCapacity = contentLength > 0 ? contentLength : MAX_JSON_BYTES;
+  buffer.reset(new (std::nothrow) uint8_t[bufferCapacity]);
+  if (!buffer) {
+    setLastError(-1103, "JSON 메모리 할당 실패\n버퍼 크기 확인");
+    http.end();
+    return false;
+  }
+
+  MemoryWriteStream jsonStream(buffer.get(), bufferCapacity);
+  const int written = http.writeToStream(&jsonStream);
+  http.end();
+
+  lastReceivedBytes = static_cast<int>(jsonStream.size());
+  if (written < 0 || jsonStream.overflowed() || jsonStream.size() == 0) {
+    setLastError(written < 0 ? written : -1104, "JSON 다운로드 실패\nWi-Fi 신호/타임아웃 확인");
+    return false;
+  }
+
+  if (contentLength > 0 && static_cast<int>(jsonStream.size()) != contentLength) {
+    setLastError(-1105, "JSON 일부만 수신\nWi-Fi 신호 확인");
+    return false;
+  }
+
+  size = static_cast<int>(jsonStream.size());
+  setLastError(0, "");
+  return true;
+}
+
+static bool fetchJson(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer, int &size) {
+  for (int attempt = 1; attempt <= DEVICE_FETCH_ATTEMPTS; attempt++) {
+    lastFetchAttempt = attempt;
+    Serial.printf("JSON fetch attempt %d/%d\n", attempt, DEVICE_FETCH_ATTEMPTS);
+    if (fetchJsonOnce(endpoint, buffer, size)) {
+      return true;
+    }
+
+    buffer.reset();
+    size = 0;
+    if (attempt < DEVICE_FETCH_ATTEMPTS) {
+      delay(1200 * attempt);
+    }
+  }
+
+  return false;
+}
+
 static bool renderBitmap(const uint8_t *buffer, int size, bool partialRefresh) {
   if (size != SCREEN_BITMAP_BYTES) {
     return false;
@@ -1493,6 +1619,423 @@ static bool renderBitmap(const uint8_t *buffer, int size, bool partialRefresh) {
         const bool black = buffer[rowOffset + (x >> 3)] & (0x80 >> (x & 7));
         display.drawPixel(x, y, black ? GxEPD_BLACK : GxEPD_WHITE);
       }
+    }
+  } while (display.nextPage());
+
+  return true;
+}
+
+struct CivilDate {
+  int year;
+  int month;
+  int day;
+};
+
+static const char *WEEKDAY_LABELS[] = {"일", "월", "화", "수", "목", "금", "토"};
+
+static String utf8Prefix(const String &value, int maxChars) {
+  String output;
+  int chars = 0;
+  for (int i = 0; i < value.length() && chars < maxChars;) {
+    const uint8_t c = static_cast<uint8_t>(value[i]);
+    int bytes = 1;
+    if ((c & 0x80) == 0) {
+      bytes = 1;
+    } else if ((c & 0xe0) == 0xc0) {
+      bytes = 2;
+    } else if ((c & 0xf0) == 0xe0) {
+      bytes = 3;
+    } else if ((c & 0xf8) == 0xf0) {
+      bytes = 4;
+    }
+
+    if (i + bytes > value.length()) {
+      break;
+    }
+    output += value.substring(i, i + bytes);
+    i += bytes;
+    chars++;
+  }
+  return output;
+}
+
+static String jsonString(JsonVariantConst value, const String &fallback = "") {
+  if (value.isNull()) {
+    return fallback;
+  }
+  if (value.is<const char *>()) {
+    return String(value.as<const char *>());
+  }
+  if (value.is<float>() || value.is<double>()) {
+    return String(value.as<float>(), 1);
+  }
+  if (value.is<int>()) {
+    return String(value.as<int>());
+  }
+  return fallback;
+}
+
+static String formatValue(JsonVariantConst value, const String &suffix, int decimals = 0) {
+  if (value.isNull()) {
+    return "--";
+  }
+  if (decimals > 0) {
+    return String(value.as<float>(), decimals) + suffix;
+  }
+  return String(static_cast<int>(round(value.as<float>()))) + suffix;
+}
+
+static String formatIsoTime(const String &value) {
+  const int t = value.indexOf('T');
+  if (t >= 0 && value.length() >= t + 6) {
+    return value.substring(t + 1, t + 6);
+  }
+  return "";
+}
+
+static String dateKeyFromIso(const String &value) {
+  return value.length() >= 10 ? value.substring(0, 10) : value;
+}
+
+static CivilDate parseDateKey(const String &value) {
+  if (value.length() < 10) {
+    return {1970, 1, 1};
+  }
+  return {
+      value.substring(0, 4).toInt(),
+      value.substring(5, 7).toInt(),
+      value.substring(8, 10).toInt(),
+  };
+}
+
+static int daysFromCivil(int year, unsigned month, unsigned day) {
+  year -= month <= 2;
+  const int era = (year >= 0 ? year : year - 399) / 400;
+  const unsigned yoe = static_cast<unsigned>(year - era * 400);
+  const unsigned doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + static_cast<int>(doe) - 719468;
+}
+
+static CivilDate civilFromDays(int days) {
+  days += 719468;
+  const int era = (days >= 0 ? days : days - 146096) / 146097;
+  const unsigned doe = static_cast<unsigned>(days - era * 146097);
+  const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int year = static_cast<int>(yoe) + era * 400;
+  const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  const unsigned mp = (5 * doy + 2) / 153;
+  const unsigned day = doy - (153 * mp + 2) / 5 + 1;
+  const unsigned month = mp + (mp < 10 ? 3 : -9);
+  year += month <= 2;
+  return {year, static_cast<int>(month), static_cast<int>(day)};
+}
+
+static String dateKeyFromCivil(const CivilDate &date) {
+  char buffer[11];
+  snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d", date.year, date.month, date.day);
+  return String(buffer);
+}
+
+static int weekdayFromDays(int days) {
+  int weekday = (days + 4) % 7;
+  if (weekday < 0) {
+    weekday += 7;
+  }
+  return weekday;
+}
+
+static bool sameEventDay(JsonObjectConst event, const String &dateKey) {
+  return dateKeyFromIso(jsonString(event["startsAt"])) == dateKey;
+}
+
+static void drawText(int16_t x, int16_t y, const String &text, int maxChars = 0) {
+  drawKorean(x, y, maxChars > 0 ? utf8Prefix(text, maxChars) : text);
+}
+
+static void drawNativeHeader(JsonObjectConst root, const String &title, const DeviceTelemetry &telemetry) {
+  display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, GxEPD_BLACK);
+  display.drawLine(0, 35, SCREEN_WIDTH, 35, GxEPD_BLACK);
+  drawText(14, 24, title + " | " + String(screenPage + 1) + "/" + String(SCREEN_PAGE_COUNT));
+  drawText(150, 24, formatIsoTime(jsonString(root["generatedAt"])));
+
+  String status = telemetry.ssid.length() > 0 ? telemetry.ssid.substring(0, 10) : "Wi-Fi";
+  if (telemetry.batteryPercent >= 0) {
+    status += "  BAT " + String(telemetry.batteryPercent) + "%";
+  }
+  drawText(548, 24, status, 18);
+}
+
+static void drawSparkline(JsonArrayConst history, int16_t x, int16_t y, int16_t w, int16_t h) {
+  if (history.size() < 2) {
+    display.drawLine(x, y + h / 2, x + w, y + h / 2, GxEPD_BLACK);
+    return;
+  }
+
+  float minValue = history[0].as<float>();
+  float maxValue = minValue;
+  for (JsonVariantConst value : history) {
+    const float number = value.as<float>();
+    if (number < minValue) minValue = number;
+    if (number > maxValue) maxValue = number;
+  }
+  if (fabs(maxValue - minValue) < 0.0001f) {
+    maxValue = minValue + 1.0f;
+  }
+
+  int previousX = x;
+  int previousY = y + h - static_cast<int>((history[0].as<float>() - minValue) / (maxValue - minValue) * h);
+  for (size_t i = 1; i < history.size(); i++) {
+    const int currentX = x + static_cast<int>(i * w / (history.size() - 1));
+    const int currentY = y + h - static_cast<int>((history[i].as<float>() - minValue) / (maxValue - minValue) * h);
+    display.drawLine(previousX, previousY, currentX, currentY, GxEPD_BLACK);
+    previousX = currentX;
+    previousY = currentY;
+  }
+}
+
+static void drawWeatherIcon(int16_t x, int16_t y, int code) {
+  if (code == 0 || code == 1) {
+    display.drawCircle(x + 15, y + 15, 9, GxEPD_BLACK);
+    display.drawLine(x + 15, y, x + 15, y + 5, GxEPD_BLACK);
+    display.drawLine(x + 15, y + 25, x + 15, y + 30, GxEPD_BLACK);
+    display.drawLine(x, y + 15, x + 5, y + 15, GxEPD_BLACK);
+    display.drawLine(x + 25, y + 15, x + 30, y + 15, GxEPD_BLACK);
+  } else if (code >= 51 && code <= 82) {
+    display.drawRoundRect(x + 2, y + 8, 26, 13, 6, GxEPD_BLACK);
+    display.drawLine(x + 8, y + 24, x + 5, y + 30, GxEPD_BLACK);
+    display.drawLine(x + 17, y + 24, x + 14, y + 30, GxEPD_BLACK);
+    display.drawLine(x + 26, y + 24, x + 23, y + 30, GxEPD_BLACK);
+  } else {
+    display.drawRoundRect(x + 2, y + 9, 28, 14, 7, GxEPD_BLACK);
+    display.drawCircle(x + 11, y + 9, 7, GxEPD_BLACK);
+    display.drawCircle(x + 20, y + 8, 8, GxEPD_BLACK);
+  }
+}
+
+static void drawOverviewPage(JsonObjectConst root) {
+  JsonObjectConst weather = root["weather"];
+  drawText(24, 72, "오늘 요약");
+  drawWeatherIcon(28, 98, weather["weatherCode"].isNull() ? 3 : weather["weatherCode"].as<int>());
+  drawText(72, 120, jsonString(weather["label"]) + " " + formatValue(weather["temperatureC"], "C"));
+  drawText(72, 148, jsonString(weather["condition"], "날씨 정보 없음"), 18);
+  drawText(28, 196, "체감 " + formatValue(weather["apparentTemperatureC"], "C"));
+  drawText(190, 196, "습도 " + formatValue(weather["humidityPercent"], "%"));
+  drawText(350, 196, "바람 " + formatValue(weather["windKph"], "km/h"));
+
+  display.drawLine(20, 226, SCREEN_WIDTH - 20, 226, GxEPD_BLACK);
+  drawText(28, 258, "다가오는 일정");
+  JsonArrayConst events = root["events"];
+  int y = 292;
+  for (size_t i = 0; i < events.size() && i < 3; i++) {
+    JsonObjectConst event = events[i];
+    drawText(36, y, formatIsoTime(jsonString(event["startsAt"])) + " " + jsonString(event["title"]), 28);
+    drawText(56, y + 24, jsonString(event["calendarName"], "캘린더"), 22);
+    y += 54;
+  }
+
+  drawText(450, 258, "시장");
+  JsonArrayConst stocks = root["stocks"];
+  y = 292;
+  for (size_t i = 0; i < stocks.size() && i < 3; i++) {
+    JsonObjectConst stock = stocks[i];
+    drawText(458, y, jsonString(stock["name"]), 12);
+    drawText(610, y, jsonString(stock["price"]), 12);
+    drawText(610, y + 24, jsonString(stock["changePercent"]) + "%", 10);
+    y += 54;
+  }
+}
+
+static void drawWeatherPage(JsonObjectConst root) {
+  JsonObjectConst weather = root["weather"];
+  drawText(24, 68, jsonString(weather["label"]) + " 7일 예보");
+  JsonArrayConst days = weather["daily"];
+  int y = 92;
+  for (size_t i = 0; i < days.size() && i < 7; i++) {
+    JsonObjectConst day = days[i];
+    display.drawRect(18, y - 18, SCREEN_WIDTH - 36, 50, GxEPD_BLACK);
+    drawText(28, y + 2, jsonString(day["date"]).substring(5), 6);
+    drawWeatherIcon(104, y - 14, day["weatherCode"].isNull() ? 3 : day["weatherCode"].as<int>());
+    drawText(146, y + 2, jsonString(day["condition"]), 12);
+    drawText(304, y + 2, formatValue(day["minTemperatureC"], "C") + "-" + formatValue(day["maxTemperatureC"], "C"));
+    drawText(446, y + 2, "강수 " + formatValue(day["precipitationProbabilityPercent"], "%"));
+
+    JsonArrayConst hourly = day["hourly"];
+    int hx = 566;
+    for (size_t h = 0; h < hourly.size() && h < 3; h++) {
+      JsonObjectConst hour = hourly[h];
+      drawText(hx, y - 8, formatIsoTime(jsonString(hour["time"])), 5);
+      drawText(hx, y + 14, formatValue(hour["temperatureC"], "C"), 5);
+      hx += 72;
+    }
+    y += 53;
+  }
+}
+
+static void drawMonthCalendarPage(JsonObjectConst root) {
+  const CivilDate base = parseDateKey(dateKeyFromIso(jsonString(root["generatedAt"])));
+  const int firstDay = daysFromCivil(base.year, base.month, 1);
+  const int startDay = firstDay - weekdayFromDays(firstDay);
+  const String todayKey = dateKeyFromCivil(base);
+  JsonArrayConst events = root["events"];
+
+  for (int i = 0; i < 7; i++) {
+    drawText(52 + i * 112, 55, WEEKDAY_LABELS[i]);
+  }
+
+  const int top = 62;
+  const int cellW = SCREEN_WIDTH / 7;
+  const int cellH = (SCREEN_HEIGHT - top - 4) / 6;
+  for (int row = 0; row < 6; row++) {
+    for (int col = 0; col < 7; col++) {
+      const int x = col * cellW;
+      const int y = top + row * cellH;
+      const CivilDate date = civilFromDays(startDay + row * 7 + col);
+      const String key = dateKeyFromCivil(date);
+      display.drawRect(x, y, cellW + 1, cellH + 1, GxEPD_BLACK);
+      if (key == todayKey) {
+        display.drawRect(x + 4, y + 4, cellW - 8, cellH - 8, GxEPD_BLACK);
+        display.drawRect(x + 5, y + 5, cellW - 10, cellH - 10, GxEPD_BLACK);
+      }
+      drawText(x + 8, y + 22, date.day == 1 ? String(date.month) + "월 1일" : String(date.day), 6);
+
+      int eventY = y + 44;
+      int shown = 0;
+      for (JsonObjectConst event : events) {
+        if (!sameEventDay(event, key)) continue;
+        display.fillRect(x + 8, eventY - 14, 3, 18, GxEPD_BLACK);
+        drawText(x + 16, eventY, jsonString(event["title"]), 7);
+        drawText(x + 16, eventY + 20, formatIsoTime(jsonString(event["startsAt"])) + " " +
+                                      jsonString(event["calendarName"], ""), 8);
+        eventY += 38;
+        shown++;
+        if (shown >= 2) break;
+      }
+    }
+  }
+}
+
+static void drawWeekCalendarPage(JsonObjectConst root) {
+  const CivilDate base = parseDateKey(dateKeyFromIso(jsonString(root["generatedAt"])));
+  const int baseDay = daysFromCivil(base.year, base.month, base.day);
+  const int startDay = baseDay - weekdayFromDays(baseDay);
+  const String todayKey = dateKeyFromCivil(base);
+  JsonArrayConst events = root["events"];
+  const int top = 40;
+  const int colW = SCREEN_WIDTH / 7;
+
+  for (int col = 0; col < 7; col++) {
+    const int x = col * colW;
+    const CivilDate date = civilFromDays(startDay + col);
+    const String key = dateKeyFromCivil(date);
+    display.drawRect(x, top, colW + 1, SCREEN_HEIGHT - top - 2, GxEPD_BLACK);
+    if (key == todayKey) {
+      display.drawRect(x + 4, top + 4, colW - 8, SCREEN_HEIGHT - top - 10, GxEPD_BLACK);
+      display.drawRect(x + 5, top + 5, colW - 10, SCREEN_HEIGHT - top - 12, GxEPD_BLACK);
+    }
+    drawText(x + 8, 60, String(WEEKDAY_LABELS[col]));
+    drawText(x + 8, 82, String(date.month) + "/" + String(date.day));
+    display.drawLine(x, 92, x + colW, 92, GxEPD_BLACK);
+
+    int y = 126;
+    int shown = 0;
+    for (JsonObjectConst event : events) {
+      if (!sameEventDay(event, key)) continue;
+      display.fillRect(x + 8, y - 15, 3, 20, GxEPD_BLACK);
+      drawText(x + 16, y, jsonString(event["title"]), 7);
+      drawText(x + 16, y + 22, formatIsoTime(jsonString(event["startsAt"])), 7);
+      y += 56;
+      shown++;
+      if (shown >= 6) break;
+    }
+    if (shown == 0) {
+      drawText(x + 22, 274, "일정 없음", 5);
+    }
+  }
+}
+
+static String flowValue(JsonVariantConst value) {
+  if (value.isNull()) return "--";
+  const long number = value.as<long>();
+  if (abs(number) >= 10000) {
+    return String(number / 10000) + "만";
+  }
+  return String(number);
+}
+
+static void drawStocksPage(JsonObjectConst root) {
+  JsonArrayConst stocks = root["stocks"];
+  const int tileW = SCREEN_WIDTH / 3;
+  const int tileH = (SCREEN_HEIGHT - 38) / 4;
+  for (int i = 0; i < 12; i++) {
+    const int col = i % 3;
+    const int row = i / 3;
+    const int x = col * tileW;
+    const int y = 38 + row * tileH;
+    display.drawRect(x, y, tileW + 1, tileH + 1, GxEPD_BLACK);
+    if (i >= static_cast<int>(stocks.size())) continue;
+    JsonObjectConst stock = stocks[i];
+    drawText(x + 8, y + 24, jsonString(stock["name"]), 10);
+    drawText(x + 8, y + 47, jsonString(stock["price"]), 12);
+    drawText(x + 150, y + 47, jsonString(stock["changePercent"]) + "%", 8);
+    drawSparkline(stock["history"].as<JsonArrayConst>(), x + 10, y + 58, tileW - 20, 28);
+    JsonObjectConst flow = stock["investorFlow"];
+    if (!flow.isNull()) {
+      drawText(x + 8, y + 104, "개인 " + flowValue(flow["retail"]), 9);
+      drawText(x + 88, y + 104, "기관 " + flowValue(flow["institutional"]), 9);
+      drawText(x + 168, y + 104, "외인 " + flowValue(flow["foreign"]), 9);
+    }
+  }
+}
+
+static void drawDevicePage(const DeviceTelemetry &telemetry) {
+  drawText(28, 76, "기기상태");
+  drawText(28, 118, String("Wi-Fi: ") + telemetry.ssid);
+  drawText(28, 154, String("RSSI: ") + String(telemetry.rssi) + " dBm");
+  if (telemetry.batteryPercent >= 0) {
+    drawText(28, 190, String("Battery: ") + String(telemetry.batteryPercent) + "% " +
+                         String(telemetry.batteryVoltage, 2) + "V");
+  } else {
+    drawText(28, 190, "Battery: --");
+  }
+  drawText(28, 226, String("Charge: ") + telemetry.batteryChargeState);
+  drawText(28, 262, String("Page: ") + String(screenPage + 1) + "/" + String(SCREEN_PAGE_COUNT));
+  drawText(28, 316, String("상태: ") + deviceState);
+  drawText(28, 352, String("최근 오류: ") + String(lastErrorCode));
+}
+
+static bool renderDashboard(JsonObjectConst root, const DeviceTelemetry &telemetry, bool partialRefresh) {
+  display.setRotation(0);
+  if (partialRefresh) {
+    display.setPartialWindow(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+  } else {
+    display.setFullWindow();
+  }
+
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+
+    const int page = ((screenPage % SCREEN_PAGE_COUNT) + SCREEN_PAGE_COUNT) % SCREEN_PAGE_COUNT;
+    if (page == 0) {
+      drawNativeHeader(root, "요약", telemetry);
+      drawOverviewPage(root);
+    } else if (page == 1) {
+      drawNativeHeader(root, "주간날씨", telemetry);
+      drawWeatherPage(root);
+    } else if (page == 2) {
+      drawNativeHeader(root, "캘린더", telemetry);
+      drawMonthCalendarPage(root);
+    } else if (page == 3) {
+      drawNativeHeader(root, "주간일정", telemetry);
+      drawWeekCalendarPage(root);
+    } else if (page == 4) {
+      drawNativeHeader(root, "시장지표", telemetry);
+      drawStocksPage(root);
+    } else {
+      drawNativeHeader(root, "기기상태", telemetry);
+      drawDevicePage(telemetry);
     }
   } while (display.nextPage());
 
@@ -1529,6 +2072,7 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
     Serial.println("Display disabled for serial/debug check");
   } else {
     setupDisplay();
+    drawStatus("로딩중", "데이터를 가져오는 중입니다.", partialDisplayRefresh);
   }
 
   if (!connectWifi()) {
@@ -1554,9 +2098,9 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
     Serial.println("Battery telemetry disabled");
   }
 
-  std::unique_ptr<uint8_t[]> bitmapBuffer;
-  int bitmapSize = 0;
-  if (!fetchBitmap(endpointWithTelemetry(telemetry, forceServerRefresh), bitmapBuffer, bitmapSize)) {
+  std::unique_ptr<uint8_t[]> jsonBuffer;
+  int jsonSize = 0;
+  if (!fetchJson(endpointWithTelemetry(telemetry, forceServerRefresh), jsonBuffer, jsonSize)) {
     deviceState = "fetch-failed";
     if (!ENABLE_DISPLAY) {
       return false;
@@ -1564,17 +2108,26 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
     drawStatus("화면 가져오기 실패", fetchFailureDetail());
     return false;
   }
-  deviceState = "bitmap-received";
+  deviceState = "json-received";
 
   if (!ENABLE_DISPLAY) {
-    Serial.println("Display disabled; skipping bitmap render");
+    Serial.println("Display disabled; skipping dashboard render");
     return true;
   }
 
+  JsonDocument document;
+  const DeserializationError jsonError = deserializeJson(document, jsonBuffer.get(), jsonSize);
+  if (jsonError) {
+    deviceState = "json-failed";
+    setLastError(-1201, String("JSON 파싱 실패\n") + jsonError.c_str());
+    drawStatus("데이터 해석 실패", fetchFailureDetail());
+    return false;
+  }
+
   Serial.printf("Display refresh mode: %s\n", partialDisplayRefresh ? "partial" : "full");
-  if (!renderBitmap(bitmapBuffer.get(), bitmapSize, partialDisplayRefresh)) {
+  if (!renderDashboard(document.as<JsonObjectConst>(), telemetry, partialDisplayRefresh)) {
     deviceState = "render-failed";
-    drawStatus("화면 표시 실패", "비트맵 주소와 크기를 확인하세요.");
+    drawStatus("화면 표시 실패", "JSON 렌더링을 확인하세요.");
     return false;
   }
 

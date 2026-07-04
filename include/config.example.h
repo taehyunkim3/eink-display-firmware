@@ -5,11 +5,11 @@
 #define WIFI_SSID "your-wifi-name"
 #define WIFI_PASSWORD "your-wifi-password"
 
-// Use the deployed Vercel 1bpp bitmap endpoint for Korean text and layout fidelity.
-// Example: "https://your-app.vercel.app/api/screen.bin"
+// Use the deployed Vercel JSON endpoint. The ESP32 renders text and lines natively.
+// Example: "https://your-app.vercel.app/api/screen.json"
 // Local testing from the ESP32 must use your Mac's LAN IP, not localhost:
-// Example: "http://192.168.0.10:3000/api/screen.bin"
-#define DEVICE_ENDPOINT "https://your-app.vercel.app/api/screen.bin"
+// Example: "http://192.168.0.10:3000/api/screen.json"
+#define DEVICE_ENDPOINT "https://your-app.vercel.app/api/screen.json"
 #define DEVICE_AUTH_TOKEN "replace-with-the-same-token-as-eink-frontend"
 
 // First upload/debug should stay false so Serial Monitor remains usable.
@@ -19,7 +19,7 @@
 #define FALLBACK_SLEEP_SECONDS 1800
 #define BOOT_TEST_SECONDS 0
 #define DEBUG_HEARTBEAT_SECONDS 5
-#define SCREEN_PAGE_COUNT 7
+#define SCREEN_PAGE_COUNT 6
 // Device setting defaults. Users can change these from the on-device settings
 // menu; saved values are stored in ESP32 Preferences.
 #define PAGE_FULL_REFRESH_INTERVAL 5
@@ -64,6 +64,7 @@
 
 // 800 x 480 x 1bpp = 48,000 bytes.
 #define MAX_IMAGE_BYTES 64000
+#define MAX_JSON_BYTES 64000
 #define DEVICE_FETCH_ATTEMPTS 3
 #define DEVICE_HTTP_CONNECT_TIMEOUT_MS 15000
 #define DEVICE_HTTP_TIMEOUT_MS 25000
