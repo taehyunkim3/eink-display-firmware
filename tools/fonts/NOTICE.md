@@ -1,29 +1,46 @@
-# NanumGothicCoding bitmap font
+# Galmuri bitmap font
 
-The generated firmware bitmap font is derived from NAVER NanumGothicCoding.
+The generated firmware bitmap fonts are derived from Galmuri.
 
-- Source: https://github.com/naver/nanumfont
-- Release used for generation: NanumGothicCoding 2.5
-- License: Open Font License
+- Source: https://github.com/quiple/galmuri
+- Release used for generation: Galmuri 2.40.3
+- License: SIL Open Font License 1.1
 
 The original TTF is not checked in. Regenerate the firmware headers with:
 
 ```sh
-python3 tools/fonts/generate_nanum_bitmap_font.py \
-  --font /path/to/NanumGothicCoding.ttf \
-  --output include/generated/nanum_gothic_coding_12_bitmap.h \
-  --size 12 \
-  --symbol-prefix NANUM12
+python3 tools/fonts/generate_bitmap_font.py \
+  --font /path/to/Galmuri7.ttf \
+  --output include/generated/galmuri_7_bitmap.h \
+  --size 7 \
+  --symbol-prefix GALMURI7 \
+  --source-name Galmuri7
 
-python3 tools/fonts/generate_nanum_bitmap_font.py \
-  --font /path/to/NanumGothicCoding.ttf \
-  --output include/generated/nanum_gothic_coding_14_bitmap.h \
+python3 tools/fonts/generate_bitmap_font.py \
+  --font /path/to/Galmuri9.ttf \
+  --output include/generated/galmuri_9_bitmap.h \
+  --size 9 \
+  --symbol-prefix GALMURI9 \
+  --source-name Galmuri9
+
+python3 tools/fonts/generate_bitmap_font.py \
+  --font /path/to/Galmuri11.ttf \
+  --output include/generated/galmuri_11_bitmap.h \
+  --size 11 \
+  --symbol-prefix GALMURI11 \
+  --source-name Galmuri11
+
+python3 tools/fonts/generate_bitmap_font.py \
+  --font /path/to/Galmuri11-Bold.ttf \
+  --output include/generated/galmuri_11_bold_bitmap.h \
+  --size 11 \
+  --symbol-prefix GALMURI11BOLD \
+  --source-name Galmuri11-Bold
+
+python3 tools/fonts/generate_bitmap_font.py \
+  --font /path/to/Galmuri14.ttf \
+  --output include/generated/galmuri_14_bitmap.h \
   --size 14 \
-  --symbol-prefix NANUM14
-
-python3 tools/fonts/generate_nanum_bitmap_font.py \
-  --font /path/to/NanumGothicCoding.ttf \
-  --output include/generated/nanum_gothic_coding_18_bitmap.h \
-  --size 18 \
-  --symbol-prefix NANUM18
+  --symbol-prefix GALMURI14 \
+  --source-name Galmuri14
 ```

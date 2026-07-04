@@ -20,9 +20,11 @@
 #include <U8g2_for_Adafruit_GFX.h>
 
 #include "config.h"
-#include "generated/nanum_gothic_coding_12_bitmap.h"
-#include "generated/nanum_gothic_coding_14_bitmap.h"
-#include "generated/nanum_gothic_coding_18_bitmap.h"
+#include "generated/galmuri_7_bitmap.h"
+#include "generated/galmuri_9_bitmap.h"
+#include "generated/galmuri_11_bitmap.h"
+#include "generated/galmuri_11_bold_bitmap.h"
+#include "generated/galmuri_14_bitmap.h"
 
 #ifndef BUTTON_DEBOUNCE_MS
 #define BUTTON_DEBOUNCE_MS 30
@@ -167,8 +169,10 @@ RTC_DATA_ATTR static int screenPage = 0;
 RTC_DATA_ATTR static uint32_t pageTransitionRefreshCount = 0;
 
 enum class TextSize {
+  Micro,
   Tiny,
   Small,
+  Bold,
   Large,
 };
 
@@ -939,11 +943,14 @@ static void encodeUtf8(uint32_t codepoint, char *buffer) {
 }
 
 struct BitmapFont {
+  uint16_t asciiStart;
+  uint16_t asciiCount;
   uint16_t hangulStart;
   uint16_t hangulCount;
   uint8_t glyphSize;
   uint8_t glyphBytesPerRow;
   uint8_t glyphBytes;
+  const uint8_t *asciiBitmaps;
   const uint8_t *bitmaps;
   uint8_t spaceWidth;
 };
@@ -951,45 +958,90 @@ struct BitmapFont {
 static BitmapFont bitmapFontForSize(TextSize size) {
   if (size == TextSize::Large) {
     return {
-        NANUM18_HANGUL_START,
-        NANUM18_HANGUL_COUNT,
-        NANUM18_GLYPH_SIZE,
-        NANUM18_GLYPH_BYTES_PER_ROW,
-        NANUM18_GLYPH_BYTES,
-        NANUM18_HANGUL_BITMAPS,
-        8,
+        GALMURI14_ASCII_START,
+        GALMURI14_ASCII_COUNT,
+        GALMURI14_HANGUL_START,
+        GALMURI14_HANGUL_COUNT,
+        GALMURI14_GLYPH_SIZE,
+        GALMURI14_GLYPH_BYTES_PER_ROW,
+        GALMURI14_GLYPH_BYTES,
+        GALMURI14_ASCII_BITMAPS,
+        GALMURI14_HANGUL_BITMAPS,
+        7,
+    };
+  }
+  if (size == TextSize::Bold) {
+    return {
+        GALMURI11BOLD_ASCII_START,
+        GALMURI11BOLD_ASCII_COUNT,
+        GALMURI11BOLD_HANGUL_START,
+        GALMURI11BOLD_HANGUL_COUNT,
+        GALMURI11BOLD_GLYPH_SIZE,
+        GALMURI11BOLD_GLYPH_BYTES_PER_ROW,
+        GALMURI11BOLD_GLYPH_BYTES,
+        GALMURI11BOLD_ASCII_BITMAPS,
+        GALMURI11BOLD_HANGUL_BITMAPS,
+        6,
     };
   }
   if (size == TextSize::Tiny) {
     return {
-        NANUM12_HANGUL_START,
-        NANUM12_HANGUL_COUNT,
-        NANUM12_GLYPH_SIZE,
-        NANUM12_GLYPH_BYTES_PER_ROW,
-        NANUM12_GLYPH_BYTES,
-        NANUM12_HANGUL_BITMAPS,
+        GALMURI9_ASCII_START,
+        GALMURI9_ASCII_COUNT,
+        GALMURI9_HANGUL_START,
+        GALMURI9_HANGUL_COUNT,
+        GALMURI9_GLYPH_SIZE,
+        GALMURI9_GLYPH_BYTES_PER_ROW,
+        GALMURI9_GLYPH_BYTES,
+        GALMURI9_ASCII_BITMAPS,
+        GALMURI9_HANGUL_BITMAPS,
         5,
+    };
+  }
+  if (size == TextSize::Micro) {
+    return {
+        GALMURI7_ASCII_START,
+        GALMURI7_ASCII_COUNT,
+        GALMURI7_HANGUL_START,
+        GALMURI7_HANGUL_COUNT,
+        GALMURI7_GLYPH_SIZE,
+        GALMURI7_GLYPH_BYTES_PER_ROW,
+        GALMURI7_GLYPH_BYTES,
+        GALMURI7_ASCII_BITMAPS,
+        GALMURI7_HANGUL_BITMAPS,
+        4,
     };
   }
 
   return {
-      NANUM14_HANGUL_START,
-      NANUM14_HANGUL_COUNT,
-      NANUM14_GLYPH_SIZE,
-      NANUM14_GLYPH_BYTES_PER_ROW,
-      NANUM14_GLYPH_BYTES,
-      NANUM14_HANGUL_BITMAPS,
+      GALMURI11_ASCII_START,
+      GALMURI11_ASCII_COUNT,
+      GALMURI11_HANGUL_START,
+      GALMURI11_HANGUL_COUNT,
+      GALMURI11_GLYPH_SIZE,
+      GALMURI11_GLYPH_BYTES_PER_ROW,
+      GALMURI11_GLYPH_BYTES,
+      GALMURI11_ASCII_BITMAPS,
+      GALMURI11_HANGUL_BITMAPS,
       6,
   };
 }
 
-static bool isNanumHangul(uint32_t codepoint, const BitmapFont &font) {
+static bool isBitmapAscii(uint32_t codepoint, const BitmapFont &font) {
+  return codepoint >= font.asciiStart &&
+         codepoint < font.asciiStart + font.asciiCount;
+}
+
+static bool isBitmapHangul(uint32_t codepoint, const BitmapFont &font) {
   return codepoint >= font.hangulStart &&
          codepoint < font.hangulStart + font.hangulCount;
 }
 
-static void drawNanumHangul(int16_t x, int16_t baseline, uint32_t codepoint, const BitmapFont &font) {
-  const uint32_t glyphIndex = codepoint - font.hangulStart;
+static void drawBitmapGlyph(int16_t x,
+                            int16_t baseline,
+                            uint32_t glyphIndex,
+                            const uint8_t *bitmaps,
+                            const BitmapFont &font) {
   const uint32_t offset = glyphIndex * font.glyphBytes;
   const int16_t top = baseline - font.glyphSize + 2;
 
@@ -1008,6 +1060,14 @@ static void drawNanumHangul(int16_t x, int16_t baseline, uint32_t codepoint, con
       }
     }
   }
+}
+
+static void drawBitmapAscii(int16_t x, int16_t baseline, uint32_t codepoint, const BitmapFont &font) {
+  drawBitmapGlyph(x, baseline, codepoint - font.asciiStart, font.asciiBitmaps, font);
+}
+
+static void drawBitmapHangul(int16_t x, int16_t baseline, uint32_t codepoint, const BitmapFont &font) {
+  drawBitmapGlyph(x, baseline, codepoint - font.hangulStart, font.bitmaps, font);
 }
 
 static void drawKorean(int16_t x, int16_t y, const String &text, TextSize size) {
@@ -1030,8 +1090,13 @@ static void drawKorean(int16_t x, int16_t y, const String &text, TextSize size) 
       cursorX += font.spaceWidth;
       continue;
     }
-    if (isNanumHangul(codepoint, font)) {
-      drawNanumHangul(cursorX, y, codepoint, font);
+    if (isBitmapHangul(codepoint, font)) {
+      drawBitmapHangul(cursorX, y, codepoint, font);
+      cursorX += font.glyphSize;
+      continue;
+    }
+    if (isBitmapAscii(codepoint, font)) {
+      drawBitmapAscii(cursorX, y, codepoint, font);
       cursorX += font.glyphSize;
       continue;
     }
@@ -2000,7 +2065,7 @@ static void drawInvertedText(int16_t x,
                              int16_t height,
                              const String &text,
                              int maxChars = 0,
-                             TextSize size = TextSize::Large) {
+                             TextSize size = TextSize::Bold) {
   display.fillRect(x, y - height + 5, width, height, GxEPD_BLACK);
   setKoreanTextColors(GxEPD_WHITE, GxEPD_BLACK);
   drawKorean(x + 5, y, maxChars > 0 ? utf8Prefix(text, maxChars) : text, size);
