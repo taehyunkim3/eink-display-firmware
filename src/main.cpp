@@ -1777,6 +1777,9 @@ struct CivilDate {
 
 static const char *WEEKDAY_LABELS[] = {"일", "월", "화", "수", "목", "금", "토"};
 
+static int daysFromCivil(int year, unsigned month, unsigned day);
+static CivilDate civilFromDays(int days);
+
 static String utf8Prefix(const String &value, int maxChars) {
   String output;
   int chars = 0;
@@ -1819,26 +1822,54 @@ static String jsonString(JsonVariantConst value, const String &fallback = "") {
   return fallback;
 }
 
+static String displaySuffix(const String &suffix) {
+  return suffix == "C" ? "°C" : suffix;
+}
+
+static String twoDigit(int value) {
+  return value < 10 ? "0" + String(value) : String(value);
+}
+
 static String formatValue(JsonVariantConst value, const String &suffix, int decimals = 0) {
   if (value.isNull()) {
     return "--";
   }
+  const String unit = displaySuffix(suffix);
   if (decimals > 0) {
-    return String(value.as<float>(), decimals) + suffix;
+    return String(value.as<float>(), decimals) + unit;
   }
-  return String(static_cast<int>(round(value.as<float>()))) + suffix;
+  return String(static_cast<int>(round(value.as<float>()))) + unit;
 }
 
 static String formatIsoTime(const String &value) {
   const int t = value.indexOf('T');
   if (t >= 0 && value.length() >= t + 6) {
-    return value.substring(t + 1, t + 6);
+    int hours = value.substring(t + 1, t + 3).toInt();
+    const int minutes = value.substring(t + 4, t + 6).toInt();
+    hours = (hours + 9) % 24;
+    String output = twoDigit(hours);
+    output += ":";
+    output += twoDigit(minutes);
+    return output;
   }
   return "";
 }
 
 static String dateKeyFromIso(const String &value) {
-  return value.length() >= 10 ? value.substring(0, 10) : value;
+  if (value.length() < 16) {
+    return value.length() >= 10 ? value.substring(0, 10) : value;
+  }
+
+  CivilDate date = {
+      value.substring(0, 4).toInt(),
+      value.substring(5, 7).toInt(),
+      value.substring(8, 10).toInt(),
+  };
+  const int hour = value.substring(11, 13).toInt();
+  if (hour + 9 >= 24) {
+    date = civilFromDays(daysFromCivil(date.year, date.month, date.day) + 1);
+  }
+  return String(date.year) + "-" + twoDigit(date.month) + "-" + twoDigit(date.day);
 }
 
 static CivilDate parseDateKey(const String &value) {
@@ -1996,6 +2027,33 @@ static void drawWeatherIcon(int16_t x, int16_t y, int code) {
   }
 }
 
+static bool overviewMarketMatch(JsonObjectConst stock, int slot) {
+  const String name = jsonString(stock["name"]);
+  const String code = jsonString(stock["code"]);
+  if (slot == 0) {
+    return name == "KOSPI" || code == "^KS11";
+  }
+  if (slot == 1) {
+    return name == "KOSDAQ" || code == "^KQ11";
+  }
+  return name.indexOf("WTI") >= 0 || code == "CL=F";
+}
+
+static bool drawOverviewMarketItem(JsonArrayConst stocks, int slot, int16_t y) {
+  for (JsonObjectConst stock : stocks) {
+    if (!overviewMarketMatch(stock, slot)) {
+      continue;
+    }
+
+    drawText(458, y, jsonString(stock["name"]), 10);
+    drawText(458, y + 18, jsonString(stock["price"], "--"), 10);
+    drawText(548, y + 18, jsonString(stock["changePercent"], "--") + "%", 8);
+    drawSparkline(stock["history"].as<JsonArrayConst>(), 638, y - 11, 116, 34);
+    return true;
+  }
+  return false;
+}
+
 static void drawOverviewPage(JsonObjectConst root) {
   JsonObjectConst weather = root["weather"];
   drawText(24, 72, "오늘 요약", 0, TextSize::Large);
@@ -2019,13 +2077,14 @@ static void drawOverviewPage(JsonObjectConst root) {
 
   drawText(450, 258, "시장", 0, TextSize::Large);
   JsonArrayConst stocks = root["stocks"];
-  y = 292;
-  for (size_t i = 0; i < stocks.size() && i < 3; i++) {
-    JsonObjectConst stock = stocks[i];
-    drawText(458, y, jsonString(stock["name"]), 12);
-    drawText(610, y, jsonString(stock["price"]), 12);
-    drawText(610, y + 24, jsonString(stock["changePercent"]) + "%", 10);
-    y += 54;
+  for (int i = 0; i < 3; i++) {
+    const int rowY = 292 + i * 48;
+    if (!drawOverviewMarketItem(stocks, i, rowY)) {
+      const char *fallbackLabel = i == 0 ? "KOSPI" : (i == 1 ? "KOSDAQ" : "WTI");
+      drawText(458, rowY, fallbackLabel);
+      drawText(458, rowY + 18, "--");
+      display.drawLine(638, rowY + 6, 754, rowY + 6, GxEPD_BLACK);
+    }
   }
 }
 
