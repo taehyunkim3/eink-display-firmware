@@ -1709,6 +1709,16 @@ static void startSettingsPortal() {
   lastErrorCode = 0;
   Serial.println("Settings mode start (AP portal + BLE)");
 
+  // connectWifi() disables Wi-Fi modem sleep, but the BT controller aborts
+  // inside coex_core_enable when BLE starts while modem sleep is off
+  // (esp-idf #9595). Re-enable it before NimBLE comes up, and free the RAM
+  // JSON cache since BLE needs a large heap block.
+  cachedDashboardJson.reset();
+  cachedDashboardJsonSize = 0;
+  WiFi.disconnect(false, true);
+  WiFi.setSleep(true);
+  delay(100);
+
   String macSuffix = WiFi.macAddress();
   macSuffix.replace(":", "");
   const String deviceName = "EINK-SETUP-" + macSuffix.substring(macSuffix.length() - 4);
@@ -1722,9 +1732,12 @@ static void startSettingsPortal() {
   const int scanCount = WiFi.scanNetworks();
   WifiNetworkEntry wifiNetworks[WIFI_SETUP_MAX_NETWORKS];
   const int networkCount = buildWifiNetworkList(scanCount, wifiNetworks, WIFI_SETUP_MAX_NETWORKS);
-  Serial.printf("Settings AP: %s, portal http://192.168.4.1 (networks=%d)\n",
+  // Scan done: STA is no longer needed, keep only the AP alongside BLE.
+  WiFi.mode(WIFI_AP);
+  Serial.printf("Settings AP: %s, portal http://192.168.4.1 (networks=%d, heap=%u)\n",
                 deviceName.c_str(),
-                networkCount);
+                networkCount,
+                static_cast<unsigned>(ESP.getFreeHeap()));
   setupDisplay();
 
   DNSServer dnsServer;
