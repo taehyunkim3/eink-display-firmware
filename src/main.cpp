@@ -2072,6 +2072,22 @@ static void drawInvertedText(int16_t x,
   setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
 }
 
+static void drawGridCellFrame(int16_t x,
+                              int16_t y,
+                              int16_t w,
+                              int16_t h,
+                              int row,
+                              int col) {
+  if (row == 0) {
+    display.drawFastHLine(x, y, w, GxEPD_BLACK);
+  }
+  if (col == 0) {
+    display.drawFastVLine(x, y, h, GxEPD_BLACK);
+  }
+  display.drawFastHLine(x, y + h, w, GxEPD_BLACK);
+  display.drawFastVLine(x + w, y, h, GxEPD_BLACK);
+}
+
 static void drawBatteryIcon(int16_t x, int16_t y, int percent, bool charging) {
   display.drawRect(x, y, 34, 16, GxEPD_BLACK);
   display.fillRect(x + 35, y + 5, 3, 6, GxEPD_BLACK);
@@ -2126,6 +2142,145 @@ static void drawSparkline(JsonArrayConst history, int16_t x, int16_t y, int16_t 
     previousX = currentX;
     previousY = currentY;
   }
+}
+
+static float parseMarketNumber(const String &value, bool *ok = nullptr) {
+  String normalized;
+  normalized.reserve(value.length());
+  for (int i = 0; i < value.length(); i++) {
+    const char c = value[i];
+    if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.') {
+      normalized += c;
+    }
+  }
+
+  if (normalized.length() == 0 || normalized == "-" || normalized == "+") {
+    if (ok) *ok = false;
+    return 0.0f;
+  }
+
+  if (ok) *ok = true;
+  return normalized.toFloat();
+}
+
+static float stockPreviousClose(JsonObjectConst stock, bool *ok = nullptr) {
+  bool priceOk = false;
+  bool rateOk = false;
+  const float latestPrice = parseMarketNumber(jsonString(stock["price"]), &priceOk);
+  const float latestRate = parseMarketNumber(jsonString(stock["changePercent"]), &rateOk);
+  if (priceOk && rateOk && latestRate > -99.0f) {
+    if (ok) *ok = true;
+    return latestPrice / (1.0f + latestRate / 100.0f);
+  }
+
+  JsonArrayConst history = stock["history"].as<JsonArrayConst>();
+  if (history.size() > 0) {
+    if (ok) *ok = true;
+    return history[0].as<float>();
+  }
+
+  if (ok) *ok = false;
+  return 0.0f;
+}
+
+static float stockPercentRange(JsonObjectConst stock) {
+  bool ok = false;
+  const float latestRate = fabs(parseMarketNumber(jsonString(stock["changePercent"]), &ok));
+  const float padded = ok ? ceilf(max(1.0f, latestRate) * 1.35f) : 3.0f;
+  return constrain(padded, 1.0f, 15.0f);
+}
+
+static int percentY(float percent, float range, int16_t y, int16_t h) {
+  const float clamped = constrain(percent, -range, range);
+  return y + h / 2 - static_cast<int>((clamped / range) * (h / 2 - 5));
+}
+
+static void drawChartGrid(int16_t x, int16_t y, int16_t w, int16_t h) {
+  display.drawRect(x, y, w, h, GxEPD_BLACK);
+  const int midY = y + h / 2;
+  for (int px = x + 5; px < x + w - 5; px += 8) {
+    display.drawFastHLine(px, midY, 4, GxEPD_BLACK);
+  }
+  for (int i = 1; i < 4; i++) {
+    const int gx = x + (w * i) / 4;
+    for (int py = y + 5; py < y + h - 5; py += 8) {
+      display.drawFastVLine(gx, py, 3, GxEPD_BLACK);
+    }
+  }
+}
+
+static void drawPercentLineChart(JsonObjectConst stock, int16_t x, int16_t y, int16_t w, int16_t h) {
+  JsonArrayConst history = stock["history"].as<JsonArrayConst>();
+  drawChartGrid(x, y, w, h);
+  if (history.size() < 2) {
+    return;
+  }
+
+  bool baselineOk = false;
+  const float baseline = stockPreviousClose(stock, &baselineOk);
+  if (!baselineOk || fabs(baseline) < 0.0001f) {
+    return;
+  }
+
+  const float range = stockPercentRange(stock);
+  int previousX = x + 5;
+  float firstPercent = ((history[0].as<float>() - baseline) / baseline) * 100.0f;
+  int previousY = percentY(firstPercent, range, y, h);
+  for (size_t i = 1; i < history.size(); i++) {
+    const int currentX = x + 5 + static_cast<int>(i * (w - 10) / (history.size() - 1));
+    const float percent = ((history[i].as<float>() - baseline) / baseline) * 100.0f;
+    const int currentY = percentY(percent, range, y, h);
+    display.drawLine(previousX, previousY, currentX, currentY, GxEPD_BLACK);
+    previousX = currentX;
+    previousY = currentY;
+  }
+}
+
+static bool drawCandleChart(JsonObjectConst stock, int16_t x, int16_t y, int16_t w, int16_t h) {
+  JsonArrayConst candles = stock["candles"].as<JsonArrayConst>();
+  if (candles.size() < 2) {
+    return false;
+  }
+
+  bool baselineOk = false;
+  const float baseline = stockPreviousClose(stock, &baselineOk);
+  if (!baselineOk || fabs(baseline) < 0.0001f) {
+    return false;
+  }
+
+  drawChartGrid(x, y, w, h);
+  const float range = stockPercentRange(stock);
+  const int count = min(static_cast<int>(candles.size()), 36);
+  const int start = static_cast<int>(candles.size()) - count;
+  const int slot = max(5, (w - 12) / max(1, count));
+  const int bodyW = max(2, min(6, slot - 2));
+
+  for (int i = 0; i < count; i++) {
+    JsonObjectConst candle = candles[start + i];
+    const float open = candle["o"].as<float>();
+    const float high = candle["h"].as<float>();
+    const float low = candle["l"].as<float>();
+    const float close = candle["c"].as<float>();
+    if (open <= 0 || high <= 0 || low <= 0 || close <= 0) {
+      continue;
+    }
+
+    const int cx = x + 6 + i * (w - 12) / max(1, count - 1);
+    const int highY = percentY(((high - baseline) / baseline) * 100.0f, range, y, h);
+    const int lowY = percentY(((low - baseline) / baseline) * 100.0f, range, y, h);
+    const int openY = percentY(((open - baseline) / baseline) * 100.0f, range, y, h);
+    const int closeY = percentY(((close - baseline) / baseline) * 100.0f, range, y, h);
+    const int top = min(openY, closeY);
+    const int bottom = max(openY, closeY);
+    display.drawLine(cx, highY, cx, lowY, GxEPD_BLACK);
+    if (close >= open) {
+      display.drawRect(cx - bodyW / 2, top, bodyW, max(2, bottom - top), GxEPD_BLACK);
+    } else {
+      display.fillRect(cx - bodyW / 2, top, bodyW, max(2, bottom - top), GxEPD_BLACK);
+    }
+  }
+
+  return true;
 }
 
 static void setPbmPixel(uint8_t *bitmap, int width, int x, int y) {
@@ -2189,7 +2344,8 @@ static bool writeDefaultWeatherIcon(const char *path, int kind) {
   uint8_t bitmap[iconSize * bytesPerRow] = {};
 
   if (kind == 0) {
-    drawPbmCircle(bitmap, iconSize, 16, 16, 7, true);
+    drawPbmCircle(bitmap, iconSize, 16, 16, 8, false);
+    drawPbmCircle(bitmap, iconSize, 16, 16, 9, false);
     drawPbmLine(bitmap, iconSize, 16, 1, 16, 7);
     drawPbmLine(bitmap, iconSize, 16, 25, 16, 31);
     drawPbmLine(bitmap, iconSize, 1, 16, 7, 16);
@@ -2199,14 +2355,15 @@ static bool writeDefaultWeatherIcon(const char *path, int kind) {
     drawPbmLine(bitmap, iconSize, 27, 5, 23, 9);
     drawPbmLine(bitmap, iconSize, 9, 23, 5, 27);
   } else if (kind == 1) {
-    drawPbmCircle(bitmap, iconSize, 11, 17, 7, true);
-    drawPbmCircle(bitmap, iconSize, 19, 13, 9, true);
-    drawPbmCircle(bitmap, iconSize, 26, 18, 6, true);
-    drawPbmRect(bitmap, iconSize, 6, 18, 25, 7);
+    drawPbmCircle(bitmap, iconSize, 11, 15, 7, false);
+    drawPbmCircle(bitmap, iconSize, 20, 12, 9, false);
+    drawPbmCircle(bitmap, iconSize, 27, 16, 6, false);
+    drawPbmRect(bitmap, iconSize, 6, 18, 25, 4);
   } else {
-    drawPbmCircle(bitmap, iconSize, 11, 14, 7, true);
-    drawPbmCircle(bitmap, iconSize, 20, 12, 8, true);
-    drawPbmRect(bitmap, iconSize, 6, 16, 23, 7);
+    drawPbmCircle(bitmap, iconSize, 11, 13, 7, false);
+    drawPbmCircle(bitmap, iconSize, 20, 11, 8, false);
+    drawPbmCircle(bitmap, iconSize, 27, 15, 5, false);
+    drawPbmRect(bitmap, iconSize, 6, 17, 25, 4);
     drawPbmLine(bitmap, iconSize, 8, 25, 5, 31);
     drawPbmLine(bitmap, iconSize, 17, 25, 14, 31);
     drawPbmLine(bitmap, iconSize, 26, 25, 23, 31);
@@ -2256,6 +2413,9 @@ static void setupSdAssets() {
   writeDefaultWeatherIcon("/eink/icons/weather_sun.pbm", 0);
   writeDefaultWeatherIcon("/eink/icons/weather_cloud.pbm", 1);
   writeDefaultWeatherIcon("/eink/icons/weather_rain.pbm", 2);
+  writeDefaultWeatherIcon("/eink/icons/weather_sun_v2.pbm", 0);
+  writeDefaultWeatherIcon("/eink/icons/weather_cloud_v2.pbm", 1);
+  writeDefaultWeatherIcon("/eink/icons/weather_rain_v2.pbm", 2);
 }
 
 static int readPbmToken(File &file, char *buffer, size_t bufferSize) {
@@ -2334,15 +2494,16 @@ static bool drawPbmIcon(const char *path, int16_t x, int16_t y) {
 static void drawWeatherIcon(int16_t x, int16_t y, int code) {
   const bool rain = code >= 51 && code <= 82;
   const bool clear = code == 0 || code == 1;
-  const char *sdIcon = rain ? "/eink/icons/weather_rain.pbm"
-                            : (clear ? "/eink/icons/weather_sun.pbm"
-                                     : "/eink/icons/weather_cloud.pbm");
+  const char *sdIcon = rain ? "/eink/icons/weather_rain_v2.pbm"
+                            : (clear ? "/eink/icons/weather_sun_v2.pbm"
+                                     : "/eink/icons/weather_cloud_v2.pbm");
   if (drawPbmIcon(sdIcon, x, y)) {
     return;
   }
 
   if (code == 0 || code == 1) {
-    display.fillCircle(x + 16, y + 16, 8, GxEPD_BLACK);
+    display.drawCircle(x + 16, y + 16, 8, GxEPD_BLACK);
+    display.drawCircle(x + 16, y + 16, 9, GxEPD_BLACK);
     display.drawLine(x + 16, y + 1, x + 16, y + 7, GxEPD_BLACK);
     display.drawLine(x + 16, y + 25, x + 16, y + 31, GxEPD_BLACK);
     display.drawLine(x + 1, y + 16, x + 7, y + 16, GxEPD_BLACK);
@@ -2351,18 +2512,19 @@ static void drawWeatherIcon(int16_t x, int16_t y, int code) {
     display.drawLine(x + 23, y + 23, x + 27, y + 27, GxEPD_BLACK);
     display.drawLine(x + 27, y + 5, x + 23, y + 9, GxEPD_BLACK);
     display.drawLine(x + 9, y + 23, x + 5, y + 27, GxEPD_BLACK);
-  } else if (code >= 51 && code <= 82) {
-    display.fillCircle(x + 11, y + 13, 7, GxEPD_BLACK);
-    display.fillCircle(x + 20, y + 11, 8, GxEPD_BLACK);
-    display.fillRect(x + 6, y + 14, 23, 8, GxEPD_BLACK);
+  } else if (rain) {
+    display.drawCircle(x + 11, y + 13, 7, GxEPD_BLACK);
+    display.drawCircle(x + 20, y + 11, 8, GxEPD_BLACK);
+    display.drawCircle(x + 27, y + 15, 5, GxEPD_BLACK);
+    display.fillRect(x + 6, y + 17, 25, 4, GxEPD_BLACK);
     display.drawLine(x + 8, y + 25, x + 5, y + 31, GxEPD_BLACK);
     display.drawLine(x + 17, y + 25, x + 14, y + 31, GxEPD_BLACK);
     display.drawLine(x + 26, y + 25, x + 23, y + 31, GxEPD_BLACK);
   } else {
-    display.fillCircle(x + 11, y + 14, 7, GxEPD_BLACK);
-    display.fillCircle(x + 20, y + 12, 9, GxEPD_BLACK);
-    display.fillCircle(x + 26, y + 16, 6, GxEPD_BLACK);
-    display.fillRect(x + 6, y + 16, 25, 8, GxEPD_BLACK);
+    display.drawCircle(x + 11, y + 15, 7, GxEPD_BLACK);
+    display.drawCircle(x + 20, y + 12, 9, GxEPD_BLACK);
+    display.drawCircle(x + 27, y + 16, 6, GxEPD_BLACK);
+    display.fillRect(x + 6, y + 18, 25, 4, GxEPD_BLACK);
   }
 }
 
@@ -2429,27 +2591,38 @@ static void drawOverviewPage(JsonObjectConst root) {
 
 static void drawWeatherPage(JsonObjectConst root) {
   JsonObjectConst weather = root["weather"];
-  drawText(24, 68, jsonString(weather["label"]) + " 7일 예보", 0, TextSize::Large);
   JsonArrayConst days = weather["daily"];
-  int y = 92;
-  for (size_t i = 0; i < days.size() && i < 7; i++) {
+  const int top = 38;
+  const int cellW = SCREEN_WIDTH / 2;
+  const int cellH = (SCREEN_HEIGHT - top - 2) / 4;
+  for (size_t i = 0; i < days.size() && i < 8; i++) {
     JsonObjectConst day = days[i];
-    display.drawRect(18, y - 18, SCREEN_WIDTH - 36, 50, GxEPD_BLACK);
-    drawText(28, y + 2, jsonString(day["date"]).substring(5), 6);
-    drawWeatherIcon(104, y - 14, day["weatherCode"].isNull() ? 3 : day["weatherCode"].as<int>());
-    drawText(146, y + 2, jsonString(day["condition"]), 12);
-    drawText(304, y + 2, formatValue(day["minTemperatureC"], "C") + "-" + formatValue(day["maxTemperatureC"], "C"));
-    drawText(446, y + 2, "강수 " + formatValue(day["precipitationProbabilityPercent"], "%"));
+    const int col = i % 2;
+    const int row = i / 2;
+    const int x = col * cellW;
+    const int y = top + row * cellH;
+    drawGridCellFrame(x, y, cellW, cellH, row, col);
+
+    drawText(x + 10, y + 24, jsonString(day["date"]).substring(5), 5, TextSize::Bold);
+    drawWeatherIcon(x + 10, y + 38, day["weatherCode"].isNull() ? 3 : day["weatherCode"].as<int>());
+    drawText(x + 50, y + 54, jsonString(day["condition"]), 12, TextSize::Bold);
+    drawText(x + 50, y + 77,
+             formatValue(day["minTemperatureC"], "C") + "-" +
+                 formatValue(day["maxTemperatureC"], "C"),
+             10);
+    drawText(x + 154, y + 77,
+             "강수 " + formatValue(day["precipitationProbabilityPercent"], "%"),
+             8);
 
     JsonArrayConst hourly = day["hourly"];
-    int hx = 566;
+    int hx = x + 244;
     for (size_t h = 0; h < hourly.size() && h < 3; h++) {
       JsonObjectConst hour = hourly[h];
-      drawText(hx, y - 8, formatIsoTime(jsonString(hour["time"])), 5);
-      drawText(hx, y + 14, formatValue(hour["temperatureC"], "C"), 5);
-      hx += 72;
+      drawText(hx, y + 30, formatIsoTime(jsonString(hour["time"])), 5, TextSize::Tiny);
+      drawWeatherIcon(hx, y + 38, hour["weatherCode"].isNull() ? 3 : hour["weatherCode"].as<int>());
+      drawText(hx, y + 86, formatValue(hour["temperatureC"], "C"), 5, TextSize::Tiny);
+      hx += 48;
     }
-    y += 53;
   }
 }
 
@@ -2537,10 +2710,11 @@ static void drawWeekCalendarPage(JsonObjectConst root) {
 static String flowValue(JsonVariantConst value) {
   if (value.isNull()) return "--";
   const long number = value.as<long>();
+  const String sign = number > 0 ? "+" : "";
   if (abs(number) >= 10000) {
-    return String(number / 10000) + "만";
+    return sign + String(number / 10000) + "만";
   }
-  return String(number);
+  return sign + String(number);
 }
 
 static void drawStocksPage(JsonObjectConst root) {
@@ -2552,13 +2726,13 @@ static void drawStocksPage(JsonObjectConst root) {
     const int row = i / 3;
     const int x = col * tileW;
     const int y = 38 + row * tileH;
-    display.drawRect(x, y, tileW + 1, tileH + 1, GxEPD_BLACK);
+    drawGridCellFrame(x, y, tileW, tileH, row, col);
     if (i >= static_cast<int>(stocks.size())) continue;
     JsonObjectConst stock = stocks[i];
     drawInvertedText(x + 1, y + 24, tileW - 1, 24, jsonString(stock["name"]), 10);
     drawText(x + 8, y + 52, jsonString(stock["price"]), 12);
     drawText(x + 150, y + 52, jsonString(stock["changePercent"]) + "%", 8);
-    drawSparkline(stock["history"].as<JsonArrayConst>(), x + 10, y + 62, tileW - 20, 26);
+    drawPercentLineChart(stock, x + 10, y + 62, tileW - 20, 26);
     JsonObjectConst flow = stock["investorFlow"];
     if (!flow.isNull()) {
       drawText(x + 8, y + 104, "개인 " + flowValue(flow["retail"]), 9);
@@ -2568,21 +2742,59 @@ static void drawStocksPage(JsonObjectConst root) {
   }
 }
 
-static void drawDevicePage(const DeviceTelemetry &telemetry) {
-  drawText(28, 76, "기기상태", 0, TextSize::Large);
-  drawText(28, 118, String("Wi-Fi: ") + telemetry.ssid);
-  drawText(28, 154, String("RSSI: ") + String(telemetry.rssi) + " dBm");
-  if (telemetry.batteryPercent >= 0) {
-    drawText(28, 190, String("Battery: ") + String(telemetry.batteryPercent) + "% " +
-                         String(telemetry.batteryVoltage, 2) + "V");
-  } else {
-    drawText(28, 190, "Battery: --");
+static void drawStockChartTile(JsonObjectConst stock,
+                               int indexInPage,
+                               int globalIndex,
+                               int16_t x,
+                               int16_t y,
+                               int16_t w,
+                               int16_t h) {
+  const int col = indexInPage % 2;
+  const int row = indexInPage / 2;
+  drawGridCellFrame(x, y, w, h, row, col);
+  drawText(x + 10, y + 24, String(globalIndex + 1) + ". " + jsonString(stock["name"]), 14, TextSize::Bold);
+  drawText(x + 10, y + 46,
+           jsonString(stock["price"], "--") + "  " + jsonString(stock["changePercent"], "--") + "%",
+           18);
+
+  const int chartX = x + 10;
+  const int chartY = y + 58;
+  const int chartW = w - 20;
+  const int chartH = h - 108;
+  if (!drawCandleChart(stock, chartX, chartY, chartW, chartH)) {
+    drawPercentLineChart(stock, chartX, chartY, chartW, chartH);
   }
-  drawText(28, 226, String("Charge: ") + telemetry.batteryChargeState);
-  drawText(28, 262, String("Page: ") + String(screenPage + 1) + "/" + String(SCREEN_PAGE_COUNT));
-  drawText(28, 292, String("SD: ") + (sdAssetsAvailable ? "assets OK" : "not mounted"));
-  drawText(28, 316, String("상태: ") + deviceState);
-  drawText(28, 352, String("최근 오류: ") + String(lastErrorCode));
+
+  JsonObjectConst flow = stock["investorFlow"];
+  if (!flow.isNull()) {
+    const int flowY = y + h - 16;
+    drawText(x + 10, flowY, "개인 " + flowValue(flow["retail"]), 10, TextSize::Tiny);
+    drawText(x + 130, flowY, "기관 " + flowValue(flow["institutional"]), 10, TextSize::Tiny);
+    drawText(x + 250, flowY, "외인 " + flowValue(flow["foreign"]), 10, TextSize::Tiny);
+  } else {
+    drawText(x + 10, y + h - 16, "점선: 전일 종가 0% 기준", 16, TextSize::Tiny);
+  }
+}
+
+static void drawStockChartsPage(JsonObjectConst root, int pageGroup) {
+  JsonArrayConst stocks = root["stocks"];
+  const int top = 38;
+  const int cellW = SCREEN_WIDTH / 2;
+  const int cellH = (SCREEN_HEIGHT - top - 2) / 2;
+  const int start = pageGroup * 4;
+  for (int i = 0; i < 4; i++) {
+    const int stockIndex = start + i;
+    const int col = i % 2;
+    const int row = i / 2;
+    const int x = col * cellW;
+    const int y = top + row * cellH;
+    if (stockIndex >= static_cast<int>(stocks.size())) {
+      drawGridCellFrame(x, y, cellW, cellH, row, col);
+      drawText(x + 18, y + 104, "표시할 항목 없음", 0, TextSize::Bold);
+      continue;
+    }
+    drawStockChartTile(stocks[stockIndex], i, stockIndex, x, y, cellW, cellH);
+  }
 }
 
 static bool renderDashboard(JsonObjectConst root, const DeviceTelemetry &telemetry, bool partialRefresh) {
@@ -2614,9 +2826,15 @@ static bool renderDashboard(JsonObjectConst root, const DeviceTelemetry &telemet
     } else if (page == 4) {
       drawNativeHeader(root, "시장지표", telemetry);
       drawStocksPage(root);
+    } else if (page == 5) {
+      drawNativeHeader(root, "차트1", telemetry);
+      drawStockChartsPage(root, 0);
+    } else if (page == 6) {
+      drawNativeHeader(root, "차트2", telemetry);
+      drawStockChartsPage(root, 1);
     } else {
-      drawNativeHeader(root, "기기상태", telemetry);
-      drawDevicePage(telemetry);
+      drawNativeHeader(root, "차트3", telemetry);
+      drawStockChartsPage(root, 2);
     }
   } while (display.nextPage());
 

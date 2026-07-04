@@ -19,7 +19,7 @@
 #define FALLBACK_SLEEP_SECONDS 1800
 #define BOOT_TEST_SECONDS 0
 #define DEBUG_HEARTBEAT_SECONDS 5
-#define SCREEN_PAGE_COUNT 6
+#define SCREEN_PAGE_COUNT 8
 // Device setting defaults. Users can change these from the on-device settings
 // menu; saved values are stored in ESP32 Preferences.
 #define PAGE_FULL_REFRESH_INTERVAL 5
@@ -73,7 +73,7 @@
 
 // 800 x 480 x 1bpp = 48,000 bytes.
 #define MAX_IMAGE_BYTES 64000
-#define MAX_JSON_BYTES 64000
+#define MAX_JSON_BYTES 96000
 #define DEVICE_FETCH_ATTEMPTS 3
 #define DEVICE_HTTP_CONNECT_TIMEOUT_MS 15000
 #define DEVICE_HTTP_TIMEOUT_MS 25000
