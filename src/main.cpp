@@ -2744,52 +2744,147 @@ static bool overviewMarketMatch(JsonObjectConst stock, int slot) {
   return name.indexOf("WTI") >= 0 || code == "CL=F";
 }
 
-static bool drawOverviewMarketItem(JsonArrayConst stocks, int slot, int16_t y) {
+static JsonObjectConst overviewMarketSlot(JsonArrayConst stocks, int slot) {
   for (JsonObjectConst stock : stocks) {
-    if (!overviewMarketMatch(stock, slot)) {
-      continue;
+    if (overviewMarketMatch(stock, slot)) {
+      return stock;
     }
-
-    drawText(458, y, jsonString(stock["name"]), 10);
-    drawText(458, y + 18, jsonString(stock["price"], "--"), 10);
-    drawText(548, y + 18, jsonString(stock["changePercent"], "--") + "%", 8);
-    drawSparkline(stock["history"].as<JsonArrayConst>(), 638, y - 11, 116, 34);
-    return true;
   }
-  return false;
+  return JsonObjectConst();
+}
+
+// Filled title bar across the top of a card, with an optional right-aligned
+// secondary label. Text renders white-on-black.
+static void drawCardTitle(int16_t x, int16_t y, int16_t w, const String &title, const String &right = "") {
+  display.fillRect(x, y, w, 22, GxEPD_BLACK);
+  setKoreanTextColors(GxEPD_WHITE, GxEPD_BLACK);
+  drawKorean(x + 9, y + 16, title, TextSize::Tiny);
+  if (right.length() > 0) {
+    drawKorean(x + w - 9 - measureKorean(right, TextSize::Tiny), y + 16, right, TextSize::Tiny);
+  }
+  setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
+}
+
+static void drawTrendArrow(int16_t x, int16_t y, const String &direction) {
+  if (direction == "up") {
+    display.fillTriangle(x, y + 9, x + 10, y + 9, x + 5, y, GxEPD_BLACK);
+  } else if (direction == "down") {
+    display.fillTriangle(x, y, x + 10, y, x + 5, y + 9, GxEPD_BLACK);
+  } else {
+    display.fillRect(x, y + 4, 10, 2, GxEPD_BLACK);
+  }
 }
 
 static void drawOverviewPage(JsonObjectConst root) {
   JsonObjectConst weather = root["weather"];
-  drawText(24, 72, "오늘 요약", 0, TextSize::Large);
-  drawWeatherIcon(28, 92, weather["weatherCode"].isNull() ? 3 : weather["weatherCode"].as<int>(), 48);
-  drawText(92, 118, jsonString(weather["label"]) + " " + formatValue(weather["temperatureC"], "C"), 0,
-           TextSize::Large);
-  drawText(92, 148, jsonString(weather["condition"], "날씨 정보 없음"), 18);
-  drawText(28, 196, "체감 " + formatValue(weather["apparentTemperatureC"], "C"));
-  drawText(190, 196, "습도 " + formatValue(weather["humidityPercent"], "%"));
-  drawText(350, 196, "바람 " + formatValue(weather["windKph"], "km/h"));
-
-  display.drawLine(20, 226, SCREEN_WIDTH - 20, 226, GxEPD_BLACK);
-  drawText(28, 258, "다가오는 일정", 0, TextSize::Large);
   JsonArrayConst events = root["events"];
-  int y = 292;
-  for (size_t i = 0; i < events.size() && i < 3; i++) {
-    JsonObjectConst event = events[i];
-    drawText(36, y, formatIsoTime(jsonString(event["startsAt"])) + " " + jsonString(event["title"]), 28);
-    drawText(56, y + 24, jsonString(event["calendarName"], "캘린더"), 22);
-    y += 54;
+  JsonArrayConst stocks = root["stocks"];
+  JsonArrayConst news = root["news"].as<JsonArrayConst>();
+
+  // ── 날씨 카드 (좌상단) ──
+  const int16_t wx = 12, wy = 40, ww = 380, wh = 210;
+  display.drawRect(wx, wy, ww, wh, GxEPD_BLACK);
+  drawCardTitle(wx, wy, ww, "오늘 날씨", jsonString(weather["label"]));
+
+  drawWeatherIcon(wx + 14, wy + 32, weather["weatherCode"].isNull() ? 3 : weather["weatherCode"].as<int>(), 48);
+  drawText(wx + 76, wy + 66, formatValue(weather["temperatureC"], "C"), 0, TextSize::Large);
+  drawText(wx + 76, wy + 94, jsonString(weather["condition"], "날씨 정보 없음"), 13);
+
+  JsonObjectConst todayForecast = weather["daily"][0];
+  drawText(wx + 250, wy + 50, "최고 " + formatValue(todayForecast["maxTemperatureC"], "C"), 0, TextSize::Tiny);
+  drawText(wx + 250, wy + 72, "최저 " + formatValue(todayForecast["minTemperatureC"], "C"), 0, TextSize::Tiny);
+  drawText(wx + 250, wy + 94,
+           "강수 " + formatValue(todayForecast["precipitationProbabilityPercent"], "%"),
+           0,
+           TextSize::Tiny);
+
+  display.drawLine(wx + 12, wy + 110, wx + ww - 12, wy + 110, GxEPD_BLACK);
+  drawText(wx + 14, wy + 134, "체감 " + formatValue(weather["apparentTemperatureC"], "C"), 0, TextSize::Tiny);
+  drawText(wx + 140, wy + 134, "습도 " + formatValue(weather["humidityPercent"], "%"), 0, TextSize::Tiny);
+  drawText(wx + 252, wy + 134, "바람 " + formatValue(weather["windKph"], "km/h"), 0, TextSize::Tiny);
+
+  JsonArrayConst hourly = todayForecast["hourly"];
+  int16_t hourX = wx + 14;
+  for (size_t h = 0; h < hourly.size() && h < 3; h++) {
+    JsonObjectConst hour = hourly[h];
+    drawWeatherIcon(hourX, wy + 152, hour["weatherCode"].isNull() ? 3 : hour["weatherCode"].as<int>(), 32);
+    drawText(hourX + 40, wy + 168, formatIsoTime(jsonString(hour["time"])), 0, TextSize::Micro);
+    drawText(hourX + 40, wy + 188, formatValue(hour["temperatureC"], "C"), 0, TextSize::Tiny);
+    hourX += 124;
   }
 
-  drawText(450, 258, "시장", 0, TextSize::Large);
-  JsonArrayConst stocks = root["stocks"];
+  // ── 오늘 일정 카드 (우상단) ──
+  const int16_t ex = 404, ey = 40, ew = 384, eh = 210;
+  display.drawRect(ex, ey, ew, eh, GxEPD_BLACK);
+  drawCardTitle(ex, ey, ew, "다가오는 일정",
+                events.size() > 0 ? String(events.size()) + "건" : String(""));
+
+  if (events.size() == 0) {
+    drawText(ex + 16, ey + 66, "예정된 일정이 없어요", 0, TextSize::Small);
+  } else {
+    int16_t rowY = ey + 52;
+    for (size_t i = 0; i < events.size() && i < 3; i++) {
+      JsonObjectConst event = events[i];
+      const String time =
+          event["allDay"].as<bool>() ? "종일" : formatIsoTime(jsonString(event["startsAt"]));
+      drawText(ex + 14, rowY, time, 0, TextSize::Bold);
+      drawText(ex + 76, rowY, jsonString(event["title"]), 19, TextSize::Small);
+      drawText(ex + 76, rowY + 20, jsonString(event["calendarName"], "캘린더"), 24, TextSize::Micro);
+      if (i < 2 && i + 1 < events.size()) {
+        display.drawLine(ex + 14, rowY + 32, ex + ew - 14, rowY + 32, GxEPD_BLACK);
+      }
+      rowY += 50;
+    }
+  }
+
+  // ── 시장 지표 카드 (중단, 3열) ──
+  const int16_t mx = 12, my = 262, mw = 776, mh = 126;
+  display.drawRect(mx, my, mw, mh, GxEPD_BLACK);
+  drawCardTitle(mx, my, mw, "시장 지표");
+
+  const int16_t colWidth = mw / 3;
   for (int i = 0; i < 3; i++) {
-    const int rowY = 292 + i * 48;
-    if (!drawOverviewMarketItem(stocks, i, rowY)) {
+    const int16_t colX = mx + i * colWidth;
+    if (i > 0) {
+      display.drawFastVLine(colX, my + 22, mh - 22, GxEPD_BLACK);
+    }
+
+    JsonObjectConst stock = overviewMarketSlot(stocks, i);
+    const int16_t tx = colX + 14;
+    if (stock.isNull()) {
       const char *fallbackLabel = i == 0 ? "KOSPI" : (i == 1 ? "KOSDAQ" : "WTI");
-      drawText(458, rowY, fallbackLabel);
-      drawText(458, rowY + 18, "--");
-      display.drawLine(638, rowY + 6, 754, rowY + 6, GxEPD_BLACK);
+      drawText(tx, my + 48, fallbackLabel, 0, TextSize::Bold);
+      drawText(tx, my + 82, "--", 0, TextSize::Large);
+      continue;
+    }
+
+    drawText(tx, my + 48, jsonString(stock["name"]), 10, TextSize::Bold);
+    drawText(tx, my + 82, formatWithThousands(jsonString(stock["price"], "--")), 12, TextSize::Large);
+    drawTrendArrow(tx, my + 96, jsonString(stock["direction"]));
+    drawText(tx + 18, my + 106,
+             signedStockValue(stock, jsonString(stock["changePercent"], "--"), "%"),
+             9,
+             TextSize::Small);
+    drawSparkline(stock["history"].as<JsonArrayConst>(), colX + 152, my + 40, 92, 60);
+  }
+
+  // ── 뉴스 스트립 (하단) ──
+  const int16_t nx = 12, ny = 400, nw = 776, nh = 68;
+  display.drawRect(nx, ny, nw, nh, GxEPD_BLACK);
+  display.fillRect(nx, ny, 58, nh, GxEPD_BLACK);
+  setKoreanTextColors(GxEPD_WHITE, GxEPD_BLACK);
+  drawKorean(nx + 13, ny + 41, "뉴스", TextSize::Tiny);
+  setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
+
+  if (news.isNull() || news.size() == 0) {
+    drawText(nx + 74, ny + 41, "뉴스 정보 없음", 0, TextSize::Tiny);
+  } else {
+    for (size_t i = 0; i < news.size() && i < 2; i++) {
+      JsonObjectConst item = news[i];
+      const int16_t lineY = ny + 27 + static_cast<int16_t>(i) * 27;
+      const String time = formatIsoTime(jsonString(item["publishedAt"]));
+      drawText(nx + 74, lineY, time.length() > 0 ? time : "--:--", 0, TextSize::Micro);
+      drawText(nx + 122, lineY, jsonString(item["title"]), 42, TextSize::Tiny);
     }
   }
 }
