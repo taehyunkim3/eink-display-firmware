@@ -2270,6 +2270,46 @@ static void drawBatteryIcon(int16_t x, int16_t y, int percent, bool charging) {
   }
 }
 
+// 20x20 seasonal pixel doodle; (x, y) is the top-left corner.
+static void drawSeasonGlyph(int16_t x, int16_t y, int month) {
+  const int16_t cx = x + 10;
+  const int16_t cy = y + 10;
+  constexpr float DEG = 3.14159265f / 180.0f;
+
+  if (month >= 3 && month <= 5) {
+    // 봄: 벚꽃 (꽃잎 5개 + 중심)
+    for (int i = 0; i < 5; i++) {
+      const float angle = (i * 72.0f - 90.0f) * DEG;
+      display.fillCircle(cx + lroundf(cosf(angle) * 6), cy + lroundf(sinf(angle) * 6), 3, GxEPD_BLACK);
+    }
+    display.fillCircle(cx, cy, 2, GxEPD_WHITE);
+    display.drawCircle(cx, cy, 2, GxEPD_BLACK);
+  } else if (month >= 6 && month <= 8) {
+    // 여름: 해 (원 + 광선 8개)
+    display.fillCircle(cx, cy, 5, GxEPD_BLACK);
+    for (int i = 0; i < 8; i++) {
+      const float angle = i * 45.0f * DEG;
+      display.drawLine(cx + lroundf(cosf(angle) * 7), cy + lroundf(sinf(angle) * 7),
+                       cx + lroundf(cosf(angle) * 10), cy + lroundf(sinf(angle) * 10), GxEPD_BLACK);
+    }
+  } else if (month >= 9 && month <= 11) {
+    // 가을: 낙엽 (잎몸 + 잎맥 + 꼭지)
+    display.fillTriangle(cx, y, x + 3, cy + 2, cx, y + 15, GxEPD_BLACK);
+    display.fillTriangle(cx, y, x + 17, cy + 2, cx, y + 15, GxEPD_BLACK);
+    display.drawLine(cx, y + 3, cx, y + 13, GxEPD_WHITE);
+    display.drawLine(cx, y + 15, cx + 3, y + 19, GxEPD_BLACK);
+  } else {
+    // 겨울: 눈송이 (6방향 가지)
+    for (int i = 0; i < 6; i++) {
+      const float angle = i * 60.0f * DEG;
+      const int16_t tipX = cx + lroundf(cosf(angle) * 9);
+      const int16_t tipY = cy + lroundf(sinf(angle) * 9);
+      display.drawLine(cx, cy, tipX, tipY, GxEPD_BLACK);
+      display.fillCircle(tipX, tipY, 1, GxEPD_BLACK);
+    }
+  }
+}
+
 static void drawNativeHeader(JsonObjectConst root, const String &title, const DeviceTelemetry &telemetry) {
   display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, GxEPD_BLACK);
   display.drawLine(0, 28, SCREEN_WIDTH, 28, GxEPD_BLACK);
@@ -2280,6 +2320,12 @@ static void drawNativeHeader(JsonObjectConst root, const String &title, const De
           ? lastFetchHeaderLine
           : formatIsoDateTimeKst(jsonString(root["generatedAt"])) + " 수신";
   drawText(146, 20, headerTimeLine, 0, TextSize::Tiny);
+
+  const String generatedAt = jsonString(root["generatedAt"]);
+  const int seasonMonth = generatedAt.length() >= 7 ? generatedAt.substring(5, 7).toInt() : 0;
+  if (seasonMonth >= 1 && seasonMonth <= 12) {
+    drawSeasonGlyph(566, 4, seasonMonth);
+  }
 
   drawWifiSignalIcon(614, 24, telemetry.rssi);
   drawText(652, 20, telemetry.ssid.length() > 0 ? telemetry.ssid.substring(0, 7) : "Wi-Fi", 8, TextSize::Tiny);
