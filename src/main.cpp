@@ -3119,12 +3119,36 @@ static void drawStockChartsPage(JsonObjectConst root, int pageGroup) {
 
 static void drawNewsPage(JsonObjectConst root) {
   JsonArrayConst news = root["news"].as<JsonArrayConst>();
+
+  // AI market summary box on top (only when the server provides one).
+  int y = 62;
+  const String summary = jsonString(root["marketSummary"]);
+  if (summary.length() > 0) {
+    display.fillRect(12, 40, 92, 20, GxEPD_BLACK);
+    setKoreanTextColors(GxEPD_WHITE, GxEPD_BLACK);
+    drawKorean(20, 55, "AI 시황", TextSize::Tiny);
+    setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
+
+    int lineY = 82;
+    int lineStart = 0;
+    for (int lines = 0; lines < 3 && lineStart < static_cast<int>(summary.length()); lines++) {
+      int lineEnd = summary.indexOf('\n', lineStart);
+      if (lineEnd < 0) {
+        lineEnd = summary.length();
+      }
+      drawText(20, lineY, summary.substring(lineStart, lineEnd), 52, TextSize::Small);
+      lineY += 22;
+      lineStart = lineEnd + 1;
+    }
+    display.drawLine(12, lineY - 8, SCREEN_WIDTH - 12, lineY - 8, GxEPD_BLACK);
+    y = lineY + 16;
+  }
+
   if (news.isNull() || news.size() == 0) {
-    drawText(24, 84, "뉴스 정보 없음", 0, TextSize::Bold);
+    drawText(24, y + 22, "뉴스 정보 없음", 0, TextSize::Bold);
     return;
   }
 
-  int y = 62;
   for (JsonObjectConst item : news) {
     if (y > SCREEN_HEIGHT - 20) {
       break;
