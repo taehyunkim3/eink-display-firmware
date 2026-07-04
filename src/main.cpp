@@ -218,7 +218,7 @@ enum class TextSize {
 
 static void setupDisplay();
 static void drawKorean(int16_t x, int16_t y, const String &text, TextSize size = TextSize::Small);
-static void drawTrendPage(JsonObjectConst root);
+static String utf8Prefix(const String &value, int maxChars);
 static bool flashFirmwareFromSd(const char *path);
 
 static void setLastError(int code, const String &detail) {
@@ -1674,6 +1674,98 @@ static void drawSetupTimerBox(uint32_t remainingSeconds) {
   drawKorean(x, 406, setupTimerText(remainingSeconds), TextSize::Large);
 }
 
+static String compactSettingText(const String &value, int maxChars) {
+  if (value.length() == 0) {
+    return "-";
+  }
+  if (value.length() <= maxChars) {
+    return value;
+  }
+  return utf8Prefix(value, maxChars - 3) + "...";
+}
+
+static String compactEndpointText(String endpoint) {
+  endpoint.replace("https://", "");
+  endpoint.replace("http://", "");
+  if (endpoint.length() <= 31) {
+    return endpoint;
+  }
+  return endpoint.substring(0, 13) + "..." + endpoint.substring(endpoint.length() - 15);
+}
+
+static String settingEnabledText(bool enabled) {
+  return enabled ? "ON" : "OFF";
+}
+
+static String settingStartPageText(int32_t startPage) {
+  return startPage < 0 ? "마지막" : String(startPage + 1);
+}
+
+static String settingPageMaskText(uint32_t pageMask) {
+  if ((pageMask & ALL_PAGES_MASK) == ALL_PAGES_MASK) {
+    return "전체";
+  }
+
+  String text;
+  for (int page = 0; page < SCREEN_PAGE_COUNT; page++) {
+    if (((pageMask >> page) & 1u) == 0) {
+      continue;
+    }
+    if (text.length() > 0) {
+      text += ",";
+    }
+    text += String(page + 1);
+  }
+  return text.length() > 0 ? text : "-";
+}
+
+static String settingNightText(const DeviceSettings &settings) {
+  if (settings.nightStartHour < 0) {
+    return "OFF";
+  }
+  return String(settings.nightStartHour) + "-" + String(settings.nightEndHour) + "시";
+}
+
+static String settingHoursText(uint32_t hours) {
+  return hours == 0 ? "OFF" : String(hours) + "h";
+}
+
+static void drawCurrentSettingsSummary() {
+  const DeviceSettings settings = loadDeviceSettings();
+  const String savedSsid = storedWifiSsid();
+  const String ssid = savedSsid.length() > 0 ? savedSsid : String(WIFI_SSID);
+  const String savedPassword = storedWifiPassword();
+  const bool hasPassword = savedPassword.length() > 0 || String(WIFI_PASSWORD).length() > 0;
+  const bool hasToken = deviceAuthToken().length() > 0;
+  const int16_t x = 430;
+  int16_t y = 116;
+
+  drawKorean(x, y, "현재값", TextSize::Micro);
+  y += 13;
+  drawKorean(x, y, "WiFi:" + compactSettingText(ssid, 14) + " PW:" + settingEnabledText(hasPassword),
+             TextSize::Micro);
+  y += 13;
+  drawKorean(x, y, "서버:" + compactEndpointText(deviceEndpointBase()), TextSize::Micro);
+  y += 13;
+  drawKorean(x, y, "웹:" + String(settings.refreshSeconds) + "s 전체:" +
+                     String(settings.fullRefreshInterval) + "회",
+             TextSize::Micro);
+  y += 13;
+  drawKorean(x, y, "시작:" + settingStartPageText(settings.startPage) + " 회전:" +
+                     (settings.rotateSeconds == 0 ? String("OFF") : String(settings.rotateSeconds) + "s"),
+             TextSize::Micro);
+  y += 13;
+  drawKorean(x, y, "페이지:" + settingPageMaskText(settings.pageMask), TextSize::Micro);
+  y += 13;
+  drawKorean(x, y, "수면:" + settingEnabledText(settings.deepSleep) + " 야간:" + settingNightText(settings),
+             TextSize::Micro);
+  y += 13;
+  drawKorean(x, y, "OTA:" + settingHoursText(settings.otaHours) + " 토큰:" + settingEnabledText(hasToken),
+             TextSize::Micro);
+  y += 13;
+  drawKorean(x, y, "FW:" + String(FIRMWARE_VERSION), TextSize::Micro);
+}
+
 static void drawSetupGuideScreen(const String &deviceName, const String &pin, const String &statusLine,
                                  uint32_t remainingSeconds = BLE_SETUP_TIMEOUT_SECONDS) {
   if (!ENABLE_DISPLAY) {
@@ -1697,9 +1789,10 @@ static void drawSetupGuideScreen(const String &deviceName, const String &pin, co
     }
 
     drawKorean(28, 132, "방법 1 · 웹 블루투스 — 모든 설정 가능", TextSize::Bold);
+    drawCurrentSettingsSummary();
     drawKorean(28, 160, "지원: Android/Mac/Windows Chrome (iOS 불가)", TextSize::Tiny);
     drawKorean(28, 186, "1) 오른쪽 QR 코드 또는 아래 주소로 접속", TextSize::Tiny);
-    drawKorean(44, 210, SETUP_PAGE_URL, TextSize::Tiny);
+    drawKorean(44, 210, SETUP_PAGE_URL, TextSize::Bold);
     drawKorean(28, 234, String("2) [기기 연결] 후 목록에서 ") + deviceName + " 선택", TextSize::Tiny);
     drawKorean(28, 258, "3) 아래 PIN 입력 후 설정 저장", TextSize::Tiny);
     drawKorean(28, 290, "확인 PIN", TextSize::Tiny);
@@ -3436,9 +3529,6 @@ static bool renderDashboard(JsonObjectConst root, const DeviceTelemetry &telemet
     } else if (page == 8) {
       drawNativeHeader(root, "뉴스", telemetry);
       drawNewsPage(root);
-    } else {
-      drawNativeHeader(root, "추세", telemetry);
-      drawTrendPage(root);
     }
   } while (display.nextPage());
 
@@ -3574,316 +3664,6 @@ static bool renderDashboardFromSdCache(bool partialDisplayRefresh) {
   }
   deviceState = "offline-cache";
   return true;
-}
-
-// ---- SD history log + trend page ---------------------------------------
-// Every fresh fetch appends one CSV line to /eink/history/YYYY-MM.csv:
-//   date,HH:MM,temperatureC,stockCode,stockPrice,batteryPercent
-// The trend page aggregates the last TREND_MAX_DAYS days from the current
-// and previous month files.
-struct TrendDay {
-  char label[6];  // "MM-DD"
-  float tMin;
-  float tMax;
-  float price;
-  int battery;
-  bool hasTemp;
-  bool hasPrice;
-};
-
-constexpr int TREND_MAX_DAYS = 40;
-
-static String historyFilePathForMonth(const String &yearMonth) {
-  return "/eink/history/" + yearMonth + ".csv";
-}
-
-static String lastLoggedGeneratedAt = "";
-
-static void appendHistoryLog(JsonObjectConst root, const DeviceTelemetry &telemetry) {
-  if (!sdAssetsAvailable) {
-    return;
-  }
-  const String generatedAt = jsonString(root["generatedAt"]);
-  if (generatedAt.length() < 16 || generatedAt == lastLoggedGeneratedAt) {
-    return;
-  }
-  lastLoggedGeneratedAt = generatedAt;
-
-  const String date = generatedAt.substring(0, 10);
-  String timeText = generatedAt.substring(11, 16);
-  if (lastFetchKstMinutes >= 0) {
-    char buffer[6];
-    snprintf(buffer, sizeof(buffer), "%02d:%02d",
-             static_cast<int>(lastFetchKstMinutes / 60),
-             static_cast<int>(lastFetchKstMinutes % 60));
-    timeText = buffer;
-  }
-
-  String temp = "";
-  JsonObjectConst weather = root["weather"];
-  if (!weather["temperatureC"].isNull()) {
-    temp = String(weather["temperatureC"].as<float>(), 1);
-  }
-
-  String stockCode = "";
-  String stockPrice = "";
-  JsonArrayConst stocks = root["stocks"].as<JsonArrayConst>();
-  if (!stocks.isNull() && stocks.size() > 0) {
-    JsonObjectConst stock = stocks[0];
-    stockCode = jsonString(stock["code"]);
-    stockCode.replace(",", "");
-    bool ok = false;
-    const float price = parseMarketNumber(jsonString(stock["price"]), &ok);
-    if (ok) {
-      stockPrice = String(price, 2);
-    }
-  }
-
-  SD.mkdir("/eink/history");
-  File file = SD.open(historyFilePathForMonth(date.substring(0, 7)).c_str(), FILE_APPEND);
-  if (!file) {
-    Serial.println("History log: open failed");
-    return;
-  }
-  file.printf("%s,%s,%s,%s,%s,%d\n",
-              date.c_str(),
-              timeText.c_str(),
-              temp.c_str(),
-              stockCode.c_str(),
-              stockPrice.c_str(),
-              static_cast<int>(telemetry.batteryPercent));
-  file.close();
-}
-
-// Aggregates one month file into the day array. Returns the updated count.
-static int trendLoadMonthFile(const String &path, TrendDay *days, int count, char *stockCode, size_t stockCodeLen) {
-  File file = SD.open(path.c_str(), FILE_READ);
-  if (!file) {
-    return count;
-  }
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    line.trim();
-    if (line.length() < 12) {
-      continue;
-    }
-
-    // Split into 6 fields: date, time, temp, code, price, battery.
-    String fields[6];
-    int fieldIndex = 0;
-    int start = 0;
-    for (int i = 0; i <= line.length() && fieldIndex < 6; i++) {
-      if (i == line.length() || line[i] == ',') {
-        fields[fieldIndex++] = line.substring(start, i);
-        start = i + 1;
-      }
-    }
-    if (fieldIndex < 6 || fields[0].length() < 10) {
-      continue;
-    }
-
-    const String dayLabel = fields[0].substring(5, 10);  // MM-DD
-    TrendDay *day = nullptr;
-    if (count > 0 && dayLabel.equals(days[count - 1].label)) {
-      day = &days[count - 1];
-    } else {
-      if (count == TREND_MAX_DAYS) {
-        memmove(days, days + 1, sizeof(TrendDay) * (TREND_MAX_DAYS - 1));
-        count--;
-      }
-      day = &days[count++];
-      strlcpy(day->label, dayLabel.c_str(), sizeof(day->label));
-      day->tMin = 0;
-      day->tMax = 0;
-      day->price = 0;
-      day->battery = -1;
-      day->hasTemp = false;
-      day->hasPrice = false;
-    }
-
-    if (fields[2].length() > 0) {
-      const float temp = fields[2].toFloat();
-      if (!day->hasTemp) {
-        day->tMin = temp;
-        day->tMax = temp;
-        day->hasTemp = true;
-      } else {
-        day->tMin = min(day->tMin, temp);
-        day->tMax = max(day->tMax, temp);
-      }
-    }
-    if (fields[4].length() > 0) {
-      day->price = fields[4].toFloat();
-      day->hasPrice = true;
-    }
-    if (fields[3].length() > 0) {
-      strlcpy(stockCode, fields[3].c_str(), stockCodeLen);
-    }
-    if (fields[5].length() > 0) {
-      day->battery = fields[5].toInt();
-    }
-  }
-  file.close();
-  return count;
-}
-
-static String previousYearMonth(const String &yearMonth) {
-  int year = yearMonth.substring(0, 4).toInt();
-  int month = yearMonth.substring(5, 7).toInt() - 1;
-  if (month < 1) {
-    month = 12;
-    year--;
-  }
-  char buffer[8];
-  snprintf(buffer, sizeof(buffer), "%04d-%02d", year, month);
-  return String(buffer);
-}
-
-static void drawTrendPage(JsonObjectConst root) {
-  static TrendDay days[TREND_MAX_DAYS];
-  char stockCode[16] = "";
-  int count = 0;
-
-  const String generatedAt = jsonString(root["generatedAt"]);
-  if (sdAssetsAvailable && generatedAt.length() >= 7) {
-    const String currentMonth = generatedAt.substring(0, 7);
-    count = trendLoadMonthFile(historyFilePathForMonth(previousYearMonth(currentMonth)),
-                               days, 0, stockCode, sizeof(stockCode));
-    count = trendLoadMonthFile(historyFilePathForMonth(currentMonth),
-                               days, count, stockCode, sizeof(stockCode));
-  }
-
-  if (!sdAssetsAvailable) {
-    drawText(24, 200, "SD 카드가 없어 추세 데이터를 사용할 수 없습니다.", 0, TextSize::Bold);
-    drawText(24, 232, "SD 카드를 넣으면 매 갱신마다 기온/지수/배터리가 기록됩니다.", 0, TextSize::Small);
-    return;
-  }
-  if (count < 2) {
-    drawText(24, 200, "아직 추세를 그릴 데이터가 부족합니다.", 0, TextSize::Bold);
-    drawText(24, 232, "이틀 이상 데이터가 쌓이면 기온과 지수 추세가 표시됩니다.", 0, TextSize::Small);
-    return;
-  }
-
-  // Chart panels: temperature band (top) + first stock closing price (bottom).
-  struct Panel {
-    int16_t top;
-    int16_t height;
-  };
-  const Panel tempPanel = {64, 180};
-  const Panel pricePanel = {282, 168};
-  const int16_t chartX = 64;
-  const int16_t chartW = SCREEN_WIDTH - chartX - 24;
-
-  const auto xForIndex = [&](int index) -> int16_t {
-    if (count == 1) {
-      return chartX;
-    }
-    return chartX + static_cast<int16_t>(static_cast<int32_t>(chartW - 1) * index / (count - 1));
-  };
-
-  // ----- temperature panel -----
-  float tLow = 0, tHigh = 0;
-  bool tempSeen = false;
-  for (int i = 0; i < count; i++) {
-    if (!days[i].hasTemp) continue;
-    if (!tempSeen) {
-      tLow = days[i].tMin;
-      tHigh = days[i].tMax;
-      tempSeen = true;
-    } else {
-      tLow = min(tLow, days[i].tMin);
-      tHigh = max(tHigh, days[i].tMax);
-    }
-  }
-  drawText(24, tempPanel.top - 24, "기온 추세 (일별 최저~최고, C)", 0, TextSize::Bold);
-  if (tempSeen) {
-    if (tHigh - tLow < 1.0f) {
-      tHigh += 0.5f;
-      tLow -= 0.5f;
-    }
-    const auto tempY = [&](float v) -> int16_t {
-      return tempPanel.top + tempPanel.height -
-             static_cast<int16_t>((v - tLow) / (tHigh - tLow) * tempPanel.height);
-    };
-    display.drawRect(chartX, tempPanel.top, chartW, tempPanel.height + 1, GxEPD_BLACK);
-    drawText(8, tempPanel.top + 4, String(tHigh, 0), 0, TextSize::Micro);
-    drawText(8, tempPanel.top + tempPanel.height - 10, String(tLow, 0), 0, TextSize::Micro);
-
-    int16_t prevX = -1, prevMinY = 0, prevMaxY = 0;
-    for (int i = 0; i < count; i++) {
-      if (!days[i].hasTemp) continue;
-      const int16_t x = xForIndex(i);
-      const int16_t yMin = tempY(days[i].tMin);
-      const int16_t yMax = tempY(days[i].tMax);
-      display.drawLine(x, yMin, x, yMax, GxEPD_BLACK);
-      if (prevX >= 0) {
-        display.drawLine(prevX, prevMaxY, x, yMax, GxEPD_BLACK);
-        display.drawLine(prevX, prevMinY, x, yMin, GxEPD_BLACK);
-      }
-      prevX = x;
-      prevMinY = yMin;
-      prevMaxY = yMax;
-    }
-  } else {
-    drawText(chartX + 12, tempPanel.top + 80, "기온 데이터 없음", 0, TextSize::Small);
-  }
-
-  // ----- price panel -----
-  float pLow = 0, pHigh = 0;
-  bool priceSeen = false;
-  for (int i = 0; i < count; i++) {
-    if (!days[i].hasPrice) continue;
-    if (!priceSeen) {
-      pLow = days[i].price;
-      pHigh = days[i].price;
-      priceSeen = true;
-    } else {
-      pLow = min(pLow, days[i].price);
-      pHigh = max(pHigh, days[i].price);
-    }
-  }
-  const String priceTitle =
-      String(stockCode[0] != '\0' ? stockCode : "지수") + " 추세 (일별 종가 기준)";
-  drawText(24, pricePanel.top - 24, priceTitle, 0, TextSize::Bold);
-  if (priceSeen) {
-    if (pHigh - pLow < 0.01f) {
-      pHigh += 0.5f;
-      pLow -= 0.5f;
-    }
-    const auto priceY = [&](float v) -> int16_t {
-      return pricePanel.top + pricePanel.height -
-             static_cast<int16_t>((v - pLow) / (pHigh - pLow) * pricePanel.height);
-    };
-    display.drawRect(chartX, pricePanel.top, chartW, pricePanel.height + 1, GxEPD_BLACK);
-    drawText(8, pricePanel.top + 4, String(pHigh, 0), 0, TextSize::Micro);
-    drawText(8, pricePanel.top + pricePanel.height - 10, String(pLow, 0), 0, TextSize::Micro);
-
-    int16_t prevX = -1, prevY = 0;
-    for (int i = 0; i < count; i++) {
-      if (!days[i].hasPrice) continue;
-      const int16_t x = xForIndex(i);
-      const int16_t y = priceY(days[i].price);
-      display.fillCircle(x, y, 2, GxEPD_BLACK);
-      if (prevX >= 0) {
-        display.drawLine(prevX, prevY, x, y, GxEPD_BLACK);
-      }
-      prevX = x;
-      prevY = y;
-    }
-  } else {
-    drawText(chartX + 12, pricePanel.top + 70, "지수 데이터 없음", 0, TextSize::Small);
-  }
-
-  // ----- x-axis day labels (first / middle / last) -----
-  const int16_t labelY = SCREEN_HEIGHT - 18;
-  drawText(chartX, labelY, days[0].label, 0, TextSize::Micro);
-  const String midLabel = days[count / 2].label;
-  drawText(chartX + chartW / 2 - static_cast<int16_t>(measureKorean(midLabel, TextSize::Micro)) / 2,
-           labelY, midLabel, 0, TextSize::Micro);
-  const String lastLabel = days[count - 1].label;
-  drawText(chartX + chartW - static_cast<int16_t>(measureKorean(lastLabel, TextSize::Micro)),
-           labelY, lastLabel, 0, TextSize::Micro);
-  drawText(24, 32, String(count) + "일치 기록", 0, TextSize::Micro);
 }
 
 // ---- OTA firmware update ----------------------------------------------
@@ -4187,7 +3967,6 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
 
   deviceState = "screen-updated";
   Serial.println("Screen updated");
-  appendHistoryLog(document.as<JsonObjectConst>(), telemetry);
   maybeCheckOtaUpdate();
   return true;
 }
