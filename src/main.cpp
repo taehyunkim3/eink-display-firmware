@@ -2287,6 +2287,57 @@ static bool drawCandleChart(JsonObjectConst stock, int16_t x, int16_t y, int16_t
   return true;
 }
 
+static String compactChartPrice(float value) {
+  if (!isfinite(value) || value <= 0) {
+    return "--";
+  }
+  if (value >= 1000.0f) {
+    return String(static_cast<long>(round(value)));
+  }
+  if (value >= 100.0f) {
+    return String(value, 1);
+  }
+  return String(value, 2);
+}
+
+static void drawChartPointLabels(JsonObjectConst stock,
+                                 int16_t x,
+                                 int16_t y,
+                                 int16_t w,
+                                 int16_t h) {
+  JsonArrayConst candles = stock["candles"].as<JsonArrayConst>();
+  if (candles.size() >= 2) {
+    const int count = min(static_cast<int>(candles.size()), 36);
+    const int start = static_cast<int>(candles.size()) - count;
+    const int indexes[] = {start, start + (count - 1) / 2, start + count - 1};
+    const int labelX[] = {x, x + w / 2 - 34, x + w - 76};
+
+    for (int i = 0; i < 3; i++) {
+      JsonObjectConst candle = candles[indexes[i]];
+      const String time = jsonString(candle["t"], "--:--");
+      const String price = compactChartPrice(candle["c"].as<float>());
+      drawText(labelX[i], y, time + " " + price, 12, TextSize::Tiny);
+    }
+    return;
+  }
+
+  JsonArrayConst history = stock["history"].as<JsonArrayConst>();
+  if (history.size() < 2) {
+    return;
+  }
+
+  const int indexes[] = {0, static_cast<int>((history.size() - 1) / 2), static_cast<int>(history.size() - 1)};
+  const int labelX[] = {x, x + w / 2 - 30, x + w - 58};
+  const char *labels[] = {"시작", "중간", "현재"};
+  for (int i = 0; i < 3; i++) {
+    drawText(labelX[i],
+             y,
+             String(labels[i]) + " " + compactChartPrice(history[indexes[i]].as<float>()),
+             10,
+             TextSize::Tiny);
+  }
+}
+
 static void setPbmPixel(uint8_t *bitmap, int width, int x, int y) {
   if (x < 0 || x >= width || y < 0 || y >= width) {
     return;
@@ -2764,10 +2815,11 @@ static void drawStockChartTile(JsonObjectConst stock,
   const int chartX = x + 10;
   const int chartY = y + 58;
   const int chartW = w - 20;
-  const int chartH = h - 108;
+  const int chartH = h - 122;
   if (!drawCandleChart(stock, chartX, chartY, chartW, chartH)) {
     drawPercentLineChart(stock, chartX, chartY, chartW, chartH);
   }
+  drawChartPointLabels(stock, chartX, chartY + chartH + 17, chartW, 16);
 
   JsonObjectConst flow = stock["investorFlow"];
   if (!flow.isNull()) {
