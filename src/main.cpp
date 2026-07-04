@@ -2091,6 +2091,27 @@ static int weekdayFromDays(int days) {
   return weekday;
 }
 
+// "2026년 07월 04일 토요일 16:20" (KST, with day rollover from UTC).
+static String formatIsoDateTimeKst(const String &value) {
+  if (value.length() < 16) {
+    return formatIsoTime(value);
+  }
+
+  int days = daysFromCivil(value.substring(0, 4).toInt(),
+                           value.substring(5, 7).toInt(),
+                           value.substring(8, 10).toInt());
+  int hours = value.substring(11, 13).toInt() + 9;
+  const int minutes = value.substring(14, 16).toInt();
+  if (hours >= 24) {
+    hours -= 24;
+    days += 1;
+  }
+
+  const CivilDate kst = civilFromDays(days);
+  return String(kst.year) + "년 " + twoDigit(kst.month) + "월 " + twoDigit(kst.day) + "일 " +
+         WEEKDAY_LABELS[weekdayFromDays(days)] + "요일 " + twoDigit(hours) + ":" + twoDigit(minutes);
+}
+
 static bool sameEventDay(JsonObjectConst event, const String &dateKey) {
   return dateKeyFromIso(jsonString(event["startsAt"])) == dateKey;
 }
@@ -2148,15 +2169,15 @@ static void drawBatteryIcon(int16_t x, int16_t y, int percent, bool charging) {
 
 static void drawNativeHeader(JsonObjectConst root, const String &title, const DeviceTelemetry &telemetry) {
   display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, GxEPD_BLACK);
-  display.drawLine(0, 35, SCREEN_WIDTH, 35, GxEPD_BLACK);
-  drawInvertedText(10, 25, 116, 25, title, 5);
-  drawText(140, 24, String(screenPage + 1) + "/" + String(SCREEN_PAGE_COUNT));
-  drawText(192, 24, formatIsoTime(jsonString(root["generatedAt"])));
+  display.drawLine(0, 28, SCREEN_WIDTH, 28, GxEPD_BLACK);
+  drawInvertedText(8, 20, 82, 20, title, 5, TextSize::Tiny);
+  drawText(100, 20, String(screenPage + 1) + "/" + String(SCREEN_PAGE_COUNT), 0, TextSize::Tiny);
+  drawText(146, 20, formatIsoDateTimeKst(jsonString(root["generatedAt"])) + " 업데이트", 0, TextSize::Tiny);
 
-  drawWifiSignalIcon(610, 27, telemetry.rssi);
-  drawText(646, 24, telemetry.ssid.length() > 0 ? telemetry.ssid.substring(0, 7) : "Wi-Fi", 8);
+  drawWifiSignalIcon(614, 24, telemetry.rssi);
+  drawText(652, 20, telemetry.ssid.length() > 0 ? telemetry.ssid.substring(0, 7) : "Wi-Fi", 8, TextSize::Tiny);
   if (telemetry.batteryPercent >= 0) {
-    drawBatteryIcon(742, 10, telemetry.batteryPercent, telemetry.batteryChargeState == "charging");
+    drawBatteryIcon(746, 6, telemetry.batteryPercent, telemetry.batteryChargeState == "charging");
   }
 }
 
@@ -2327,12 +2348,14 @@ static bool drawCandleChart(JsonObjectConst stock, int16_t x, int16_t y, int16_t
   return true;
 }
 
+static String formatWithThousands(const String &raw);
+
 static String compactChartPrice(float value) {
   if (!isfinite(value) || value <= 0) {
     return "--";
   }
   if (value >= 1000.0f) {
-    return String(static_cast<long>(round(value)));
+    return formatWithThousands(String(static_cast<long>(round(value))));
   }
   if (value >= 100.0f) {
     return String(value, 1);
@@ -2344,6 +2367,38 @@ static String removeNumberSeparators(String value) {
   value.replace(",", "");
   value.replace("，", "");
   return value;
+}
+
+// Normalize separators, then re-insert a comma every 3 digits of the integer part.
+static String formatWithThousands(const String &raw) {
+  const String value = removeNumberSeparators(raw);
+
+  int digitsStart = -1;
+  for (int i = 0; i < value.length(); i++) {
+    if (value[i] >= '0' && value[i] <= '9') {
+      digitsStart = i;
+      break;
+    }
+  }
+  if (digitsStart < 0) {
+    return value;
+  }
+
+  int digitsEnd = digitsStart;
+  while (digitsEnd < value.length() && value[digitsEnd] >= '0' && value[digitsEnd] <= '9') {
+    digitsEnd++;
+  }
+
+  const String integerPart = value.substring(digitsStart, digitsEnd);
+  String grouped;
+  for (int i = 0; i < integerPart.length(); i++) {
+    if (i > 0 && (integerPart.length() - i) % 3 == 0) {
+      grouped += ',';
+    }
+    grouped += integerPart[i];
+  }
+
+  return value.substring(0, digitsStart) + grouped + value.substring(digitsEnd);
 }
 
 static String stockDirectionWord(JsonObjectConst stock) {
@@ -2360,9 +2415,10 @@ static String signedStockValue(JsonObjectConst stock, const String &value, const
     cleaned.remove(0, 1);
   }
   const String direction = jsonString(stock["direction"]);
-  if (direction == "up") return "+" + cleaned + suffix;
-  if (direction == "down") return "-" + cleaned + suffix;
-  return cleaned + suffix;
+  const String grouped = formatWithThousands(cleaned);
+  if (direction == "up") return "+" + grouped + suffix;
+  if (direction == "down") return "-" + grouped + suffix;
+  return grouped + suffix;
 }
 
 // Price scale on the right of the chart: +range / previous close / -range.
@@ -2384,7 +2440,7 @@ static void drawChartPriceAxis(JsonObjectConst stock, int16_t x, int16_t y, int1
   for (int i = 0; i < 3; i++) {
     const int tickY = percentY(percents[i], range, y, h);
     display.drawFastHLine(x, tickY, 3, GxEPD_BLACK);
-    drawText(x + 5, tickY + 3, removeNumberSeparators(compactChartPrice(prices[i])), 0, TextSize::Micro);
+    drawText(x + 5, tickY + 3, compactChartPrice(prices[i]), 0, TextSize::Micro);
   }
 }
 
@@ -2695,13 +2751,13 @@ static void drawMonthCalendarPage(JsonObjectConst root) {
       }
       drawText(x + 3, y + 13, date.day == 1 ? String(date.month) + "월1일" : String(date.day), 5, TextSize::Tiny);
 
-      int eventY = y + 26;
+      int eventY = y + 24;
       int shown = 0;
       for (JsonObjectConst event : events) {
         if (!sameEventDay(event, key)) continue;
         const String time = event["allDay"].as<bool>() ? "" : formatIsoTime(jsonString(event["startsAt"])) + " ";
-        drawText(x + 4, eventY, time + jsonString(event["title"]), 10, TextSize::Tiny);
-        eventY += 13;
+        drawText(x + 4, eventY, time + jsonString(event["title"]), 18, TextSize::Micro);
+        eventY += 11;
         shown++;
         if (shown >= 4) break;
       }
@@ -2711,7 +2767,7 @@ static void drawMonthCalendarPage(JsonObjectConst root) {
           if (sameEventDay(event, key)) remaining++;
         }
         if (remaining > shown) {
-          drawText(x + 4, eventY, "+" + String(remaining - shown), 4, TextSize::Tiny);
+          drawText(x + 4, eventY, "+" + String(remaining - shown), 4, TextSize::Micro);
         }
       }
     }
@@ -2740,15 +2796,15 @@ static void drawWeekCalendarPage(JsonObjectConst root) {
     drawText(x + 4, 76, String(date.month) + "/" + String(date.day), 5, TextSize::Tiny);
     display.drawLine(x, 84, x + colW, 84, GxEPD_BLACK);
 
-    int y = 102;
+    int y = 100;
     int shown = 0;
     for (JsonObjectConst event : events) {
       if (!sameEventDay(event, key)) continue;
       const String time = event["allDay"].as<bool>() ? "" : formatIsoTime(jsonString(event["startsAt"])) + " ";
-      drawText(x + 5, y, time + jsonString(event["title"]), 10, TextSize::Tiny);
-      y += 14;
+      drawText(x + 5, y, time + jsonString(event["title"]), 18, TextSize::Micro);
+      y += 12;
       shown++;
-      if (shown >= 25) break;
+      if (shown >= 30) break;
     }
     if (shown == 0) {
       drawText(x + 14, 274, "일정 없음", 5, TextSize::Tiny);
@@ -2779,7 +2835,7 @@ static void drawStocksPage(JsonObjectConst root) {
     if (i >= static_cast<int>(stocks.size())) continue;
     JsonObjectConst stock = stocks[i];
     drawInvertedText(x + 1, y + 24, tileW - 1, 24, jsonString(stock["name"]), 10);
-    drawText(x + 8, y + 54, removeNumberSeparators(jsonString(stock["price"], "--")), 12, TextSize::Bold);
+    drawText(x + 8, y + 54, formatWithThousands(jsonString(stock["price"], "--")), 12, TextSize::Bold);
     drawText(x + 138,
              y + 54,
              stockDirectionWord(stock) + " " + signedStockValue(stock, jsonString(stock["changePercent"], "--"), "%"),
@@ -2811,7 +2867,7 @@ static void drawStockChartTile(JsonObjectConst stock,
   drawGridCellFrame(x, y, w, h, row, col);
   drawText(x + 10, y + 24, String(globalIndex + 1) + ". " + jsonString(stock["name"]), 14, TextSize::Bold);
   drawText(x + 10, y + 46,
-           removeNumberSeparators(jsonString(stock["price"], "--")) + "  " +
+           formatWithThousands(jsonString(stock["price"], "--")) + "  " +
                signedStockValue(stock, jsonString(stock["changePercent"], "--"), "%"),
            18);
 
@@ -2858,6 +2914,27 @@ static void drawStockChartsPage(JsonObjectConst root, int pageGroup) {
   }
 }
 
+static void drawNewsPage(JsonObjectConst root) {
+  JsonArrayConst news = root["news"].as<JsonArrayConst>();
+  if (news.isNull() || news.size() == 0) {
+    drawText(24, 84, "뉴스 정보 없음", 0, TextSize::Bold);
+    return;
+  }
+
+  int y = 62;
+  for (JsonObjectConst item : news) {
+    if (y > SCREEN_HEIGHT - 20) {
+      break;
+    }
+    const String time = formatIsoTime(jsonString(item["publishedAt"]));
+    drawText(16, y, time.length() > 0 ? time : "--:--", 0, TextSize::Tiny);
+    drawText(64, y, jsonString(item["title"]), 50, TextSize::Small);
+    drawText(SCREEN_WIDTH - 78, y, jsonString(item["source"]), 6, TextSize::Tiny);
+    display.drawFastHLine(12, y + 12, SCREEN_WIDTH - 24, GxEPD_BLACK);
+    y += 36;
+  }
+}
+
 static bool renderDashboard(JsonObjectConst root, const DeviceTelemetry &telemetry, bool partialRefresh) {
   display.setRotation(0);
   if (partialRefresh) {
@@ -2893,9 +2970,12 @@ static bool renderDashboard(JsonObjectConst root, const DeviceTelemetry &telemet
     } else if (page == 6) {
       drawNativeHeader(root, "차트2", telemetry);
       drawStockChartsPage(root, 1);
-    } else {
+    } else if (page == 7) {
       drawNativeHeader(root, "차트3", telemetry);
       drawStockChartsPage(root, 2);
+    } else {
+      drawNativeHeader(root, "뉴스", telemetry);
+      drawNewsPage(root);
     }
   } while (display.nextPage());
 

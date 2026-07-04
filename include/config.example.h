@@ -19,7 +19,7 @@
 #define FALLBACK_SLEEP_SECONDS 1800
 #define BOOT_TEST_SECONDS 0
 #define DEBUG_HEARTBEAT_SECONDS 5
-#define SCREEN_PAGE_COUNT 8
+#define SCREEN_PAGE_COUNT 9
 // Device setting defaults. Users can change these from the on-device settings
 // menu; saved values are stored in ESP32 Preferences.
 #define PAGE_FULL_REFRESH_INTERVAL 5
