@@ -1753,17 +1753,42 @@ static void drawText(int16_t x, int16_t y, const String &text, int maxChars = 0)
   drawKorean(x, y, maxChars > 0 ? utf8Prefix(text, maxChars) : text);
 }
 
+static void drawInvertedText(int16_t x, int16_t y, int16_t width, int16_t height, const String &text, int maxChars = 0) {
+  display.fillRect(x, y - height + 5, width, height, GxEPD_BLACK);
+  setKoreanFont();
+  koreanFonts.setForegroundColor(GxEPD_WHITE);
+  koreanFonts.setBackgroundColor(GxEPD_BLACK);
+  koreanFonts.drawUTF8(x + 5, y, (maxChars > 0 ? utf8Prefix(text, maxChars) : text).c_str());
+  koreanFonts.setForegroundColor(GxEPD_BLACK);
+  koreanFonts.setBackgroundColor(GxEPD_WHITE);
+}
+
+static void drawBatteryIcon(int16_t x, int16_t y, int percent, bool charging) {
+  display.drawRect(x, y, 34, 16, GxEPD_BLACK);
+  display.fillRect(x + 35, y + 5, 3, 6, GxEPD_BLACK);
+  const int fillWidth = constrain(percent, 0, 100) * 30 / 100;
+  if (fillWidth > 0) {
+    display.fillRect(x + 2, y + 2, fillWidth, 12, GxEPD_BLACK);
+  }
+  if (charging) {
+    display.drawLine(x + 15, y + 2, x + 10, y + 9, GxEPD_BLACK);
+    display.drawLine(x + 10, y + 9, x + 18, y + 9, GxEPD_BLACK);
+    display.drawLine(x + 18, y + 9, x + 13, y + 15, GxEPD_BLACK);
+  }
+}
+
 static void drawNativeHeader(JsonObjectConst root, const String &title, const DeviceTelemetry &telemetry) {
   display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, GxEPD_BLACK);
   display.drawLine(0, 35, SCREEN_WIDTH, 35, GxEPD_BLACK);
-  drawText(14, 24, title + " | " + String(screenPage + 1) + "/" + String(SCREEN_PAGE_COUNT));
-  drawText(150, 24, formatIsoTime(jsonString(root["generatedAt"])));
+  drawInvertedText(10, 25, 116, 25, title, 5);
+  drawText(140, 24, String(screenPage + 1) + "/" + String(SCREEN_PAGE_COUNT));
+  drawText(192, 24, formatIsoTime(jsonString(root["generatedAt"])));
 
-  String status = telemetry.ssid.length() > 0 ? telemetry.ssid.substring(0, 10) : "Wi-Fi";
+  drawWifiSignalIcon(610, 27, telemetry.rssi);
+  drawText(646, 24, telemetry.ssid.length() > 0 ? telemetry.ssid.substring(0, 7) : "Wi-Fi", 8);
   if (telemetry.batteryPercent >= 0) {
-    status += "  BAT " + String(telemetry.batteryPercent) + "%";
+    drawBatteryIcon(742, 10, telemetry.batteryPercent, telemetry.batteryChargeState == "charging");
   }
-  drawText(548, 24, status, 18);
 }
 
 static void drawSparkline(JsonArrayConst history, int16_t x, int16_t y, int16_t w, int16_t h) {
@@ -1796,20 +1821,27 @@ static void drawSparkline(JsonArrayConst history, int16_t x, int16_t y, int16_t 
 
 static void drawWeatherIcon(int16_t x, int16_t y, int code) {
   if (code == 0 || code == 1) {
-    display.drawCircle(x + 15, y + 15, 9, GxEPD_BLACK);
-    display.drawLine(x + 15, y, x + 15, y + 5, GxEPD_BLACK);
-    display.drawLine(x + 15, y + 25, x + 15, y + 30, GxEPD_BLACK);
-    display.drawLine(x, y + 15, x + 5, y + 15, GxEPD_BLACK);
-    display.drawLine(x + 25, y + 15, x + 30, y + 15, GxEPD_BLACK);
+    display.fillCircle(x + 16, y + 16, 8, GxEPD_BLACK);
+    display.drawLine(x + 16, y + 1, x + 16, y + 7, GxEPD_BLACK);
+    display.drawLine(x + 16, y + 25, x + 16, y + 31, GxEPD_BLACK);
+    display.drawLine(x + 1, y + 16, x + 7, y + 16, GxEPD_BLACK);
+    display.drawLine(x + 25, y + 16, x + 31, y + 16, GxEPD_BLACK);
+    display.drawLine(x + 5, y + 5, x + 9, y + 9, GxEPD_BLACK);
+    display.drawLine(x + 23, y + 23, x + 27, y + 27, GxEPD_BLACK);
+    display.drawLine(x + 27, y + 5, x + 23, y + 9, GxEPD_BLACK);
+    display.drawLine(x + 9, y + 23, x + 5, y + 27, GxEPD_BLACK);
   } else if (code >= 51 && code <= 82) {
-    display.drawRoundRect(x + 2, y + 8, 26, 13, 6, GxEPD_BLACK);
-    display.drawLine(x + 8, y + 24, x + 5, y + 30, GxEPD_BLACK);
-    display.drawLine(x + 17, y + 24, x + 14, y + 30, GxEPD_BLACK);
-    display.drawLine(x + 26, y + 24, x + 23, y + 30, GxEPD_BLACK);
+    display.fillCircle(x + 11, y + 13, 7, GxEPD_BLACK);
+    display.fillCircle(x + 20, y + 11, 8, GxEPD_BLACK);
+    display.fillRect(x + 6, y + 14, 23, 8, GxEPD_BLACK);
+    display.drawLine(x + 8, y + 25, x + 5, y + 31, GxEPD_BLACK);
+    display.drawLine(x + 17, y + 25, x + 14, y + 31, GxEPD_BLACK);
+    display.drawLine(x + 26, y + 25, x + 23, y + 31, GxEPD_BLACK);
   } else {
-    display.drawRoundRect(x + 2, y + 9, 28, 14, 7, GxEPD_BLACK);
-    display.drawCircle(x + 11, y + 9, 7, GxEPD_BLACK);
-    display.drawCircle(x + 20, y + 8, 8, GxEPD_BLACK);
+    display.fillCircle(x + 11, y + 14, 7, GxEPD_BLACK);
+    display.fillCircle(x + 20, y + 12, 9, GxEPD_BLACK);
+    display.fillCircle(x + 26, y + 16, 6, GxEPD_BLACK);
+    display.fillRect(x + 6, y + 16, 25, 8, GxEPD_BLACK);
   }
 }
 
@@ -1904,9 +1936,8 @@ static void drawMonthCalendarPage(JsonObjectConst root) {
       for (JsonObjectConst event : events) {
         if (!sameEventDay(event, key)) continue;
         display.fillRect(x + 8, eventY - 14, 3, 18, GxEPD_BLACK);
-        drawText(x + 16, eventY, jsonString(event["title"]), 7);
-        drawText(x + 16, eventY + 20, formatIsoTime(jsonString(event["startsAt"])) + " " +
-                                      jsonString(event["calendarName"], ""), 8);
+        drawText(x + 16, eventY, jsonString(event["title"]), 5);
+        drawText(x + 16, eventY + 20, formatIsoTime(jsonString(event["startsAt"])), 5);
         eventY += 38;
         shown++;
         if (shown >= 2) break;
@@ -1942,8 +1973,8 @@ static void drawWeekCalendarPage(JsonObjectConst root) {
     for (JsonObjectConst event : events) {
       if (!sameEventDay(event, key)) continue;
       display.fillRect(x + 8, y - 15, 3, 20, GxEPD_BLACK);
-      drawText(x + 16, y, jsonString(event["title"]), 7);
-      drawText(x + 16, y + 22, formatIsoTime(jsonString(event["startsAt"])), 7);
+      drawText(x + 16, y, jsonString(event["title"]), 5);
+      drawText(x + 16, y + 22, formatIsoTime(jsonString(event["startsAt"])), 5);
       y += 56;
       shown++;
       if (shown >= 6) break;
@@ -1975,10 +2006,10 @@ static void drawStocksPage(JsonObjectConst root) {
     display.drawRect(x, y, tileW + 1, tileH + 1, GxEPD_BLACK);
     if (i >= static_cast<int>(stocks.size())) continue;
     JsonObjectConst stock = stocks[i];
-    drawText(x + 8, y + 24, jsonString(stock["name"]), 10);
-    drawText(x + 8, y + 47, jsonString(stock["price"]), 12);
-    drawText(x + 150, y + 47, jsonString(stock["changePercent"]) + "%", 8);
-    drawSparkline(stock["history"].as<JsonArrayConst>(), x + 10, y + 58, tileW - 20, 28);
+    drawInvertedText(x + 1, y + 24, tileW - 1, 24, jsonString(stock["name"]), 10);
+    drawText(x + 8, y + 52, jsonString(stock["price"]), 12);
+    drawText(x + 150, y + 52, jsonString(stock["changePercent"]) + "%", 8);
+    drawSparkline(stock["history"].as<JsonArrayConst>(), x + 10, y + 62, tileW - 20, 26);
     JsonObjectConst flow = stock["investorFlow"];
     if (!flow.isNull()) {
       drawText(x + 8, y + 104, "개인 " + flowValue(flow["retail"]), 9);
@@ -2072,7 +2103,6 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
     Serial.println("Display disabled for serial/debug check");
   } else {
     setupDisplay();
-    drawStatus("로딩중", "데이터를 가져오는 중입니다.", partialDisplayRefresh);
   }
 
   if (!connectWifi()) {
