@@ -1658,7 +1658,16 @@ static void drawQrCode(int16_t x, int16_t y, const char *text, uint8_t version, 
   }
 }
 
-static void drawSetupGuideScreen(const String &deviceName, const String &pin, const String &statusLine) {
+static String setupTimerLine(uint32_t remainingSeconds) {
+  char timer[8];
+  snprintf(timer, sizeof(timer), "%lu:%02lu",
+           static_cast<unsigned long>(remainingSeconds / 60),
+           static_cast<unsigned long>(remainingSeconds % 60));
+  return String("자동 종료까지 ") + timer + " · PIN 3회 오류 시 즉시 종료";
+}
+
+static void drawSetupGuideScreen(const String &deviceName, const String &pin, const String &statusLine,
+                                 uint32_t remainingSeconds = BLE_SETUP_TIMEOUT_SECONDS) {
   if (!ENABLE_DISPLAY) {
     return;
   }
@@ -1692,11 +1701,26 @@ static void drawSetupGuideScreen(const String &deviceName, const String &pin, co
     drawKorean(28, 406, String("휴대폰 Wi-Fi에서 '") + deviceName + "' 연결 후 http://192.168.4.1 접속", TextSize::Tiny);
 
     display.drawLine(28, SCREEN_HEIGHT - 64, SCREEN_WIDTH - 28, SCREEN_HEIGHT - 64, GxEPD_BLACK);
-    drawKorean(28, SCREEN_HEIGHT - 42, "보안: 5분 후 자동 종료 · PIN 3회 오류 시 즉시 종료", TextSize::Tiny);
+    drawKorean(28, SCREEN_HEIGHT - 42, setupTimerLine(remainingSeconds), TextSize::Tiny);
     drawKorean(28, SCREEN_HEIGHT - 20, String("상태: ") + statusLine + "   (닫기: 새로고침 버튼)", TextSize::Tiny);
 
     drawQrCode(SCREEN_WIDTH - 236, 128, SETUP_PAGE_URL, 6, 4);
     drawKorean(SCREEN_WIDTH - 236, 336, "설정 페이지 QR", TextSize::Tiny);
+  } while (display.nextPage());
+}
+
+// Fast countdown update: repaints only the footer band (timer + status) with
+// a partial window so the panel never runs a full refresh for the clock.
+static void drawSetupGuideFooterPartial(uint32_t remainingSeconds, const String &statusLine) {
+  if (!ENABLE_DISPLAY) {
+    return;
+  }
+  display.setPartialWindow(24, SCREEN_HEIGHT - 56, SCREEN_WIDTH - 48, 44);
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    drawKorean(28, SCREEN_HEIGHT - 42, setupTimerLine(remainingSeconds), TextSize::Tiny);
+    drawKorean(28, SCREEN_HEIGHT - 20, String("상태: ") + statusLine + "   (닫기: 새로고침 버튼)", TextSize::Tiny);
   } while (display.nextPage());
 }
 
@@ -1802,6 +1826,12 @@ static void startSettingsPortal() {
   bool cancelled = false;
   const uint32_t startedAt = millis();
   uint32_t lastRedrawAt = millis();
+  uint32_t lastTimerDrawAt = millis();
+  const auto remainingSeconds = [&startedAt]() -> uint32_t {
+    const uint32_t elapsedMs = millis() - startedAt;
+    const uint32_t totalMs = BLE_SETUP_TIMEOUT_SECONDS * 1000UL;
+    return elapsedMs >= totalMs ? 0 : (totalMs - elapsedMs + 999) / 1000;
+  };
   while (!wifiSaved && !context.saved && !context.locked && !cancelled &&
          millis() - startedAt < BLE_SETUP_TIMEOUT_SECONDS * 1000UL) {
     dnsServer.processNextRequest();
@@ -1819,7 +1849,12 @@ static void startSettingsPortal() {
     if (context.dirty && millis() - lastRedrawAt > 2500) {
       context.dirty = false;
       lastRedrawAt = millis();
-      drawSetupGuideScreen(deviceName, context.pin, context.statusLine);
+      lastTimerDrawAt = millis();
+      drawSetupGuideScreen(deviceName, context.pin, context.statusLine, remainingSeconds());
+    } else if (millis() - lastTimerDrawAt >= 3000) {
+      // Countdown tick: partial-window repaint of the footer only.
+      lastTimerDrawAt = millis();
+      drawSetupGuideFooterPartial(remainingSeconds(), context.statusLine);
     }
 
     delay(BUTTON_SCAN_INTERVAL_MS);
@@ -1828,7 +1863,7 @@ static void startSettingsPortal() {
   const bool bleSaved = context.saved;
   if (bleSaved) {
     // Give the web client a moment to read the "saved" notification.
-    drawSetupGuideScreen(deviceName, context.pin, context.statusLine);
+    drawSetupGuideScreen(deviceName, context.pin, context.statusLine, remainingSeconds());
     delay(1500);
   }
 
