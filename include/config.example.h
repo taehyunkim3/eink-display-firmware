@@ -32,9 +32,9 @@
 
 // reTerminal E1001 top buttons from the official schematic.
 #define ENABLE_BUTTONS true
-#define BUTTON_LEFT_PIN 5
+#define BUTTON_LEFT_PIN 3
 #define BUTTON_RIGHT_PIN 4
-#define BUTTON_REFRESH_PIN 3
+#define BUTTON_REFRESH_PIN 5
 #define BUTTON_DEBOUNCE_MS 30
 // Buttons are scanned as events instead of blocking waits. A short click is
 // emitted when the button is released; left+right hold is emitted only after
@@ -61,6 +61,15 @@
 #define CHARGER_STATUS_REGISTER 0x0B
 #define CHARGER_STATUS_SHIFT 3
 #define CHARGER_STATUS_MASK 0x03
+
+// reTerminal E1001 microSD slot. Card must be FAT32, up to 32GB.
+#define ENABLE_SD_ASSETS true
+#define SD_SCK 7
+#define SD_MISO 8
+#define SD_MOSI 9
+#define SD_CS 14
+#define SD_EN 16
+#define SD_DET 15
 
 // 800 x 480 x 1bpp = 48,000 bytes.
 #define MAX_IMAGE_BYTES 64000

@@ -1,7 +1,9 @@
 #include <Arduino.h>
 #include <DNSServer.h>
+#include <FS.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
+#include <SD.h>
 #include <SPI.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -18,6 +20,7 @@
 #include <U8g2_for_Adafruit_GFX.h>
 
 #include "config.h"
+#include "generated/nanum_gothic_coding_12_bitmap.h"
 #include "generated/nanum_gothic_coding_14_bitmap.h"
 #include "generated/nanum_gothic_coding_18_bitmap.h"
 
@@ -67,6 +70,34 @@
 
 #ifndef CHARGER_STATUS_MASK
 #define CHARGER_STATUS_MASK 0x03
+#endif
+
+#ifndef ENABLE_SD_ASSETS
+#define ENABLE_SD_ASSETS true
+#endif
+
+#ifndef SD_SCK
+#define SD_SCK EPD_SCK
+#endif
+
+#ifndef SD_MISO
+#define SD_MISO 8
+#endif
+
+#ifndef SD_MOSI
+#define SD_MOSI EPD_MOSI
+#endif
+
+#ifndef SD_CS
+#define SD_CS 14
+#endif
+
+#ifndef SD_EN
+#define SD_EN 16
+#endif
+
+#ifndef SD_DET
+#define SD_DET 15
 #endif
 
 #ifndef WIFI_BUTTON_PASSWORD_MAX_LENGTH
@@ -130,10 +161,13 @@ static int lastReceivedBytes = 0;
 static int lastFetchAttempt = 0;
 static String lastErrorDetail = "";
 static bool displayInitialized = false;
+static bool sdAssetsInitialized = false;
+static bool sdAssetsAvailable = false;
 RTC_DATA_ATTR static int screenPage = 0;
 RTC_DATA_ATTR static uint32_t pageTransitionRefreshCount = 0;
 
 enum class TextSize {
+  Tiny,
   Small,
   Large,
 };
@@ -329,6 +363,21 @@ static void saveDeviceSettings(const DeviceSettings &settings) {
                       clampSetting(settings.refreshSeconds,
                                    SETTINGS_REFRESH_SECONDS_MIN,
                                    SETTINGS_REFRESH_SECONDS_MAX));
+  preferences.end();
+}
+
+static int loadSavedScreenPage() {
+  Preferences preferences;
+  preferences.begin("state", false);
+  const int savedPage = preferences.getInt("page", 0);
+  preferences.end();
+  return ((savedPage % SCREEN_PAGE_COUNT) + SCREEN_PAGE_COUNT) % SCREEN_PAGE_COUNT;
+}
+
+static void saveScreenPage() {
+  Preferences preferences;
+  preferences.begin("state", false);
+  preferences.putInt("page", ((screenPage % SCREEN_PAGE_COUNT) + SCREEN_PAGE_COUNT) % SCREEN_PAGE_COUNT);
   preferences.end();
 }
 
@@ -911,6 +960,17 @@ static BitmapFont bitmapFontForSize(TextSize size) {
         8,
     };
   }
+  if (size == TextSize::Tiny) {
+    return {
+        NANUM12_HANGUL_START,
+        NANUM12_HANGUL_COUNT,
+        NANUM12_GLYPH_SIZE,
+        NANUM12_GLYPH_BYTES_PER_ROW,
+        NANUM12_GLYPH_BYTES,
+        NANUM12_HANGUL_BITMAPS,
+        5,
+    };
+  }
 
   return {
       NANUM14_HANGUL_START,
@@ -1160,10 +1220,12 @@ static WaitAction sleepOrWait(uint32_t seconds) {
         return WaitAction::WifiSetup;
       } else if (buttonEvent == ButtonEvent::LeftClick) {
         screenPage = (screenPage + SCREEN_PAGE_COUNT - 1) % SCREEN_PAGE_COUNT;
+        saveScreenPage();
         Serial.printf("Button: page left -> %d\n", screenPage);
         return WaitAction::PageRefresh;
       } else if (buttonEvent == ButtonEvent::RightClick) {
         screenPage = (screenPage + 1) % SCREEN_PAGE_COUNT;
+        saveScreenPage();
         Serial.printf("Button: page right -> %d\n", screenPage);
         return WaitAction::PageRefresh;
       }
@@ -2001,7 +2063,219 @@ static void drawSparkline(JsonArrayConst history, int16_t x, int16_t y, int16_t 
   }
 }
 
+static void setPbmPixel(uint8_t *bitmap, int width, int x, int y) {
+  if (x < 0 || x >= width || y < 0 || y >= width) {
+    return;
+  }
+  const int bytesPerRow = (width + 7) / 8;
+  bitmap[y * bytesPerRow + x / 8] |= 0x80 >> (x % 8);
+}
+
+static void drawPbmLine(uint8_t *bitmap, int width, int x0, int y0, int x1, int y1) {
+  int dx = abs(x1 - x0);
+  int sx = x0 < x1 ? 1 : -1;
+  int dy = -abs(y1 - y0);
+  int sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy;
+
+  while (true) {
+    setPbmPixel(bitmap, width, x0, y0);
+    if (x0 == x1 && y0 == y1) {
+      break;
+    }
+    const int e2 = 2 * err;
+    if (e2 >= dy) {
+      err += dy;
+      x0 += sx;
+    }
+    if (e2 <= dx) {
+      err += dx;
+      y0 += sy;
+    }
+  }
+}
+
+static void drawPbmCircle(uint8_t *bitmap, int width, int cx, int cy, int r, bool fill) {
+  for (int y = -r; y <= r; y++) {
+    for (int x = -r; x <= r; x++) {
+      const int distance = x * x + y * y;
+      if (fill ? distance <= r * r : abs(distance - r * r) <= r) {
+        setPbmPixel(bitmap, width, cx + x, cy + y);
+      }
+    }
+  }
+}
+
+static void drawPbmRect(uint8_t *bitmap, int width, int x, int y, int w, int h) {
+  for (int yy = y; yy < y + h; yy++) {
+    for (int xx = x; xx < x + w; xx++) {
+      setPbmPixel(bitmap, width, xx, yy);
+    }
+  }
+}
+
+static bool writeDefaultWeatherIcon(const char *path, int kind) {
+  if (SD.exists(path)) {
+    return true;
+  }
+
+  constexpr int iconSize = 32;
+  constexpr int bytesPerRow = iconSize / 8;
+  uint8_t bitmap[iconSize * bytesPerRow] = {};
+
+  if (kind == 0) {
+    drawPbmCircle(bitmap, iconSize, 16, 16, 7, true);
+    drawPbmLine(bitmap, iconSize, 16, 1, 16, 7);
+    drawPbmLine(bitmap, iconSize, 16, 25, 16, 31);
+    drawPbmLine(bitmap, iconSize, 1, 16, 7, 16);
+    drawPbmLine(bitmap, iconSize, 25, 16, 31, 16);
+    drawPbmLine(bitmap, iconSize, 5, 5, 9, 9);
+    drawPbmLine(bitmap, iconSize, 23, 23, 27, 27);
+    drawPbmLine(bitmap, iconSize, 27, 5, 23, 9);
+    drawPbmLine(bitmap, iconSize, 9, 23, 5, 27);
+  } else if (kind == 1) {
+    drawPbmCircle(bitmap, iconSize, 11, 17, 7, true);
+    drawPbmCircle(bitmap, iconSize, 19, 13, 9, true);
+    drawPbmCircle(bitmap, iconSize, 26, 18, 6, true);
+    drawPbmRect(bitmap, iconSize, 6, 18, 25, 7);
+  } else {
+    drawPbmCircle(bitmap, iconSize, 11, 14, 7, true);
+    drawPbmCircle(bitmap, iconSize, 20, 12, 8, true);
+    drawPbmRect(bitmap, iconSize, 6, 16, 23, 7);
+    drawPbmLine(bitmap, iconSize, 8, 25, 5, 31);
+    drawPbmLine(bitmap, iconSize, 17, 25, 14, 31);
+    drawPbmLine(bitmap, iconSize, 26, 25, 23, 31);
+  }
+
+  File file = SD.open(path, FILE_WRITE);
+  if (!file) {
+    return false;
+  }
+  file.print("P4\n32 32\n");
+  file.write(bitmap, sizeof(bitmap));
+  file.close();
+  return true;
+}
+
+static void setupSdAssets() {
+  if (!ENABLE_SD_ASSETS || sdAssetsInitialized) {
+    return;
+  }
+  sdAssetsInitialized = true;
+
+  pinMode(SD_EN, OUTPUT);
+  digitalWrite(SD_EN, HIGH);
+  delay(20);
+  pinMode(SD_DET, INPUT_PULLUP);
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+
+  if (!SD.begin(SD_CS, SPI, 20000000)) {
+    Serial.println("SD mount failed; retrying with SD_EN low");
+    digitalWrite(SD_EN, LOW);
+    delay(20);
+    if (!SD.begin(SD_CS, SPI, 20000000)) {
+      Serial.println("SD assets unavailable");
+      sdAssetsAvailable = false;
+      return;
+    }
+  }
+
+  sdAssetsAvailable = true;
+  Serial.printf("SD assets mounted: type=%u, size=%lluMB\n",
+                static_cast<unsigned>(SD.cardType()),
+                static_cast<unsigned long long>(SD.cardSize() / (1024ULL * 1024ULL)));
+  SD.mkdir("/eink");
+  SD.mkdir("/eink/icons");
+  SD.mkdir("/eink/fonts");
+  writeDefaultWeatherIcon("/eink/icons/weather_sun.pbm", 0);
+  writeDefaultWeatherIcon("/eink/icons/weather_cloud.pbm", 1);
+  writeDefaultWeatherIcon("/eink/icons/weather_rain.pbm", 2);
+}
+
+static int readPbmToken(File &file, char *buffer, size_t bufferSize) {
+  size_t index = 0;
+  bool inToken = false;
+  while (file.available()) {
+    const char c = static_cast<char>(file.read());
+    if (c == '#') {
+      while (file.available() && file.read() != '\n') {
+      }
+      continue;
+    }
+    if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+      if (inToken) {
+        break;
+      }
+      continue;
+    }
+    inToken = true;
+    if (index + 1 < bufferSize) {
+      buffer[index++] = c;
+    }
+  }
+  buffer[index] = '\0';
+  return static_cast<int>(index);
+}
+
+static bool drawPbmIcon(const char *path, int16_t x, int16_t y) {
+  if (!sdAssetsAvailable) {
+    return false;
+  }
+
+  File file = SD.open(path, FILE_READ);
+  if (!file) {
+    return false;
+  }
+
+  char token[12] = {};
+  if (readPbmToken(file, token, sizeof(token)) <= 0 || String(token) != "P4") {
+    file.close();
+    return false;
+  }
+  readPbmToken(file, token, sizeof(token));
+  const int width = atoi(token);
+  readPbmToken(file, token, sizeof(token));
+  const int height = atoi(token);
+  if (width <= 0 || width > 64 || height <= 0 || height > 64) {
+    file.close();
+    return false;
+  }
+
+  const int bytesPerRow = (width + 7) / 8;
+  for (int row = 0; row < height; row++) {
+    for (int byteIndex = 0; byteIndex < bytesPerRow; byteIndex++) {
+      if (!file.available()) {
+        file.close();
+        return false;
+      }
+      const uint8_t bits = static_cast<uint8_t>(file.read());
+      for (int bit = 0; bit < 8; bit++) {
+        const int col = byteIndex * 8 + bit;
+        if (col >= width) {
+          break;
+        }
+        if ((bits & (0x80 >> bit)) != 0) {
+          display.drawPixel(x + col, y + row, GxEPD_BLACK);
+        }
+      }
+    }
+  }
+
+  file.close();
+  return true;
+}
+
 static void drawWeatherIcon(int16_t x, int16_t y, int code) {
+  const bool rain = code >= 51 && code <= 82;
+  const bool clear = code == 0 || code == 1;
+  const char *sdIcon = rain ? "/eink/icons/weather_rain.pbm"
+                            : (clear ? "/eink/icons/weather_sun.pbm"
+                                     : "/eink/icons/weather_cloud.pbm");
+  if (drawPbmIcon(sdIcon, x, y)) {
+    return;
+  }
+
   if (code == 0 || code == 1) {
     display.fillCircle(x + 16, y + 16, 8, GxEPD_BLACK);
     display.drawLine(x + 16, y + 1, x + 16, y + 7, GxEPD_BLACK);
@@ -2146,9 +2420,9 @@ static void drawMonthCalendarPage(JsonObjectConst root) {
       for (JsonObjectConst event : events) {
         if (!sameEventDay(event, key)) continue;
         display.fillRect(x + 8, eventY - 14, 3, 18, GxEPD_BLACK);
-        drawText(x + 16, eventY, jsonString(event["title"]), 5);
-        drawText(x + 16, eventY + 20, formatIsoTime(jsonString(event["startsAt"])), 5);
-        eventY += 38;
+      drawText(x + 16, eventY, jsonString(event["title"]), 6, TextSize::Tiny);
+      drawText(x + 16, eventY + 16, formatIsoTime(jsonString(event["startsAt"])), 5, TextSize::Tiny);
+      eventY += 32;
         shown++;
         if (shown >= 2) break;
       }
@@ -2183,9 +2457,9 @@ static void drawWeekCalendarPage(JsonObjectConst root) {
     for (JsonObjectConst event : events) {
       if (!sameEventDay(event, key)) continue;
       display.fillRect(x + 8, y - 15, 3, 20, GxEPD_BLACK);
-      drawText(x + 16, y, jsonString(event["title"]), 5);
-      drawText(x + 16, y + 22, formatIsoTime(jsonString(event["startsAt"])), 5);
-      y += 56;
+      drawText(x + 16, y, jsonString(event["title"]), 6, TextSize::Tiny);
+      drawText(x + 16, y + 17, formatIsoTime(jsonString(event["startsAt"])), 5, TextSize::Tiny);
+      y += 48;
       shown++;
       if (shown >= 6) break;
     }
@@ -2241,6 +2515,7 @@ static void drawDevicePage(const DeviceTelemetry &telemetry) {
   }
   drawText(28, 226, String("Charge: ") + telemetry.batteryChargeState);
   drawText(28, 262, String("Page: ") + String(screenPage + 1) + "/" + String(SCREEN_PAGE_COUNT));
+  drawText(28, 292, String("SD: ") + (sdAssetsAvailable ? "assets OK" : "not mounted"));
   drawText(28, 316, String("상태: ") + deviceState);
   drawText(28, 352, String("최근 오류: ") + String(lastErrorCode));
 }
@@ -2288,7 +2563,7 @@ static void setupDisplay() {
     return;
   }
 
-    SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
+    SPI.begin(EPD_SCK, SD_MISO, EPD_MOSI, EPD_CS);
     Serial.println("Initializing e-paper display");
     display.init(115200, true, 2, false);
     koreanFonts.begin(display);
@@ -2302,6 +2577,7 @@ static void setupDisplay() {
     } else {
       Serial.println("Skipping boot test screen");
     }
+    setupSdAssets();
     displayInitialized = true;
 }
 
@@ -2385,6 +2661,7 @@ void setup() {
   Serial.println();
   Serial.println("ESP32 e-ink dashboard firmware");
   Serial.printf("Display enabled: %s\n", ENABLE_DISPLAY ? "yes" : "no");
+  screenPage = loadSavedScreenPage();
   Serial.printf("Screen page: %d\n", screenPage);
   setupButtons();
   refreshScreen();
