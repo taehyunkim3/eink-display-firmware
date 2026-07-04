@@ -30,7 +30,7 @@
 #endif
 
 #ifndef BUTTON_CLICK_MIN_MS
-#define BUTTON_CLICK_MIN_MS 60
+#define BUTTON_CLICK_MIN_MS 30
 #endif
 
 #ifndef WIFI_SETUP_CHORD_GRACE_MS
@@ -507,9 +507,7 @@ public:
     left_.reset(BUTTON_LEFT_PIN, now);
     right_.reset(BUTTON_RIGHT_PIN, now);
     refresh_.reset(BUTTON_REFRESH_PIN, now);
-    leftRightSeen_ = false;
     leftRightHoldEmitted_ = false;
-    suppressLeftRightClicks_ = false;
     bothDownStartedAt_ = 0;
   }
 
@@ -527,10 +525,8 @@ public:
     bool resetLeftRightAfterEvent = false;
     const bool bothDown = left_.down && right_.down;
     if (bothDown) {
-      if (!leftRightSeen_) {
-        leftRightSeen_ = true;
+      if (bothDownStartedAt_ == 0) {
         bothDownStartedAt_ = now;
-        suppressLeftRightClicks_ = true;
       }
 
       const bool joinedInWindow =
@@ -544,13 +540,12 @@ public:
       resetLeftRightAfterEvent = true;
     }
 
-    const bool suppressLeftRightClicks = suppressLeftRightClicks_;
     if (event == ButtonEvent::None && left_.released && left_.releasedAfter >= BUTTON_CLICK_MIN_MS &&
-        !suppressLeftRightClicks) {
+        !leftRightHoldEmitted_) {
       event = ButtonEvent::LeftClick;
     }
     if (event == ButtonEvent::None && right_.released &&
-        right_.releasedAfter >= BUTTON_CLICK_MIN_MS && !suppressLeftRightClicks) {
+        right_.releasedAfter >= BUTTON_CLICK_MIN_MS && !leftRightHoldEmitted_) {
       event = ButtonEvent::RightClick;
     }
     if (event == ButtonEvent::None && refresh_.released &&
@@ -559,9 +554,7 @@ public:
     }
 
     if (resetLeftRightAfterEvent) {
-      leftRightSeen_ = false;
       leftRightHoldEmitted_ = false;
-      suppressLeftRightClicks_ = false;
       bothDownStartedAt_ = 0;
     }
 
@@ -621,9 +614,7 @@ private:
   DebouncedButton left_;
   DebouncedButton right_;
   DebouncedButton refresh_;
-  bool leftRightSeen_ = false;
   bool leftRightHoldEmitted_ = false;
-  bool suppressLeftRightClicks_ = false;
   uint32_t bothDownStartedAt_ = 0;
 };
 

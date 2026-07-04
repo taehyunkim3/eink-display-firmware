@@ -40,7 +40,7 @@
 // emitted when the button is released; left+right hold is emitted only after
 // both buttons are down together for WIFI_SETUP_HOLD_MS.
 #define BUTTON_SCAN_INTERVAL_MS 10
-#define BUTTON_CLICK_MIN_MS 60
+#define BUTTON_CLICK_MIN_MS 30
 #define WIFI_SETUP_CHORD_GRACE_MS 700
 #define WIFI_SETUP_HOLD_MS 1500
 
