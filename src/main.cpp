@@ -90,6 +90,18 @@
 #define SETTINGS_REFRESH_SECONDS_MAX 7200
 #endif
 
+#ifndef DEVICE_HTTP_CONNECT_TIMEOUT_MS
+#define DEVICE_HTTP_CONNECT_TIMEOUT_MS 15000
+#endif
+
+#ifndef DEVICE_HTTP_TIMEOUT_MS
+#define DEVICE_HTTP_TIMEOUT_MS 25000
+#endif
+
+#ifndef DEVICE_FETCH_ATTEMPTS
+#define DEVICE_FETCH_ATTEMPTS 3
+#endif
+
 static const char WIFI_PASSWORD_CHARSET[] =
     "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "!@#$%^&*()-_=+[]{}:;,.?/\\|~`'\" ";
@@ -1303,7 +1315,7 @@ static void startSettingsPortal() {
   }
 }
 
-static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer, int &size) {
+static bool fetchBitmapOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer, int &size) {
   WiFiClient plainClient;
   WiFiClientSecure secureClient;
   HTTPClient http;
@@ -1320,13 +1332,20 @@ static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buff
 
   Serial.printf("GET %s\n", endpoint.c_str());
   if (!http.begin(client, endpoint)) {
+    lastErrorCode = -1001;
     Serial.println("HTTP begin failed");
     return false;
   }
 
   http.addHeader("Authorization", String("Bearer ") + DEVICE_AUTH_TOKEN);
+  http.setConnectTimeout(DEVICE_HTTP_CONNECT_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setReuse(false);
+  http.setTimeout(DEVICE_HTTP_TIMEOUT_MS);
+
   const int statusCode = http.GET();
   if (statusCode != HTTP_CODE_OK) {
+    lastErrorCode = statusCode;
     Serial.printf("HTTP failed: %d\n", statusCode);
     http.end();
     return false;
@@ -1335,6 +1354,7 @@ static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buff
   const int contentLength = http.getSize();
   Serial.printf("Bitmap content length: %d\n", contentLength);
   if (contentLength > MAX_IMAGE_BYTES) {
+    lastErrorCode = -1002;
     Serial.println("Bitmap response exceeds MAX_IMAGE_BYTES");
     http.end();
     return false;
@@ -1343,6 +1363,7 @@ static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buff
   const int bufferCapacity = contentLength > 0 ? contentLength : MAX_IMAGE_BYTES;
   buffer.reset(new (std::nothrow) uint8_t[bufferCapacity]);
   if (!buffer) {
+    lastErrorCode = -1003;
     Serial.println("Bitmap buffer allocation failed");
     http.end();
     return false;
@@ -1354,6 +1375,7 @@ static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buff
   http.end();
 
   if (written < 0 || bitmapStream.overflowed() || bitmapStream.size() == 0) {
+    lastErrorCode = written < 0 ? written : -1004;
     Serial.printf("Bitmap download failed: written=%d, received=%u, overflow=%s\n",
                   written,
                   static_cast<unsigned int>(bitmapStream.size()),
@@ -1362,6 +1384,7 @@ static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buff
   }
 
   if (contentLength > 0 && static_cast<int>(bitmapStream.size()) != contentLength) {
+    lastErrorCode = -1005;
     Serial.printf("Bitmap download incomplete: %u/%d\n",
                   static_cast<unsigned int>(bitmapStream.size()),
                   contentLength);
@@ -1371,11 +1394,30 @@ static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buff
   size = static_cast<int>(bitmapStream.size());
   Serial.printf("Bitmap received bytes: %d\n", size);
   if (size != SCREEN_BITMAP_BYTES) {
+    lastErrorCode = -1006;
     Serial.printf("Bitmap size mismatch: expected=%d, got=%d\n", SCREEN_BITMAP_BYTES, size);
     return false;
   }
 
+  lastErrorCode = 0;
   return true;
+}
+
+static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer, int &size) {
+  for (int attempt = 1; attempt <= DEVICE_FETCH_ATTEMPTS; attempt++) {
+    Serial.printf("Bitmap fetch attempt %d/%d\n", attempt, DEVICE_FETCH_ATTEMPTS);
+    if (fetchBitmapOnce(endpoint, buffer, size)) {
+      return true;
+    }
+
+    buffer.reset();
+    size = 0;
+    if (attempt < DEVICE_FETCH_ATTEMPTS) {
+      delay(1200 * attempt);
+    }
+  }
+
+  return false;
 }
 
 static bool renderBitmap(const uint8_t *buffer, int size, bool partialRefresh) {
@@ -1461,7 +1503,7 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
     if (!ENABLE_DISPLAY) {
       return false;
     }
-    drawStatus("화면 가져오기 실패", "서버 주소, 토큰, Vercel 로그를 확인하세요.");
+    drawStatus("화면 가져오기 실패", String("재시도 실패 err=") + String(lastErrorCode) + ". Serial 로그 확인.");
     return false;
   }
   deviceState = "bitmap-received";
