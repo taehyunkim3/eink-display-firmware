@@ -951,12 +951,14 @@ struct BitmapFont {
   uint16_t asciiCount;
   uint16_t hangulStart;
   uint16_t hangulCount;
-  uint8_t glyphSize;
+  uint8_t cellHeight;
+  uint8_t cellAscent;
   uint8_t glyphBytesPerRow;
   uint8_t glyphBytes;
+  const uint8_t *asciiWidths;
   const uint8_t *asciiBitmaps;
   const uint8_t *bitmaps;
-  uint8_t spaceWidth;
+  uint8_t hangulAdvance;
 };
 
 static BitmapFont bitmapFontForSize(TextSize size) {
@@ -966,12 +968,14 @@ static BitmapFont bitmapFontForSize(TextSize size) {
         GALMURI14_ASCII_COUNT,
         GALMURI14_HANGUL_START,
         GALMURI14_HANGUL_COUNT,
-        GALMURI14_GLYPH_SIZE,
+        GALMURI14_CELL_HEIGHT,
+        GALMURI14_CELL_ASCENT,
         GALMURI14_GLYPH_BYTES_PER_ROW,
         GALMURI14_GLYPH_BYTES,
+        GALMURI14_ASCII_WIDTHS,
         GALMURI14_ASCII_BITMAPS,
         GALMURI14_HANGUL_BITMAPS,
-        7,
+        GALMURI14_HANGUL_ADVANCE,
     };
   }
   if (size == TextSize::Bold) {
@@ -980,12 +984,14 @@ static BitmapFont bitmapFontForSize(TextSize size) {
         GALMURI11BOLD_ASCII_COUNT,
         GALMURI11BOLD_HANGUL_START,
         GALMURI11BOLD_HANGUL_COUNT,
-        GALMURI11BOLD_GLYPH_SIZE,
+        GALMURI11BOLD_CELL_HEIGHT,
+        GALMURI11BOLD_CELL_ASCENT,
         GALMURI11BOLD_GLYPH_BYTES_PER_ROW,
         GALMURI11BOLD_GLYPH_BYTES,
+        GALMURI11BOLD_ASCII_WIDTHS,
         GALMURI11BOLD_ASCII_BITMAPS,
         GALMURI11BOLD_HANGUL_BITMAPS,
-        6,
+        GALMURI11BOLD_HANGUL_ADVANCE,
     };
   }
   if (size == TextSize::Tiny) {
@@ -994,12 +1000,14 @@ static BitmapFont bitmapFontForSize(TextSize size) {
         GALMURI9_ASCII_COUNT,
         GALMURI9_HANGUL_START,
         GALMURI9_HANGUL_COUNT,
-        GALMURI9_GLYPH_SIZE,
+        GALMURI9_CELL_HEIGHT,
+        GALMURI9_CELL_ASCENT,
         GALMURI9_GLYPH_BYTES_PER_ROW,
         GALMURI9_GLYPH_BYTES,
+        GALMURI9_ASCII_WIDTHS,
         GALMURI9_ASCII_BITMAPS,
         GALMURI9_HANGUL_BITMAPS,
-        5,
+        GALMURI9_HANGUL_ADVANCE,
     };
   }
   if (size == TextSize::Micro) {
@@ -1008,12 +1016,14 @@ static BitmapFont bitmapFontForSize(TextSize size) {
         GALMURI7_ASCII_COUNT,
         GALMURI7_HANGUL_START,
         GALMURI7_HANGUL_COUNT,
-        GALMURI7_GLYPH_SIZE,
+        GALMURI7_CELL_HEIGHT,
+        GALMURI7_CELL_ASCENT,
         GALMURI7_GLYPH_BYTES_PER_ROW,
         GALMURI7_GLYPH_BYTES,
+        GALMURI7_ASCII_WIDTHS,
         GALMURI7_ASCII_BITMAPS,
         GALMURI7_HANGUL_BITMAPS,
-        4,
+        GALMURI7_HANGUL_ADVANCE,
     };
   }
 
@@ -1022,12 +1032,14 @@ static BitmapFont bitmapFontForSize(TextSize size) {
       GALMURI11_ASCII_COUNT,
       GALMURI11_HANGUL_START,
       GALMURI11_HANGUL_COUNT,
-      GALMURI11_GLYPH_SIZE,
+      GALMURI11_CELL_HEIGHT,
+      GALMURI11_CELL_ASCENT,
       GALMURI11_GLYPH_BYTES_PER_ROW,
       GALMURI11_GLYPH_BYTES,
+      GALMURI11_ASCII_WIDTHS,
       GALMURI11_ASCII_BITMAPS,
       GALMURI11_HANGUL_BITMAPS,
-      6,
+      GALMURI11_HANGUL_ADVANCE,
   };
 }
 
@@ -1041,26 +1053,33 @@ static bool isBitmapHangul(uint32_t codepoint, const BitmapFont &font) {
          codepoint < font.hangulStart + font.hangulCount;
 }
 
+static uint8_t bitmapAsciiWidth(uint32_t codepoint, const BitmapFont &font) {
+  return pgm_read_byte(&font.asciiWidths[codepoint - font.asciiStart]);
+}
+
 static void drawBitmapGlyph(int16_t x,
                             int16_t baseline,
                             uint32_t glyphIndex,
                             const uint8_t *bitmaps,
                             const BitmapFont &font) {
   const uint32_t offset = glyphIndex * font.glyphBytes;
-  const int16_t top = baseline - font.glyphSize + 2;
+  const int16_t top = baseline - font.cellAscent;
 
-  for (uint8_t row = 0; row < font.glyphSize; row++) {
-    for (uint8_t byteIndex = 0; byteIndex < font.glyphBytesPerRow; byteIndex++) {
-      const uint32_t byteOffset = offset + row * font.glyphBytesPerRow + byteIndex;
-      const uint8_t bits = pgm_read_byte(&bitmaps[byteOffset]);
-      for (uint8_t bit = 0; bit < 8; bit++) {
-        const uint8_t col = byteIndex * 8 + bit;
-        if (col >= font.glyphSize) {
-          break;
-        }
-        if ((bits & (0x80 >> bit)) != 0) {
-          display.drawPixel(x + col, top + row, koreanTextForeground);
-        }
+  for (uint8_t row = 0; row < font.cellHeight; row++) {
+    // Draw contiguous set-bit runs as horizontal lines instead of pixels.
+    int16_t runStart = -1;
+    const uint8_t totalCols = font.glyphBytesPerRow * 8;
+    for (uint8_t col = 0; col <= totalCols; col++) {
+      bool on = false;
+      if (col < totalCols) {
+        const uint8_t bits = pgm_read_byte(&bitmaps[offset + row * font.glyphBytesPerRow + col / 8]);
+        on = (bits & (0x80 >> (col % 8))) != 0;
+      }
+      if (on && runStart < 0) {
+        runStart = col;
+      } else if (!on && runStart >= 0) {
+        display.drawFastHLine(x + runStart, top + row, col - runStart, koreanTextForeground);
+        runStart = -1;
       }
     }
   }
@@ -1072,6 +1091,29 @@ static void drawBitmapAscii(int16_t x, int16_t baseline, uint32_t codepoint, con
 
 static void drawBitmapHangul(int16_t x, int16_t baseline, uint32_t codepoint, const BitmapFont &font) {
   drawBitmapGlyph(x, baseline, codepoint - font.hangulStart, font.bitmaps, font);
+}
+
+static int16_t measureKorean(const String &text, TextSize size) {
+  const BitmapFont font = bitmapFontForSize(size);
+  int16_t width = 0;
+  size_t index = 0;
+  const char *raw = text.c_str();
+  const size_t length = text.length();
+
+  while (index < length) {
+    uint32_t codepoint = 0;
+    if (!readUtf8Codepoint(raw, length, index, codepoint) || codepoint == '\n') {
+      break;
+    }
+    if (isBitmapHangul(codepoint, font)) {
+      width += font.hangulAdvance;
+    } else if (isBitmapAscii(codepoint, font)) {
+      width += bitmapAsciiWidth(codepoint, font);
+    } else {
+      width += font.hangulAdvance;
+    }
+  }
+  return width;
 }
 
 static void drawKorean(int16_t x, int16_t y, const String &text, TextSize size) {
@@ -1090,18 +1132,16 @@ static void drawKorean(int16_t x, int16_t y, const String &text, TextSize size) 
     if (codepoint == '\n') {
       break;
     }
-    if (codepoint == ' ') {
-      cursorX += font.spaceWidth;
-      continue;
-    }
     if (isBitmapHangul(codepoint, font)) {
       drawBitmapHangul(cursorX, y, codepoint, font);
-      cursorX += font.glyphSize;
+      cursorX += font.hangulAdvance;
       continue;
     }
     if (isBitmapAscii(codepoint, font)) {
-      drawBitmapAscii(cursorX, y, codepoint, font);
-      cursorX += font.glyphSize;
+      if (codepoint != ' ') {
+        drawBitmapAscii(cursorX, y, codepoint, font);
+      }
+      cursorX += bitmapAsciiWidth(codepoint, font);
       continue;
     }
 
@@ -2325,23 +2365,48 @@ static String signedStockValue(JsonObjectConst stock, const String &value, const
   return cleaned + suffix;
 }
 
+// Price scale on the right of the chart: +range / previous close / -range.
+static void drawChartPriceAxis(JsonObjectConst stock, int16_t x, int16_t y, int16_t w, int16_t h) {
+  bool baselineOk = false;
+  const float baseline = stockPreviousClose(stock, &baselineOk);
+  if (!baselineOk || fabs(baseline) < 0.0001f) {
+    return;
+  }
+
+  const float range = stockPercentRange(stock);
+  const float prices[] = {
+      baseline * (1.0f + range / 100.0f),
+      baseline,
+      baseline * (1.0f - range / 100.0f),
+  };
+  const float percents[] = {range, 0.0f, -range};
+
+  for (int i = 0; i < 3; i++) {
+    const int tickY = percentY(percents[i], range, y, h);
+    display.drawFastHLine(x, tickY, 3, GxEPD_BLACK);
+    drawText(x + 5, tickY + 3, removeNumberSeparators(compactChartPrice(prices[i])), 0, TextSize::Micro);
+  }
+}
+
+// Time labels only; prices live on the y-axis.
 static void drawChartPointLabels(JsonObjectConst stock,
                                  int16_t x,
                                  int16_t y,
                                  int16_t w,
                                  int16_t h) {
+  (void)h;
   JsonArrayConst candles = stock["candles"].as<JsonArrayConst>();
   if (candles.size() >= 2) {
     const int count = min(static_cast<int>(candles.size()), 36);
     const int start = static_cast<int>(candles.size()) - count;
     const int indexes[] = {start, start + (count - 1) / 2, start + count - 1};
-    const int labelX[] = {x, x + w / 2 - 34, x + w - 76};
 
     for (int i = 0; i < 3; i++) {
       JsonObjectConst candle = candles[indexes[i]];
       const String time = jsonString(candle["t"], "--:--");
-      const String price = removeNumberSeparators(compactChartPrice(candle["c"].as<float>()));
-      drawText(labelX[i], y, time + " " + price, 12, TextSize::Tiny);
+      const int16_t textW = measureKorean(time, TextSize::Micro);
+      const int labelX[] = {x, x + w / 2 - textW / 2, x + w - textW};
+      drawText(labelX[i], y, time, 8, TextSize::Micro);
     }
     return;
   }
@@ -2351,112 +2416,12 @@ static void drawChartPointLabels(JsonObjectConst stock,
     return;
   }
 
-  const int indexes[] = {0, static_cast<int>((history.size() - 1) / 2), static_cast<int>(history.size() - 1)};
-  const int labelX[] = {x, x + w / 2 - 30, x + w - 58};
   const char *labels[] = {"시작", "중간", "현재"};
   for (int i = 0; i < 3; i++) {
-    drawText(labelX[i],
-             y,
-             String(labels[i]) + " " + removeNumberSeparators(compactChartPrice(history[indexes[i]].as<float>())),
-             10,
-             TextSize::Tiny);
+    const int16_t textW = measureKorean(labels[i], TextSize::Micro);
+    const int labelX[] = {x, x + w / 2 - textW / 2, x + w - textW};
+    drawText(labelX[i], y, labels[i], 8, TextSize::Micro);
   }
-}
-
-static void setPbmPixel(uint8_t *bitmap, int width, int x, int y) {
-  if (x < 0 || x >= width || y < 0 || y >= width) {
-    return;
-  }
-  const int bytesPerRow = (width + 7) / 8;
-  bitmap[y * bytesPerRow + x / 8] |= 0x80 >> (x % 8);
-}
-
-static void drawPbmLine(uint8_t *bitmap, int width, int x0, int y0, int x1, int y1) {
-  int dx = abs(x1 - x0);
-  int sx = x0 < x1 ? 1 : -1;
-  int dy = -abs(y1 - y0);
-  int sy = y0 < y1 ? 1 : -1;
-  int err = dx + dy;
-
-  while (true) {
-    setPbmPixel(bitmap, width, x0, y0);
-    if (x0 == x1 && y0 == y1) {
-      break;
-    }
-    const int e2 = 2 * err;
-    if (e2 >= dy) {
-      err += dy;
-      x0 += sx;
-    }
-    if (e2 <= dx) {
-      err += dx;
-      y0 += sy;
-    }
-  }
-}
-
-static void drawPbmCircle(uint8_t *bitmap, int width, int cx, int cy, int r, bool fill) {
-  for (int y = -r; y <= r; y++) {
-    for (int x = -r; x <= r; x++) {
-      const int distance = x * x + y * y;
-      if (fill ? distance <= r * r : abs(distance - r * r) <= r) {
-        setPbmPixel(bitmap, width, cx + x, cy + y);
-      }
-    }
-  }
-}
-
-static void drawPbmRect(uint8_t *bitmap, int width, int x, int y, int w, int h) {
-  for (int yy = y; yy < y + h; yy++) {
-    for (int xx = x; xx < x + w; xx++) {
-      setPbmPixel(bitmap, width, xx, yy);
-    }
-  }
-}
-
-static bool writeDefaultWeatherIcon(const char *path, int kind) {
-  if (SD.exists(path)) {
-    return true;
-  }
-
-  constexpr int iconSize = 32;
-  constexpr int bytesPerRow = iconSize / 8;
-  uint8_t bitmap[iconSize * bytesPerRow] = {};
-
-  if (kind == 0) {
-    drawPbmCircle(bitmap, iconSize, 16, 16, 8, false);
-    drawPbmCircle(bitmap, iconSize, 16, 16, 9, false);
-    drawPbmLine(bitmap, iconSize, 16, 1, 16, 7);
-    drawPbmLine(bitmap, iconSize, 16, 25, 16, 31);
-    drawPbmLine(bitmap, iconSize, 1, 16, 7, 16);
-    drawPbmLine(bitmap, iconSize, 25, 16, 31, 16);
-    drawPbmLine(bitmap, iconSize, 5, 5, 9, 9);
-    drawPbmLine(bitmap, iconSize, 23, 23, 27, 27);
-    drawPbmLine(bitmap, iconSize, 27, 5, 23, 9);
-    drawPbmLine(bitmap, iconSize, 9, 23, 5, 27);
-  } else if (kind == 1) {
-    drawPbmCircle(bitmap, iconSize, 11, 15, 7, false);
-    drawPbmCircle(bitmap, iconSize, 20, 12, 9, false);
-    drawPbmCircle(bitmap, iconSize, 27, 16, 6, false);
-    drawPbmRect(bitmap, iconSize, 6, 18, 25, 4);
-  } else {
-    drawPbmCircle(bitmap, iconSize, 11, 13, 7, false);
-    drawPbmCircle(bitmap, iconSize, 20, 11, 8, false);
-    drawPbmCircle(bitmap, iconSize, 27, 15, 5, false);
-    drawPbmRect(bitmap, iconSize, 6, 17, 25, 4);
-    drawPbmLine(bitmap, iconSize, 8, 25, 5, 31);
-    drawPbmLine(bitmap, iconSize, 17, 25, 14, 31);
-    drawPbmLine(bitmap, iconSize, 26, 25, 23, 31);
-  }
-
-  File file = SD.open(path, FILE_WRITE);
-  if (!file) {
-    return false;
-  }
-  file.print("P4\n32 32\n");
-  file.write(bitmap, sizeof(bitmap));
-  file.close();
-  return true;
 }
 
 static void setupSdAssets() {
@@ -2490,121 +2455,117 @@ static void setupSdAssets() {
   SD.mkdir("/eink");
   SD.mkdir("/eink/icons");
   SD.mkdir("/eink/fonts");
-  writeDefaultWeatherIcon("/eink/icons/weather_sun.pbm", 0);
-  writeDefaultWeatherIcon("/eink/icons/weather_cloud.pbm", 1);
-  writeDefaultWeatherIcon("/eink/icons/weather_rain.pbm", 2);
-  writeDefaultWeatherIcon("/eink/icons/weather_sun_v2.pbm", 0);
-  writeDefaultWeatherIcon("/eink/icons/weather_cloud_v2.pbm", 1);
-  writeDefaultWeatherIcon("/eink/icons/weather_rain_v2.pbm", 2);
 }
 
-static int readPbmToken(File &file, char *buffer, size_t bufferSize) {
-  size_t index = 0;
-  bool inToken = false;
-  while (file.available()) {
-    const char c = static_cast<char>(file.read());
-    if (c == '#') {
-      while (file.available() && file.read() != '\n') {
-      }
-      continue;
-    }
-    if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
-      if (inToken) {
-        break;
-      }
-      continue;
-    }
-    inToken = true;
-    if (index + 1 < bufferSize) {
-      buffer[index++] = c;
-    }
-  }
-  buffer[index] = '\0';
-  return static_cast<int>(index);
+enum class WeatherGlyph {
+  Clear,
+  PartlyCloudy,
+  Cloudy,
+  Fog,
+  Rain,
+  Snow,
+  Thunder,
+};
+
+static WeatherGlyph weatherGlyphForCode(int code) {
+  if (code == 0) return WeatherGlyph::Clear;
+  if (code == 1 || code == 2) return WeatherGlyph::PartlyCloudy;
+  if (code == 45 || code == 48) return WeatherGlyph::Fog;
+  if ((code >= 71 && code <= 77) || code == 85 || code == 86) return WeatherGlyph::Snow;
+  if (code >= 95 && code <= 99) return WeatherGlyph::Thunder;
+  if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) return WeatherGlyph::Rain;
+  return WeatherGlyph::Cloudy;
 }
 
-static bool drawPbmIcon(const char *path, int16_t x, int16_t y) {
-  if (!sdAssetsAvailable) {
-    return false;
+// s(x): scale a coordinate designed on a 32px grid to the requested size.
+static void drawSunShape(int16_t x, int16_t y, int size, int16_t cx, int16_t cy, int16_t r) {
+  const auto s = [size](int v) { return static_cast<int16_t>(v * size / 32); };
+  const int16_t px = x + s(cx);
+  const int16_t py = y + s(cy);
+  const int16_t pr = max<int16_t>(3, s(r));
+  display.fillCircle(px, py, pr, GxEPD_BLACK);
+  display.fillCircle(px, py, pr - max<int16_t>(2, pr / 3), GxEPD_WHITE);
+  const int16_t inner = pr + max<int16_t>(2, s(3));
+  const int16_t outer = inner + max<int16_t>(2, s(4));
+  for (int i = 0; i < 8; i++) {
+    const float angle = i * PI / 4.0f;
+    const float dx = cosf(angle);
+    const float dy = sinf(angle);
+    for (int t = -1; t <= 0; t++) {
+      display.drawLine(px + static_cast<int16_t>(dx * inner) + t,
+                       py + static_cast<int16_t>(dy * inner),
+                       px + static_cast<int16_t>(dx * outer) + t,
+                       py + static_cast<int16_t>(dy * outer),
+                       GxEPD_BLACK);
+    }
   }
+}
 
-  File file = SD.open(path, FILE_READ);
-  if (!file) {
-    return false;
-  }
+// Solid cloud with a white inset so the outline reads as a bold 2px stroke.
+static void drawCloudShape(int16_t x, int16_t y, int size, int16_t offsetY) {
+  const auto s = [size](int v) { return static_cast<int16_t>(v * size / 32); };
+  const int16_t oy = s(offsetY);
+  display.fillCircle(x + s(10), y + oy + s(15), s(6), GxEPD_BLACK);
+  display.fillCircle(x + s(18), y + oy + s(11), s(8), GxEPD_BLACK);
+  display.fillCircle(x + s(25), y + oy + s(15), s(5), GxEPD_BLACK);
+  display.fillRect(x + s(8), y + oy + s(15), s(19), s(6), GxEPD_BLACK);
+  display.fillCircle(x + s(10), y + oy + s(15), s(4), GxEPD_WHITE);
+  display.fillCircle(x + s(18), y + oy + s(11), s(6), GxEPD_WHITE);
+  display.fillCircle(x + s(25), y + oy + s(15), s(3), GxEPD_WHITE);
+  display.fillRect(x + s(10), y + oy + s(14), s(15), s(5), GxEPD_WHITE);
+}
 
-  char token[12] = {};
-  if (readPbmToken(file, token, sizeof(token)) <= 0 || String(token) != "P4") {
-    file.close();
-    return false;
-  }
-  readPbmToken(file, token, sizeof(token));
-  const int width = atoi(token);
-  readPbmToken(file, token, sizeof(token));
-  const int height = atoi(token);
-  if (width <= 0 || width > 64 || height <= 0 || height > 64) {
-    file.close();
-    return false;
-  }
+static void drawWeatherIcon(int16_t x, int16_t y, int code, int size = 32) {
+  const auto s = [size](int v) { return static_cast<int16_t>(v * size / 32); };
+  const WeatherGlyph glyph = weatherGlyphForCode(code);
 
-  const int bytesPerRow = (width + 7) / 8;
-  for (int row = 0; row < height; row++) {
-    for (int byteIndex = 0; byteIndex < bytesPerRow; byteIndex++) {
-      if (!file.available()) {
-        file.close();
-        return false;
+  switch (glyph) {
+    case WeatherGlyph::Clear:
+      drawSunShape(x, y, size, 16, 16, 7);
+      break;
+    case WeatherGlyph::PartlyCloudy:
+      drawSunShape(x, y, size, 21, 10, 5);
+      drawCloudShape(x, y, size, 8);
+      break;
+    case WeatherGlyph::Cloudy:
+      drawCloudShape(x, y, size, 2);
+      break;
+    case WeatherGlyph::Fog:
+      drawCloudShape(x, y, size, -4);
+      for (int i = 0; i < 3; i++) {
+        const int16_t lineY = y + s(21 + i * 4);
+        display.fillRect(x + s(5 + (i % 2) * 3), lineY, s(22), max<int16_t>(1, s(2)), GxEPD_BLACK);
       }
-      const uint8_t bits = static_cast<uint8_t>(file.read());
-      for (int bit = 0; bit < 8; bit++) {
-        const int col = byteIndex * 8 + bit;
-        if (col >= width) {
-          break;
+      break;
+    case WeatherGlyph::Rain:
+      drawCloudShape(x, y, size, -2);
+      for (int i = 0; i < 3; i++) {
+        const int16_t dropX = x + s(9 + i * 8);
+        const int16_t dropY = y + s(23);
+        for (int t = 0; t <= 1; t++) {
+          display.drawLine(dropX + t, dropY, dropX - s(3) + t, dropY + s(7), GxEPD_BLACK);
         }
-        if ((bits & (0x80 >> bit)) != 0) {
-          display.drawPixel(x + col, y + row, GxEPD_BLACK);
-        }
       }
+      break;
+    case WeatherGlyph::Snow:
+      drawCloudShape(x, y, size, -2);
+      for (int i = 0; i < 3; i++) {
+        const int16_t cx = x + s(9 + i * 8);
+        const int16_t cy = y + s(26);
+        display.drawLine(cx - s(2), cy, cx + s(2), cy, GxEPD_BLACK);
+        display.drawLine(cx, cy - s(2), cx, cy + s(2), GxEPD_BLACK);
+        display.drawLine(cx - s(2), cy - s(2), cx + s(2), cy + s(2), GxEPD_BLACK);
+        display.drawLine(cx - s(2), cy + s(2), cx + s(2), cy - s(2), GxEPD_BLACK);
+      }
+      break;
+    case WeatherGlyph::Thunder: {
+      drawCloudShape(x, y, size, -2);
+      const int16_t bx = x + s(15);
+      const int16_t by = y + s(20);
+      display.fillTriangle(bx, by, bx + s(5), by, bx - s(2), by + s(7), GxEPD_BLACK);
+      display.fillTriangle(bx + s(4), by + s(4), bx - s(1), by + s(5), bx + s(1), by + s(12), GxEPD_BLACK);
+      break;
     }
-  }
-
-  file.close();
-  return true;
-}
-
-static void drawWeatherIcon(int16_t x, int16_t y, int code) {
-  const bool rain = code >= 51 && code <= 82;
-  const bool clear = code == 0 || code == 1;
-  const char *sdIcon = rain ? "/eink/icons/weather_rain_v2.pbm"
-                            : (clear ? "/eink/icons/weather_sun_v2.pbm"
-                                     : "/eink/icons/weather_cloud_v2.pbm");
-  if (drawPbmIcon(sdIcon, x, y)) {
-    return;
-  }
-
-  if (code == 0 || code == 1) {
-    display.drawCircle(x + 16, y + 16, 8, GxEPD_BLACK);
-    display.drawCircle(x + 16, y + 16, 9, GxEPD_BLACK);
-    display.drawLine(x + 16, y + 1, x + 16, y + 7, GxEPD_BLACK);
-    display.drawLine(x + 16, y + 25, x + 16, y + 31, GxEPD_BLACK);
-    display.drawLine(x + 1, y + 16, x + 7, y + 16, GxEPD_BLACK);
-    display.drawLine(x + 25, y + 16, x + 31, y + 16, GxEPD_BLACK);
-    display.drawLine(x + 5, y + 5, x + 9, y + 9, GxEPD_BLACK);
-    display.drawLine(x + 23, y + 23, x + 27, y + 27, GxEPD_BLACK);
-    display.drawLine(x + 27, y + 5, x + 23, y + 9, GxEPD_BLACK);
-    display.drawLine(x + 9, y + 23, x + 5, y + 27, GxEPD_BLACK);
-  } else if (rain) {
-    display.drawCircle(x + 11, y + 13, 7, GxEPD_BLACK);
-    display.drawCircle(x + 20, y + 11, 8, GxEPD_BLACK);
-    display.drawCircle(x + 27, y + 15, 5, GxEPD_BLACK);
-    display.fillRect(x + 6, y + 17, 25, 4, GxEPD_BLACK);
-    display.drawLine(x + 8, y + 25, x + 5, y + 31, GxEPD_BLACK);
-    display.drawLine(x + 17, y + 25, x + 14, y + 31, GxEPD_BLACK);
-    display.drawLine(x + 26, y + 25, x + 23, y + 31, GxEPD_BLACK);
-  } else {
-    display.drawCircle(x + 11, y + 15, 7, GxEPD_BLACK);
-    display.drawCircle(x + 20, y + 12, 9, GxEPD_BLACK);
-    display.drawCircle(x + 27, y + 16, 6, GxEPD_BLACK);
-    display.fillRect(x + 6, y + 18, 25, 4, GxEPD_BLACK);
   }
 }
 
@@ -2638,9 +2599,10 @@ static bool drawOverviewMarketItem(JsonArrayConst stocks, int slot, int16_t y) {
 static void drawOverviewPage(JsonObjectConst root) {
   JsonObjectConst weather = root["weather"];
   drawText(24, 72, "오늘 요약", 0, TextSize::Large);
-  drawWeatherIcon(28, 98, weather["weatherCode"].isNull() ? 3 : weather["weatherCode"].as<int>());
-  drawText(72, 120, jsonString(weather["label"]) + " " + formatValue(weather["temperatureC"], "C"));
-  drawText(72, 148, jsonString(weather["condition"], "날씨 정보 없음"), 18);
+  drawWeatherIcon(28, 92, weather["weatherCode"].isNull() ? 3 : weather["weatherCode"].as<int>(), 48);
+  drawText(92, 118, jsonString(weather["label"]) + " " + formatValue(weather["temperatureC"], "C"), 0,
+           TextSize::Large);
+  drawText(92, 148, jsonString(weather["condition"], "날씨 정보 없음"), 18);
   drawText(28, 196, "체감 " + formatValue(weather["apparentTemperatureC"], "C"));
   drawText(190, 196, "습도 " + formatValue(weather["humidityPercent"], "%"));
   drawText(350, 196, "바람 " + formatValue(weather["windKph"], "km/h"));
@@ -2853,14 +2815,16 @@ static void drawStockChartTile(JsonObjectConst stock,
                signedStockValue(stock, jsonString(stock["changePercent"], "--"), "%"),
            18);
 
+  const int axisW = 42;
   const int chartX = x + 10;
   const int chartY = y + 58;
-  const int chartW = w - 20;
+  const int chartW = w - 20 - axisW;
   const int chartH = h - 122;
   if (!drawCandleChart(stock, chartX, chartY, chartW, chartH)) {
     drawPercentLineChart(stock, chartX, chartY, chartW, chartH);
   }
-  drawChartPointLabels(stock, chartX, chartY + chartH + 17, chartW, 16);
+  drawChartPriceAxis(stock, chartX + chartW, chartY, axisW, chartH);
+  drawChartPointLabels(stock, chartX, chartY + chartH + 14, chartW, 16);
 
   JsonObjectConst flow = stock["investorFlow"];
   if (!flow.isNull()) {
@@ -2961,6 +2925,41 @@ static void setupDisplay() {
     displayInitialized = true;
 }
 
+// Last successfully fetched dashboard JSON. Page transitions re-render from
+// this cache instead of re-downloading, which is the main speedup for button
+// navigation. Only used when deep sleep is disabled (RAM survives).
+static std::unique_ptr<uint8_t[]> cachedDashboardJson;
+static int cachedDashboardJsonSize = 0;
+static uint32_t cachedDashboardJsonAt = 0;
+constexpr uint32_t DASHBOARD_CACHE_TTL_MS = 30UL * 60UL * 1000UL;
+
+static bool renderDashboardFromCache(bool partialDisplayRefresh) {
+  if (!cachedDashboardJson || cachedDashboardJsonSize <= 0) {
+    return false;
+  }
+  if (millis() - cachedDashboardJsonAt > DASHBOARD_CACHE_TTL_MS) {
+    Serial.println("Dashboard cache expired");
+    return false;
+  }
+
+  JsonDocument document;
+  const DeserializationError jsonError = deserializeJson(
+      document,
+      reinterpret_cast<const char *>(cachedDashboardJson.get()),
+      static_cast<size_t>(cachedDashboardJsonSize));
+  if (jsonError) {
+    return false;
+  }
+
+  Serial.println("Rendering page from cached dashboard JSON");
+  const DeviceTelemetry telemetry = readDeviceTelemetry();
+  if (!renderDashboard(document.as<JsonObjectConst>(), telemetry, partialDisplayRefresh)) {
+    return false;
+  }
+  deviceState = "screen-updated";
+  return true;
+}
+
 static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRefresh = false) {
   lastContentLength = 0;
   lastReceivedBytes = 0;
@@ -2972,6 +2971,10 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
     Serial.println("Display disabled for serial/debug check");
   } else {
     setupDisplay();
+  }
+
+  if (!forceServerRefresh && ENABLE_DISPLAY && renderDashboardFromCache(partialDisplayRefresh)) {
+    return true;
   }
 
   if (!connectWifi()) {
@@ -3014,9 +3017,20 @@ static bool refreshScreen(bool forceServerRefresh = false, bool partialDisplayRe
     return true;
   }
 
+  // Cache before parsing: passing a const pointer below keeps the buffer
+  // intact (ArduinoJson mutates mutable buffers in zero-copy mode).
+  cachedDashboardJson = std::move(jsonBuffer);
+  cachedDashboardJsonSize = jsonSize;
+  cachedDashboardJsonAt = millis();
+
   JsonDocument document;
-  const DeserializationError jsonError = deserializeJson(document, jsonBuffer.get(), jsonSize);
+  const DeserializationError jsonError = deserializeJson(
+      document,
+      reinterpret_cast<const char *>(cachedDashboardJson.get()),
+      static_cast<size_t>(jsonSize));
   if (jsonError) {
+    cachedDashboardJson.reset();
+    cachedDashboardJsonSize = 0;
     deviceState = "json-failed";
     setLastError(-1201, String("JSON 파싱 실패\n") + jsonError.c_str());
     drawStatus("데이터 해석 실패", fetchFailureDetail());

@@ -1,122 +1,178 @@
 #!/usr/bin/env python3
-"""Generate a compact 1-bit bitmap font header for the e-ink firmware."""
+"""Generate a compact 1-bit bitmap font header for the e-ink firmware.
+
+Reads a BDF bitmap font (the original pixel data shipped with Galmuri
+releases) so glyphs are extracted verbatim: no rasterization, no
+anti-aliasing, no thresholding. Emits, per font:
+
+- proportional advance widths for ASCII glyphs
+- a single fixed advance for Hangul syllables (Galmuri Hangul is monospaced)
+- a shared baseline so mixed-size text lines up correctly
+"""
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
-
-
-HANGUL_START = 0xAC00
-HANGUL_COUNT = 11172
 ASCII_START = 0x20
 ASCII_COUNT = 95
+HANGUL_START = 0xAC00
+HANGUL_COUNT = 11172
 
 
-def glyph_bytes(font: ImageFont.FreeTypeFont, codepoint: int, size: int, threshold: int) -> bytes:
-    text = chr(codepoint)
-    image = Image.new("L", (size, size), 0)
-    draw = ImageDraw.Draw(image)
-    bbox = draw.textbbox((0, 0), text, font=font)
-    glyph_w = bbox[2] - bbox[0]
-    glyph_h = bbox[3] - bbox[1]
-    x = max(0, (size - glyph_w) // 2 - bbox[0])
-    y = max(0, (size - glyph_h) // 2 - bbox[1])
-    draw.text((x, y), text, font=font, fill=255)
+@dataclass
+class Glyph:
+    encoding: int
+    advance: int
+    bbx_w: int
+    bbx_h: int
+    bbx_xoff: int
+    bbx_yoff: int
+    rows: list[int]  # one int of row bits per bitmap row, MSB = leftmost pixel
 
-    packed = bytearray()
-    for row in range(size):
-        byte = 0
-        bit = 7
-        for col in range(size):
-            if image.getpixel((col, row)) >= threshold:
-                byte |= 1 << bit
-            bit -= 1
-            if bit < 0:
-                packed.append(byte)
-                byte = 0
-                bit = 7
-        if bit != 7:
-            packed.append(byte)
+
+def parse_bdf(path: Path) -> dict[int, Glyph]:
+    glyphs: dict[int, Glyph] = {}
+    encoding = advance = None
+    bbx = None
+    rows: list[int] = []
+    in_bitmap = False
+
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if line.startswith("STARTCHAR"):
+                encoding = advance = bbx = None
+                rows = []
+                in_bitmap = False
+            elif line.startswith("ENCODING "):
+                encoding = int(line.split()[1])
+            elif line.startswith("DWIDTH "):
+                advance = int(line.split()[1])
+            elif line.startswith("BBX "):
+                parts = line.split()
+                bbx = (int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4]))
+            elif line == "BITMAP":
+                in_bitmap = True
+            elif line == "ENDCHAR":
+                if encoding is not None and encoding >= 0 and advance is not None and bbx is not None:
+                    glyphs[encoding] = Glyph(encoding, advance, *bbx, rows)
+                in_bitmap = False
+            elif in_bitmap:
+                rows.append(int(line, 16) if line else 0)
+    return glyphs
+
+
+def wanted_codepoints() -> list[int]:
+    return list(range(ASCII_START, ASCII_START + ASCII_COUNT)) + list(
+        range(HANGUL_START, HANGUL_START + HANGUL_COUNT)
+    )
+
+
+def pack_glyph(glyph: Glyph | None, cell_ascent: int, cell_height: int, bytes_per_row: int) -> bytes:
+    packed = bytearray(cell_height * bytes_per_row)
+    if glyph is None or glyph.bbx_h == 0:
+        return bytes(packed)
+
+    # BDF bitmap rows run top to bottom; the top row sits at
+    # baseline - (bbx_yoff + bbx_h). Our cell's row 0 sits at baseline - cell_ascent.
+    top = cell_ascent - (glyph.bbx_yoff + glyph.bbx_h)
+    hex_bits = ((glyph.bbx_w + 7) // 8) * 8
+    for row_index, row_bits in enumerate(glyph.rows):
+        y = top + row_index
+        if y < 0 or y >= cell_height:
+            continue
+        # Left-align row bits at x = bbx_xoff within the cell.
+        value = row_bits << (bytes_per_row * 8 - hex_bits)
+        if glyph.bbx_xoff > 0:
+            value >>= glyph.bbx_xoff
+        elif glyph.bbx_xoff < 0:
+            value = (value << -glyph.bbx_xoff) & ((1 << (bytes_per_row * 8)) - 1)
+        for byte_index in range(bytes_per_row):
+            shift = (bytes_per_row - 1 - byte_index) * 8
+            packed[y * bytes_per_row + byte_index] = (value >> shift) & 0xFF
     return bytes(packed)
 
 
-def write_header(
-    font_path: Path,
-    output_path: Path,
-    size: int,
-    threshold: int,
-    symbol_prefix: str,
-    source_name: str,
-) -> None:
-    font = ImageFont.truetype(str(font_path), size)
-    bytes_per_row = (size + 7) // 8
-    bytes_per_glyph = bytes_per_row * size
+def emit_bytes(out, values: bytes | list[int]) -> None:
+    line = "  "
+    for value in values:
+        token = f"0x{value:02X},"
+        if len(line) + len(token) + 1 > 118:
+            out.write(line.rstrip() + "\n")
+            line = "  "
+        line += token + " "
+    if line.strip():
+        out.write(line.rstrip() + "\n")
+
+
+def write_header(bdf_path: Path, output_path: Path, symbol_prefix: str, source_name: str) -> None:
+    glyphs = parse_bdf(bdf_path)
     prefix = symbol_prefix.upper()
+
+    included = [glyphs.get(cp) for cp in wanted_codepoints()]
+    inked = [g for g in included if g is not None and g.bbx_h > 0]
+    cell_ascent = max(g.bbx_yoff + g.bbx_h for g in inked)
+    cell_descent = max(0, max(-g.bbx_yoff for g in inked))
+    cell_height = cell_ascent + cell_descent
+    max_advance = max(g.advance for g in included if g is not None)
+    bytes_per_row = (max_advance + 7) // 8
+
+    hangul = [glyphs.get(cp) for cp in range(HANGUL_START, HANGUL_START + HANGUL_COUNT)]
+    hangul_advances = {g.advance for g in hangul if g is not None}
+    if len(hangul_advances) != 1:
+        raise SystemExit(f"{source_name}: expected monospaced Hangul, got advances {sorted(hangul_advances)}")
+    hangul_advance = hangul_advances.pop()
+
+    missing = sum(1 for g in included if g is None)
+    if missing:
+        print(f"{source_name}: {missing} glyphs missing, emitted blank")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as out:
         out.write("// Generated by tools/fonts/generate_bitmap_font.py\n")
-        out.write(f"// Source font: {source_name}, Open Font License.\n")
+        out.write(f"// Source font: {source_name} (BDF), Open Font License.\n")
         out.write("#pragma once\n\n")
         out.write("#include <Arduino.h>\n\n")
         out.write(f"static constexpr uint16_t {prefix}_ASCII_START = 0x{ASCII_START:02X};\n")
         out.write(f"static constexpr uint16_t {prefix}_ASCII_COUNT = {ASCII_COUNT};\n")
         out.write(f"static constexpr uint16_t {prefix}_HANGUL_START = 0x{HANGUL_START:04X};\n")
         out.write(f"static constexpr uint16_t {prefix}_HANGUL_COUNT = {HANGUL_COUNT};\n")
-        out.write(f"static constexpr uint8_t {prefix}_GLYPH_SIZE = {size};\n")
+        out.write(f"static constexpr uint8_t {prefix}_CELL_HEIGHT = {cell_height};\n")
+        out.write(f"static constexpr uint8_t {prefix}_CELL_ASCENT = {cell_ascent};\n")
         out.write(f"static constexpr uint8_t {prefix}_GLYPH_BYTES_PER_ROW = {bytes_per_row};\n")
-        out.write(f"static constexpr uint8_t {prefix}_GLYPH_BYTES = {bytes_per_glyph};\n\n")
-        out.write(f"static const uint8_t {prefix}_ASCII_BITMAPS[] PROGMEM = {{\n")
+        out.write(f"static constexpr uint8_t {prefix}_GLYPH_BYTES = {cell_height * bytes_per_row};\n")
+        out.write(f"static constexpr uint8_t {prefix}_HANGUL_ADVANCE = {hangul_advance};\n\n")
 
-        line = "  "
-        for index in range(ASCII_COUNT):
-            data = glyph_bytes(font, ASCII_START + index, size, threshold)
-            for value in data:
-                token = f"0x{value:02X},"
-                if len(line) + len(token) + 1 > 118:
-                    out.write(line.rstrip() + "\n")
-                    line = "  "
-                line += token + " "
-        if line.strip():
-            out.write(line.rstrip() + "\n")
+        ascii_widths = [
+            (g.advance if g is not None else max(2, hangul_advance // 2))
+            for g in included[:ASCII_COUNT]
+        ]
+        out.write(f"static const uint8_t {prefix}_ASCII_WIDTHS[] PROGMEM = {{\n")
+        emit_bytes(out, ascii_widths)
+        out.write("};\n\n")
+
+        out.write(f"static const uint8_t {prefix}_ASCII_BITMAPS[] PROGMEM = {{\n")
+        for g in included[:ASCII_COUNT]:
+            emit_bytes(out, pack_glyph(g, cell_ascent, cell_height, bytes_per_row))
         out.write("};\n\n")
 
         out.write(f"static const uint8_t {prefix}_HANGUL_BITMAPS[] PROGMEM = {{\n")
-
-        line = "  "
-        for index in range(HANGUL_COUNT):
-            data = glyph_bytes(font, HANGUL_START + index, size, threshold)
-            for value in data:
-                token = f"0x{value:02X},"
-                if len(line) + len(token) + 1 > 118:
-                    out.write(line.rstrip() + "\n")
-                    line = "  "
-                line += token + " "
-        if line.strip():
-            out.write(line.rstrip() + "\n")
+        for g in included[ASCII_COUNT:]:
+            emit_bytes(out, pack_glyph(g, cell_ascent, cell_height, bytes_per_row))
         out.write("};\n")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--font", required=True, type=Path)
+    parser.add_argument("--bdf", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--size", default=18, type=int)
-    parser.add_argument("--threshold", default=96, type=int)
     parser.add_argument("--symbol-prefix", default="FONT")
     parser.add_argument("--source-name", default="Bitmap font")
     args = parser.parse_args()
-    write_header(
-        args.font,
-        args.output,
-        args.size,
-        args.threshold,
-        args.symbol_prefix,
-        args.source_name,
-    )
+    write_header(args.bdf, args.output, args.symbol_prefix, args.source_name)
 
 
 if __name__ == "__main__":
