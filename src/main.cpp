@@ -156,10 +156,6 @@
 #define MAX_JSON_BYTES 64000
 #endif
 
-static const char WIFI_PASSWORD_CHARSET[] =
-    "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "!@#$%^&*()-_=+[]{}:;,.?/\\|~`'\" ";
-
 GxEPD2_BW<EPD_MODEL, EPD_MODEL::HEIGHT> display(
     EPD_MODEL(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
 U8G2_FOR_ADAFRUIT_GFX koreanFonts;
@@ -186,8 +182,9 @@ static bool sdAssetsAvailable = false;
 static std::unique_ptr<uint8_t[]> cachedDashboardJson;
 static int cachedDashboardJsonSize = 0;
 static uint32_t cachedDashboardJsonAt = 0;
-// HH:MM (KST) when the device last downloaded the dashboard JSON.
-static String lastFetchReceiptTime = "";
+// Full "YYYY년 MM월 DD일 X요일 HH:MM 수신" line (KST) built from the HTTP Date
+// header when the device last downloaded the dashboard JSON.
+static String lastFetchHeaderLine = "";
 constexpr uint32_t DASHBOARD_CACHE_TTL_MS = 30UL * 60UL * 1000UL;
 RTC_DATA_ATTR static int screenPage = 0;
 RTC_DATA_ATTR static uint32_t pageTransitionRefreshCount = 0;
@@ -230,7 +227,13 @@ struct DeviceTelemetry {
 struct DeviceSettings {
   uint32_t fullRefreshInterval;
   uint32_t refreshSeconds;
+  int32_t startPage;      // -1 = resume the last viewed page
+  uint32_t pageMask;      // bit i set = page i is visible
+  uint32_t rotateSeconds; // 0 = auto page rotation off
+  bool deepSleep;
 };
+
+constexpr uint32_t ALL_PAGES_MASK = (1UL << SCREEN_PAGE_COUNT) - 1UL;
 
 class MemoryWriteStream : public Stream {
 public:
@@ -381,36 +384,77 @@ static DeviceSettings defaultDeviceSettings() {
   return {
       clampSetting(PAGE_FULL_REFRESH_INTERVAL, 2, 20),
       clampSetting(FALLBACK_SLEEP_SECONDS, SETTINGS_REFRESH_SECONDS_MIN, SETTINGS_REFRESH_SECONDS_MAX),
+      -1,
+      ALL_PAGES_MASK,
+      0,
+      ENABLE_DEEP_SLEEP,
   };
+}
+
+static DeviceSettings sanitizeDeviceSettings(DeviceSettings settings) {
+  const DeviceSettings defaults = defaultDeviceSettings();
+  if (settings.fullRefreshInterval < 2) {
+    settings.fullRefreshInterval = defaults.fullRefreshInterval;
+  }
+  settings.fullRefreshInterval = clampSetting(settings.fullRefreshInterval, 2, 20);
+  settings.refreshSeconds = clampSetting(settings.refreshSeconds,
+                                         SETTINGS_REFRESH_SECONDS_MIN,
+                                         SETTINGS_REFRESH_SECONDS_MAX);
+  if (settings.startPage < -1 || settings.startPage >= SCREEN_PAGE_COUNT) {
+    settings.startPage = -1;
+  }
+  settings.pageMask &= ALL_PAGES_MASK;
+  if (settings.pageMask == 0) {
+    settings.pageMask = ALL_PAGES_MASK;
+  }
+  if (settings.rotateSeconds > 0) {
+    settings.rotateSeconds = clampSetting(settings.rotateSeconds, 30, 86400);
+  }
+  return settings;
 }
 
 static DeviceSettings loadDeviceSettings() {
   const DeviceSettings defaults = defaultDeviceSettings();
   Preferences preferences;
   preferences.begin("settings", false);
-  const uint32_t fullRefreshInterval =
-      preferences.getUInt("fullEvery", defaults.fullRefreshInterval);
-  const uint32_t refreshSeconds = preferences.getUInt("refreshSec", defaults.refreshSeconds);
-  preferences.end();
-
-  const uint32_t normalizedFullRefreshInterval =
-      fullRefreshInterval < 2 ? defaults.fullRefreshInterval : fullRefreshInterval;
-
-  return {
-      clampSetting(normalizedFullRefreshInterval, 2, 20),
-      clampSetting(refreshSeconds, SETTINGS_REFRESH_SECONDS_MIN, SETTINGS_REFRESH_SECONDS_MAX),
+  DeviceSettings settings = {
+      preferences.getUInt("fullEvery", defaults.fullRefreshInterval),
+      preferences.getUInt("refreshSec", defaults.refreshSeconds),
+      preferences.getInt("startPage", defaults.startPage),
+      preferences.getUInt("pageMask", defaults.pageMask),
+      preferences.getUInt("rotateSec", defaults.rotateSeconds),
+      preferences.getBool("deepSleep", defaults.deepSleep),
   };
+  preferences.end();
+  return sanitizeDeviceSettings(settings);
 }
 
-static void saveDeviceSettings(const DeviceSettings &settings) {
+static void saveDeviceSettings(const DeviceSettings &rawSettings) {
+  const DeviceSettings settings = sanitizeDeviceSettings(rawSettings);
   Preferences preferences;
   preferences.begin("settings", false);
-  preferences.putUInt("fullEvery", clampSetting(settings.fullRefreshInterval, 2, 20));
-  preferences.putUInt("refreshSec",
-                      clampSetting(settings.refreshSeconds,
-                                   SETTINGS_REFRESH_SECONDS_MIN,
-                                   SETTINGS_REFRESH_SECONDS_MAX));
+  preferences.putUInt("fullEvery", settings.fullRefreshInterval);
+  preferences.putUInt("refreshSec", settings.refreshSeconds);
+  preferences.putInt("startPage", settings.startPage);
+  preferences.putUInt("pageMask", settings.pageMask);
+  preferences.putUInt("rotateSec", settings.rotateSeconds);
+  preferences.putBool("deepSleep", settings.deepSleep);
   preferences.end();
+}
+
+static bool pageVisible(const DeviceSettings &settings, int page) {
+  return (settings.pageMask >> page) & 1u;
+}
+
+static int nextVisiblePage(const DeviceSettings &settings, int page, int direction) {
+  for (int step = 1; step <= SCREEN_PAGE_COUNT; step++) {
+    const int candidate =
+        ((page + direction * step) % SCREEN_PAGE_COUNT + SCREEN_PAGE_COUNT) % SCREEN_PAGE_COUNT;
+    if (pageVisible(settings, candidate)) {
+      return candidate;
+    }
+  }
+  return page;
 }
 
 static int loadSavedScreenPage() {
@@ -776,14 +820,6 @@ static void drawBootTest() {
   } while (display.nextPage());
 }
 
-enum class SettingsStage {
-  Menu,
-  NetworkSelect,
-  PasswordInput,
-  DisplaySettings,
-  Saved,
-};
-
 struct WifiNetworkEntry {
   String ssid;
   int32_t rssi;
@@ -862,54 +898,6 @@ static int buildWifiNetworkList(int scanCount, WifiNetworkEntry *networks, int c
   }
 
   return count;
-}
-
-static String wifiPasswordChoiceLabel(int index) {
-  const int charsetLength = strlen(WIFI_PASSWORD_CHARSET);
-  if (index < charsetLength) {
-    const char c = WIFI_PASSWORD_CHARSET[index];
-    if (c == ' ') {
-      return "공백";
-    }
-    return String(c);
-  }
-  if (index == charsetLength) {
-    return "삭제";
-  }
-  return "취소";
-}
-
-static const uint32_t FULL_REFRESH_OPTIONS[] = {2, 3, 5, 10, 20};
-static const uint32_t WEB_REFRESH_OPTIONS[] = {300, 600, 1800, 3600, 7200};
-
-static uint8_t optionIndexForValue(const uint32_t *options,
-                                   uint8_t optionCount,
-                                   uint32_t value,
-                                   uint8_t fallbackIndex) {
-  for (uint8_t i = 0; i < optionCount; i++) {
-    if (options[i] == value) {
-      return i;
-    }
-  }
-  return fallbackIndex < optionCount ? fallbackIndex : 0;
-}
-
-static String refreshSecondsLabel(uint32_t seconds) {
-  if (seconds < 60) {
-    return String(seconds) + "초";
-  }
-
-  const uint32_t minutes = seconds / 60;
-  if (minutes < 60) {
-    return String(minutes) + "분";
-  }
-
-  const uint32_t hours = minutes / 60;
-  return String(hours) + "시간";
-}
-
-static String fullRefreshIntervalLabel(uint32_t interval) {
-  return String(interval) + "번 전환마다";
 }
 
 static void setKoreanTextColors(uint16_t foreground, uint16_t background) {
@@ -1196,130 +1184,6 @@ static void drawKorean(int16_t x, int16_t y, const String &text, TextSize size) 
   }
 }
 
-static void drawSettingsFrame(const String &apName) {
-  display.fillScreen(GxEPD_WHITE);
-  display.drawRect(10, 10, SCREEN_WIDTH - 20, SCREEN_HEIGHT - 20, GxEPD_BLACK);
-  display.drawLine(28, 104, SCREEN_WIDTH - 28, 104, GxEPD_BLACK);
-  display.drawLine(28, SCREEN_HEIGHT - 104, SCREEN_WIDTH - 28, SCREEN_HEIGHT - 104, GxEPD_BLACK);
-
-  drawKorean(28, 48, "기기 설정");
-  drawKorean(28, 82, "좌/우 버튼으로 이동하고 확인 버튼으로 선택합니다.");
-  drawKorean(28, SCREEN_HEIGHT - 86, "취소: 상단 버튼 2개를 길게 누르세요.");
-  drawKorean(28, SCREEN_HEIGHT - 58, "휴대폰 설정도 가능: 와이파이에서 " + apName + " 연결");
-  drawKorean(28, SCREEN_HEIGHT - 30, "브라우저에서 http://192.168.4.1 을 여세요.");
-}
-
-static void drawSelectionRow(int16_t x,
-                             int16_t y,
-                             int16_t width,
-                             const String &text,
-                             bool selected) {
-  if (selected) {
-    display.fillRect(x - 6, y - 20, width, 26, GxEPD_BLACK);
-    setKoreanTextColors(GxEPD_WHITE, GxEPD_BLACK);
-  } else {
-    setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
-  }
-  drawKorean(x, y, text);
-  setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
-}
-
-static void drawSettingsScreen(SettingsStage stage,
-                               const String &apName,
-                               const WifiNetworkEntry *networks,
-                               int networkCount,
-                               int selectedNetwork,
-                               const String &password,
-                               int passwordChoiceIndex,
-                               int menuSelection,
-                               const DeviceSettings &settings,
-                               int displaySelection,
-                               bool partialRefresh) {
-  if (!ENABLE_DISPLAY) {
-    return;
-  }
-
-  display.setRotation(0);
-  if (partialRefresh) {
-    display.setPartialWindow(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
-  } else {
-    display.setFullWindow();
-  }
-  display.firstPage();
-  do {
-    drawSettingsFrame(apName);
-    display.setTextColor(GxEPD_BLACK);
-
-    if (stage == SettingsStage::Menu) {
-      drawKorean(28, 145, "설정 메뉴");
-      drawKorean(28, 174, "좌/우: 메뉴 이동    확인: 들어가기");
-      drawSelectionRow(46, 232, SCREEN_WIDTH - 92, "와이파이 설정", menuSelection == 0);
-      drawSelectionRow(46, 282, SCREEN_WIDTH - 92, "화면 설정", menuSelection == 1);
-      drawSelectionRow(46, 332, SCREEN_WIDTH - 92, "블루투스 설정 (웹에서 설정)", menuSelection == 2);
-    } else if (stage == SettingsStage::NetworkSelect) {
-      drawKorean(28, 145, "1. 와이파이 선택");
-      drawKorean(28, 174, "좌/우: 목록 이동    확인: 선택");
-
-      if (networkCount <= 0 || selectedNetwork < 0 || selectedNetwork >= networkCount ||
-          networks[selectedNetwork].ssid.length() == 0) {
-        drawKorean(28, 230, "검색된 와이파이가 없습니다. 아래 휴대폰 설정을 사용하세요.");
-      } else {
-        constexpr int16_t rowTop = 192;
-        constexpr int16_t rowHeight = 18;
-        for (int i = 0; i < networkCount; i++) {
-          const int16_t y = rowTop + i * rowHeight;
-          if (i == selectedNetwork) {
-            display.fillRect(22, y - 15, SCREEN_WIDTH - 52, 17, GxEPD_BLACK);
-            setKoreanTextColors(GxEPD_WHITE, GxEPD_BLACK);
-          } else {
-            setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
-          }
-          drawKorean(32, y, networks[i].ssid.substring(0, 22));
-          display.setTextColor(i == selectedNetwork ? GxEPD_WHITE : GxEPD_BLACK);
-          display.setFont(&FreeMono9pt7b);
-          display.setCursor(604, y);
-          display.print(wifiSignalPercentFromRssi(networks[i].rssi));
-          display.print("%");
-          drawWifiSignalIcon(690,
-                             y - 2,
-                             networks[i].rssi,
-                             i == selectedNetwork ? GxEPD_WHITE : GxEPD_BLACK);
-          display.setTextColor(GxEPD_BLACK);
-          setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
-        }
-      }
-    } else if (stage == SettingsStage::PasswordInput) {
-      drawKorean(28, 145, "2. 비밀번호 입력");
-      drawKorean(28, 178, "좌/우: 문자 변경    확인: 현재 문자 입력");
-      drawKorean(28, 210, "확인을 빠르게 두 번 누르면 저장합니다.");
-      const String ssid =
-          selectedNetwork >= 0 && selectedNetwork < networkCount ? networks[selectedNetwork].ssid : "";
-      drawKorean(28, 246, String("와이파이: ") + ssid.substring(0, 28));
-      drawKorean(28, 280, String("입력값: ") + password + " (" +
-                          String(password.length()) + "글자)");
-      drawKorean(28, 330, String("현재 문자: [ ") + wifiPasswordChoiceLabel(passwordChoiceIndex) +
-                          " ]");
-    } else if (stage == SettingsStage::DisplaySettings) {
-      drawKorean(28, 145, "화면 설정");
-      drawKorean(28, 174, "좌/우: 항목 이동    확인: 값 변경/저장");
-      drawSelectionRow(46,
-                       226,
-                       SCREEN_WIDTH - 92,
-                       String("전체 refresh: ") +
-                           fullRefreshIntervalLabel(settings.fullRefreshInterval),
-                       displaySelection == 0);
-      drawSelectionRow(46,
-                       276,
-                       SCREEN_WIDTH - 92,
-                       String("웹 데이터 갱신: ") + refreshSecondsLabel(settings.refreshSeconds),
-                       displaySelection == 1);
-      drawSelectionRow(46, 326, SCREEN_WIDTH - 92, "저장하고 나가기", displaySelection == 2);
-    } else {
-      drawKorean(28, 176, "저장했습니다. 기기를 다시 시작합니다.");
-    }
-  } while (display.nextPage());
-}
-
 enum class WaitAction {
   None,
   PageRefresh,
@@ -1343,8 +1207,9 @@ static bool shouldUsePartialRefreshForScreenTransition() {
   return true;
 }
 
-static WaitAction sleepOrWait(uint32_t seconds) {
-  if (ENABLE_DEEP_SLEEP) {
+static WaitAction sleepOrWait(const DeviceSettings &settings) {
+  const uint32_t seconds = settings.refreshSeconds;
+  if (settings.deepSleep) {
     Serial.printf("Deep sleep for %lu seconds\n", static_cast<unsigned long>(seconds));
     esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(seconds) * 1000000ULL);
     esp_deep_sleep_start();
@@ -1354,6 +1219,7 @@ static WaitAction sleepOrWait(uint32_t seconds) {
   buttonManager.reset();
   const uint32_t waitStartedAt = millis();
   const uint32_t waitMs = seconds * 1000UL;
+  const uint32_t rotateMs = settings.rotateSeconds * 1000UL;
   while (millis() - waitStartedAt < waitMs) {
     Serial.printf("Heartbeat: waiting, state=%s, err=%d, uptime=%lu ms, wifi=%s\n",
                   deviceState,
@@ -1372,14 +1238,21 @@ static WaitAction sleepOrWait(uint32_t seconds) {
         buttonManager.waitForAllReleased();
         return WaitAction::WifiSetup;
       } else if (buttonEvent == ButtonEvent::LeftClick) {
-        screenPage = (screenPage + SCREEN_PAGE_COUNT - 1) % SCREEN_PAGE_COUNT;
+        screenPage = nextVisiblePage(settings, screenPage, -1);
         saveScreenPage();
         Serial.printf("Button: page left GPIO%d -> %d\n", BUTTON_LEFT_PIN, screenPage);
         return WaitAction::PageRefresh;
       } else if (buttonEvent == ButtonEvent::RightClick) {
-        screenPage = (screenPage + 1) % SCREEN_PAGE_COUNT;
+        screenPage = nextVisiblePage(settings, screenPage, 1);
         saveScreenPage();
         Serial.printf("Button: page right GPIO%d -> %d\n", BUTTON_RIGHT_PIN, screenPage);
+        return WaitAction::PageRefresh;
+      }
+
+      if (rotateMs > 0 && millis() - waitStartedAt >= rotateMs) {
+        screenPage = nextVisiblePage(settings, screenPage, 1);
+        saveScreenPage();
+        Serial.printf("Auto rotate -> page %d\n", screenPage);
         return WaitAction::PageRefresh;
       }
 
@@ -1436,7 +1309,7 @@ static String wifiSetupPage(const WifiNetworkEntry *networks, int networkCount, 
     body += F("<p>저장했습니다. 기기를 다시 시작합니다.</p>");
   } else {
     body += F("<p class='note'>2.4GHz 와이파이를 선택하고 비밀번호를 입력하세요. "
-              "기기 버튼으로도 입력할 수 있습니다.</p>"
+              "서버 주소 등 전체 설정은 블루투스 웹 설정 페이지에서 가능합니다.</p>"
               "<form method='POST' action='/save'><label>와이파이 신호 강한 순서 최대 10개</label><select name='ssid'>");
     for (int i = 0; i < networkCount; i++) {
       const String ssid = networks[i].ssid;
@@ -1525,6 +1398,29 @@ static void handleBleConfigWrite(const std::string &payload) {
     return;
   }
 
+  // PIN verified: the web client may read back current settings. Secrets
+  // (Wi-Fi password, auth token) are never included.
+  const String action = document["action"] | "";
+  if (action == "get") {
+    const DeviceSettings settings = loadDeviceSettings();
+    JsonDocument response;
+    JsonObject config = response["config"].to<JsonObject>();
+    const String storedSsid = storedWifiSsid();
+    config["ssid"] = storedSsid.length() > 0 ? storedSsid : String(WIFI_SSID);
+    config["endpoint"] = deviceEndpointBase();
+    config["refreshSec"] = settings.refreshSeconds;
+    config["fullEvery"] = settings.fullRefreshInterval;
+    config["startPage"] = settings.startPage;
+    config["pageMask"] = settings.pageMask;
+    config["rotateSec"] = settings.rotateSeconds;
+    config["deepSleep"] = settings.deepSleep;
+    config["pageCount"] = SCREEN_PAGE_COUNT;
+    String serialized;
+    serializeJson(response, serialized);
+    bleSetStatus(serialized, "현재 설정을 웹으로 전송했습니다.");
+    return;
+  }
+
   const String ssid = document["ssid"] | "";
   const String password = document["password"] | "";
   const String endpoint = document["endpoint"] | "";
@@ -1557,17 +1453,43 @@ static void handleBleConfigWrite(const std::string &payload) {
     savedAnything = true;
   }
 
-  if (refreshSeconds > 0 || fullRefreshInterval > 0) {
-    DeviceSettings settings = loadDeviceSettings();
-    if (refreshSeconds > 0) {
-      settings.refreshSeconds = clampSetting(static_cast<uint32_t>(refreshSeconds),
-                                             SETTINGS_REFRESH_SECONDS_MIN,
-                                             SETTINGS_REFRESH_SECONDS_MAX);
+  DeviceSettings settings = loadDeviceSettings();
+  bool settingsChanged = false;
+  if (refreshSeconds > 0) {
+    settings.refreshSeconds = clampSetting(static_cast<uint32_t>(refreshSeconds),
+                                           SETTINGS_REFRESH_SECONDS_MIN,
+                                           SETTINGS_REFRESH_SECONDS_MAX);
+    settingsChanged = true;
+  }
+  if (fullRefreshInterval > 0) {
+    settings.fullRefreshInterval =
+        clampSetting(static_cast<uint32_t>(fullRefreshInterval), 2, 20);
+    settingsChanged = true;
+  }
+  if (!document["startPage"].isNull()) {
+    const long startPage = document["startPage"] | -1L;
+    settings.startPage =
+        startPage >= 0 && startPage < SCREEN_PAGE_COUNT ? static_cast<int32_t>(startPage) : -1;
+    settingsChanged = true;
+  }
+  if (!document["pageMask"].isNull()) {
+    const uint32_t pageMask = (document["pageMask"] | 0UL) & ALL_PAGES_MASK;
+    if (pageMask != 0) {
+      settings.pageMask = pageMask;
+      settingsChanged = true;
     }
-    if (fullRefreshInterval > 0) {
-      settings.fullRefreshInterval =
-          clampSetting(static_cast<uint32_t>(fullRefreshInterval), 2, 20);
-    }
+  }
+  if (!document["rotateSec"].isNull()) {
+    const long rotateSeconds = document["rotateSec"] | 0L;
+    settings.rotateSeconds =
+        rotateSeconds <= 0 ? 0 : clampSetting(static_cast<uint32_t>(rotateSeconds), 30, 86400);
+    settingsChanged = true;
+  }
+  if (!document["deepSleep"].isNull()) {
+    settings.deepSleep = document["deepSleep"] | false;
+    settingsChanged = true;
+  }
+  if (settingsChanged) {
     saveDeviceSettings(settings);
     savedAnything = true;
   }
@@ -1629,7 +1551,7 @@ static void drawQrCode(int16_t x, int16_t y, const char *text, uint8_t version, 
   }
 }
 
-static void drawBleSetupScreen(const String &deviceName, const String &pin, const String &statusLine) {
+static void drawSetupGuideScreen(const String &deviceName, const String &pin, const String &statusLine) {
   if (!ENABLE_DISPLAY) {
     return;
   }
@@ -1642,176 +1564,60 @@ static void drawBleSetupScreen(const String &deviceName, const String &pin, cons
     display.drawRect(10, 10, SCREEN_WIDTH - 20, SCREEN_HEIGHT - 20, GxEPD_BLACK);
     display.drawLine(28, 96, SCREEN_WIDTH - 28, 96, GxEPD_BLACK);
 
-    drawKorean(28, 52, "블루투스 설정 모드", TextSize::Large);
-    drawKorean(28, 82, "웹 브라우저에서 기기 설정을 변경할 수 있습니다.", TextSize::Tiny);
+    drawKorean(28, 52, "기기 설정", TextSize::Large);
+    drawKorean(28, 82, "설정은 웹 브라우저에서 진행합니다. 이 화면은 안내만 표시합니다.", TextSize::Tiny);
 
-    drawKorean(28, 140, String("기기 이름: ") + deviceName);
-    drawKorean(28, 186, "확인 PIN", TextSize::Tiny);
-    drawKorean(28, 226, pin, TextSize::Large);
+    drawKorean(28, 132, "방법 1 · 웹 블루투스 — 모든 설정 가능", TextSize::Bold);
+    drawKorean(28, 160, "지원: Android/Mac/Windows Chrome (iOS 불가)", TextSize::Tiny);
+    drawKorean(28, 186, "1) 오른쪽 QR 코드 또는 아래 주소로 접속", TextSize::Tiny);
+    drawKorean(44, 210, SETUP_PAGE_URL, TextSize::Tiny);
+    drawKorean(28, 234, String("2) [기기 연결] 후 목록에서 ") + deviceName + " 선택", TextSize::Tiny);
+    drawKorean(28, 258, "3) 아래 PIN 입력 후 설정 저장", TextSize::Tiny);
+    drawKorean(28, 290, "확인 PIN", TextSize::Tiny);
+    drawKorean(28, 330, pin, TextSize::Large);
 
-    drawKorean(28, 282, "1. 오른쪽 QR 코드 또는 아래 주소로 접속", TextSize::Tiny);
-    drawKorean(44, 308, SETUP_PAGE_URL, TextSize::Tiny);
-    drawKorean(28, 336, "2. [기기 연결]을 누르고 목록에서 기기 선택", TextSize::Tiny);
-    drawKorean(28, 362, "3. 화면의 PIN 입력 후 설정 저장", TextSize::Tiny);
+    drawKorean(28, 380, "방법 2 · Wi-Fi 접속 — Wi-Fi 설정만 가능 (iPhone 가능)", TextSize::Bold);
+    drawKorean(28, 406, String("휴대폰 Wi-Fi에서 '") + deviceName + "' 연결 후 http://192.168.4.1 접속", TextSize::Tiny);
 
-    drawKorean(28, 402, "지원: Android/Mac/Windows Chrome (iOS 불가)", TextSize::Tiny);
-    drawKorean(28, 428, String("상태: ") + statusLine, TextSize::Tiny);
-    drawKorean(28, SCREEN_HEIGHT - 26, "취소: 상단 버튼 2개를 길게 누르세요. 5분 후 자동 종료됩니다.", TextSize::Tiny);
+    display.drawLine(28, SCREEN_HEIGHT - 64, SCREEN_WIDTH - 28, SCREEN_HEIGHT - 64, GxEPD_BLACK);
+    drawKorean(28, SCREEN_HEIGHT - 42, "보안: 5분 후 자동 종료 · PIN 3회 오류 시 즉시 종료", TextSize::Tiny);
+    drawKorean(28, SCREEN_HEIGHT - 20, String("상태: ") + statusLine + "   (닫기: 새로고침 버튼)", TextSize::Tiny);
 
     drawQrCode(SCREEN_WIDTH - 236, 128, SETUP_PAGE_URL, 6, 4);
-    drawKorean(SCREEN_WIDTH - 236, 340, "설정 페이지 QR", TextSize::Tiny);
+    drawKorean(SCREEN_WIDTH - 236, 336, "설정 페이지 QR", TextSize::Tiny);
   } while (display.nextPage());
 }
 
-static void runBleSetupMode() {
-  deviceState = "ble-setup";
-  Serial.println("BLE setup mode start");
-
-  WiFi.softAPdisconnect(true);
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-
-  String suffix = WiFi.macAddress();
-  suffix.replace(":", "");
-  const String deviceName = "EINK-SETUP-" + suffix.substring(suffix.length() - 4);
-
-  BleSetupContext context;
-  char pinBuffer[7];
-  snprintf(pinBuffer, sizeof(pinBuffer), "%06lu",
-           static_cast<unsigned long>(esp_random() % 900000UL + 100000UL));
-  context.pin = pinBuffer;
-  bleSetup = &context;
-
-  NimBLEDevice::init(deviceName.c_str());
-  NimBLEServer *server = NimBLEDevice::createServer();
-  static BleServerCallbacks serverCallbacks;
-  static BleConfigCallbacks configCallbacks;
-  server->setCallbacks(&serverCallbacks);
-
-  NimBLEService *service = server->createService(BLE_SETUP_SERVICE_UUID);
-  NimBLECharacteristic *configCharacteristic = service->createCharacteristic(
-      BLE_SETUP_CONFIG_UUID, NIMBLE_PROPERTY::WRITE);
-  configCharacteristic->setCallbacks(&configCallbacks);
-  context.statusCharacteristic = service->createCharacteristic(
-      BLE_SETUP_STATUS_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-  context.statusCharacteristic->setValue("ready");
-  service->start();
-
-  NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
-  advertising->addServiceUUID(BLE_SETUP_SERVICE_UUID);
-  advertising->setScanResponse(true);
-  NimBLEDevice::startAdvertising();
-  Serial.printf("BLE advertising as %s, PIN %s\n", deviceName.c_str(), context.pin.c_str());
-
-  setupDisplay();
-  drawBleSetupScreen(deviceName, context.pin, context.statusLine);
-
-  buttonManager.reset();
-  bool cancelled = false;
-  const uint32_t startedAt = millis();
-  uint32_t lastRedrawAt = 0;
-  while (!context.saved && !context.locked && !cancelled &&
-         millis() - startedAt < BLE_SETUP_TIMEOUT_SECONDS * 1000UL) {
-    const ButtonEvent buttonEvent = buttonManager.update();
-    if (buttonEvent == ButtonEvent::LeftRightHold) {
-      cancelled = true;
-      buttonManager.waitForAllReleased();
-      break;
-    }
-
-    // Throttle e-ink redraws: refreshing the panel takes seconds.
-    if (context.dirty && millis() - lastRedrawAt > 2500) {
-      context.dirty = false;
-      lastRedrawAt = millis();
-      drawBleSetupScreen(deviceName, context.pin, context.statusLine);
-    }
-
-    delay(BUTTON_SCAN_INTERVAL_MS);
-  }
-
-  if (context.saved) {
-    // Give the web client a moment to read the "saved" notification.
-    drawBleSetupScreen(deviceName, context.pin, context.statusLine);
-    delay(1500);
-    NimBLEDevice::deinit(true);
-    bleSetup = nullptr;
-    ESP.restart();
-    return;
-  }
-
-  NimBLEDevice::deinit(true);
-  bleSetup = nullptr;
-
-  if (context.locked) {
-    Serial.println("BLE setup locked: too many wrong PINs");
-    drawStatus("블루투스 설정", "PIN 오류가 반복되어 종료했습니다.");
-  } else if (cancelled) {
-    Serial.println("BLE setup cancelled by button");
-    drawStatus("블루투스 설정", "취소했습니다. 대시보드로 돌아갑니다.");
-  } else {
-    Serial.println("BLE setup timed out");
-    drawStatus("블루투스 설정", "시간이 초과되었습니다. 대시보드로 돌아갑니다.");
-  }
-}
-
+// Guide-only settings mode. The Wi-Fi AP portal and the BLE GATT server run
+// at the same time; the e-ink panel only explains how to connect. All actual
+// configuration happens from the web (BLE /setting page = everything,
+// AP portal page = Wi-Fi only). Auto-closes after BLE_SETUP_TIMEOUT_SECONDS.
 static void startSettingsPortal() {
   deviceState = "settings";
   lastErrorCode = 0;
+  Serial.println("Settings mode start (AP portal + BLE)");
 
-  const String suffix = WiFi.macAddress().substring(12);
-  const String apName = "EINK-SETUP-" + suffix;
+  String macSuffix = WiFi.macAddress();
+  macSuffix.replace(":", "");
+  const String deviceName = "EINK-SETUP-" + macSuffix.substring(macSuffix.length() - 4);
   const IPAddress apIP(192, 168, 4, 1);
   const IPAddress netmask(255, 255, 255, 0);
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAPConfig(apIP, apIP, netmask);
-  WiFi.softAP(apName.c_str());
+  WiFi.softAP(deviceName.c_str());
 
   const int scanCount = WiFi.scanNetworks();
   WifiNetworkEntry wifiNetworks[WIFI_SETUP_MAX_NETWORKS];
   const int networkCount = buildWifiNetworkList(scanCount, wifiNetworks, WIFI_SETUP_MAX_NETWORKS);
-  Serial.printf("Settings AP: %s, open http://192.168.4.1\n", apName.c_str());
-  Serial.printf("Wi-Fi setup networks: scanned=%d, shown=%d\n", scanCount, networkCount);
+  Serial.printf("Settings AP: %s, portal http://192.168.4.1 (networks=%d)\n",
+                deviceName.c_str(),
+                networkCount);
   setupDisplay();
 
   DNSServer dnsServer;
   WebServer server(80);
   bool wifiSaved = false;
-  bool displaySettingsSaved = false;
-  bool exitRequested = false;
-  bool bleRequested = false;
-  SettingsStage buttonStage = SettingsStage::Menu;
-  String buttonPassword;
-  DeviceSettings displaySettings = loadDeviceSettings();
-  int selectedNetwork = 0;
-  int menuSelection = 0;
-  int displaySelection = 0;
-  uint8_t fullRefreshOptionIndex =
-      optionIndexForValue(FULL_REFRESH_OPTIONS,
-                          sizeof(FULL_REFRESH_OPTIONS) / sizeof(FULL_REFRESH_OPTIONS[0]),
-                          displaySettings.fullRefreshInterval,
-                          2);
-  uint8_t webRefreshOptionIndex =
-      optionIndexForValue(WEB_REFRESH_OPTIONS,
-                          sizeof(WEB_REFRESH_OPTIONS) / sizeof(WEB_REFRESH_OPTIONS[0]),
-                          displaySettings.refreshSeconds,
-                          2);
-  int passwordChoiceIndex = 0;
-  bool uiDirty = true;
-  int lastPasswordConfirmIndex = -1;
-  uint32_t lastPasswordConfirmAt = 0;
-
-  auto hasVisibleNetwork = [&]() {
-    return networkCount > 0;
-  };
-
-  auto moveNetworkSelection = [&](int delta) {
-    if (!hasVisibleNetwork()) {
-      return;
-    }
-
-    selectedNetwork = (selectedNetwork + delta + networkCount) % networkCount;
-  };
 
   dnsServer.start(53, "*", apIP);
   server.on("/", HTTP_GET, [&]() {
@@ -1836,212 +1642,97 @@ static void startSettingsPortal() {
   });
   server.begin();
 
+  // BLE GATT server advertising in parallel with the AP.
+  BleSetupContext context;
+  char pinBuffer[7];
+  snprintf(pinBuffer, sizeof(pinBuffer), "%06lu",
+           static_cast<unsigned long>(esp_random() % 900000UL + 100000UL));
+  context.pin = pinBuffer;
+  bleSetup = &context;
+
+  NimBLEDevice::init(deviceName.c_str());
+  NimBLEServer *bleServer = NimBLEDevice::createServer();
+  static BleServerCallbacks serverCallbacks;
+  static BleConfigCallbacks configCallbacks;
+  bleServer->setCallbacks(&serverCallbacks);
+
+  NimBLEService *service = bleServer->createService(BLE_SETUP_SERVICE_UUID);
+  NimBLECharacteristic *configCharacteristic = service->createCharacteristic(
+      BLE_SETUP_CONFIG_UUID, NIMBLE_PROPERTY::WRITE);
+  configCharacteristic->setCallbacks(&configCallbacks);
+  context.statusCharacteristic = service->createCharacteristic(
+      BLE_SETUP_STATUS_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  context.statusCharacteristic->setValue("ready");
+  service->start();
+
+  NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+  advertising->addServiceUUID(BLE_SETUP_SERVICE_UUID);
+  advertising->setScanResponse(true);
+  NimBLEDevice::startAdvertising();
+  Serial.printf("BLE advertising as %s, PIN %s\n", deviceName.c_str(), context.pin.c_str());
+
+  drawSetupGuideScreen(deviceName, context.pin, context.statusLine);
+
   buttonManager.reset();
+  bool cancelled = false;
   const uint32_t startedAt = millis();
-  while (!wifiSaved && !exitRequested && millis() - startedAt < WIFI_SETUP_TIMEOUT_SECONDS * 1000UL) {
+  uint32_t lastRedrawAt = millis();
+  while (!wifiSaved && !context.saved && !context.locked && !cancelled &&
+         millis() - startedAt < BLE_SETUP_TIMEOUT_SECONDS * 1000UL) {
     dnsServer.processNextRequest();
     server.handleClient();
 
     const ButtonEvent buttonEvent = buttonManager.update();
-    if (buttonEvent == ButtonEvent::LeftRightHold) {
-      exitRequested = true;
-      Serial.println("Settings canceled by left+right hold");
+    if (buttonEvent == ButtonEvent::LeftRightHold || buttonEvent == ButtonEvent::RefreshClick) {
+      cancelled = true;
+      Serial.println("Settings closed by button");
       buttonManager.waitForAllReleased();
-      continue;
+      break;
     }
 
-    if (uiDirty) {
-      const bool partialUiRefresh = shouldUsePartialRefreshForScreenTransition();
-      Serial.printf("Settings UI redraw: stage=%d, partial=%s\n",
-                    static_cast<int>(buttonStage),
-                    partialUiRefresh ? "yes" : "no");
-      drawSettingsScreen(buttonStage,
-                         apName,
-                         wifiNetworks,
-                         networkCount,
-                         selectedNetwork,
-                         buttonPassword,
-                         passwordChoiceIndex,
-                         menuSelection,
-                         displaySettings,
-                         displaySelection,
-                         partialUiRefresh);
-      uiDirty = false;
-    }
-
-    if (buttonEvent == ButtonEvent::LeftClick) {
-      if (buttonStage == SettingsStage::Menu) {
-        menuSelection = (menuSelection + 2) % 3;
-        Serial.printf("Settings menu selection: %d\n", menuSelection);
-      } else if (buttonStage == SettingsStage::NetworkSelect) {
-        moveNetworkSelection(-1);
-        if (hasVisibleNetwork()) {
-          Serial.printf("Wi-Fi setup button network: %s (%ld%%)\n",
-                        wifiNetworks[selectedNetwork].ssid.c_str(),
-                        static_cast<long>(wifiSignalPercentFromRssi(wifiNetworks[selectedNetwork].rssi)));
-        }
-      } else if (buttonStage == SettingsStage::PasswordInput) {
-        const int choiceCount = strlen(WIFI_PASSWORD_CHARSET) + 2;
-        passwordChoiceIndex = (passwordChoiceIndex + choiceCount - 1) % choiceCount;
-        Serial.printf("Wi-Fi setup password choice: %s\n",
-                      wifiPasswordChoiceLabel(passwordChoiceIndex).c_str());
-        lastPasswordConfirmIndex = -1;
-      } else if (buttonStage == SettingsStage::DisplaySettings) {
-        displaySelection = (displaySelection + 2) % 3;
-        Serial.printf("Display setting selection: %d\n", displaySelection);
-      }
-      uiDirty = true;
-    } else if (buttonEvent == ButtonEvent::RightClick) {
-      if (buttonStage == SettingsStage::Menu) {
-        menuSelection = (menuSelection + 1) % 3;
-        Serial.printf("Settings menu selection: %d\n", menuSelection);
-      } else if (buttonStage == SettingsStage::NetworkSelect) {
-        moveNetworkSelection(1);
-        if (hasVisibleNetwork()) {
-          Serial.printf("Wi-Fi setup button network: %s (%ld%%)\n",
-                        wifiNetworks[selectedNetwork].ssid.c_str(),
-                        static_cast<long>(wifiSignalPercentFromRssi(wifiNetworks[selectedNetwork].rssi)));
-        }
-      } else if (buttonStage == SettingsStage::PasswordInput) {
-        const int choiceCount = strlen(WIFI_PASSWORD_CHARSET) + 2;
-        passwordChoiceIndex = (passwordChoiceIndex + 1) % choiceCount;
-        Serial.printf("Wi-Fi setup password choice: %s\n",
-                      wifiPasswordChoiceLabel(passwordChoiceIndex).c_str());
-        lastPasswordConfirmIndex = -1;
-      } else if (buttonStage == SettingsStage::DisplaySettings) {
-        displaySelection = (displaySelection + 1) % 3;
-        Serial.printf("Display setting selection: %d\n", displaySelection);
-      }
-      uiDirty = true;
-    } else if (buttonEvent == ButtonEvent::RefreshClick) {
-      if (buttonStage == SettingsStage::Menu) {
-        if (menuSelection == 0) {
-          buttonStage = SettingsStage::NetworkSelect;
-          Serial.println("Settings menu: Wi-Fi setup");
-        } else if (menuSelection == 1) {
-          buttonStage = SettingsStage::DisplaySettings;
-          Serial.println("Settings menu: display settings");
-        } else {
-          bleRequested = true;
-          exitRequested = true;
-          Serial.println("Settings menu: BLE setup");
-        }
-      } else if (buttonStage == SettingsStage::NetworkSelect) {
-        if (hasVisibleNetwork() && selectedNetwork < networkCount &&
-            wifiNetworks[selectedNetwork].ssid.length() > 0) {
-          buttonStage = SettingsStage::PasswordInput;
-          buttonPassword = "";
-          passwordChoiceIndex = 0;
-          lastPasswordConfirmIndex = -1;
-          lastPasswordConfirmAt = 0;
-          Serial.printf("Wi-Fi setup button selected SSID: %s\n",
-                        wifiNetworks[selectedNetwork].ssid.c_str());
-        }
-      } else if (buttonStage == SettingsStage::PasswordInput) {
-        const int charsetLength = strlen(WIFI_PASSWORD_CHARSET);
-        if (passwordChoiceIndex < charsetLength) {
-          const uint32_t now = millis();
-          const bool doubleConfirm =
-              lastPasswordConfirmIndex == passwordChoiceIndex &&
-              now - lastPasswordConfirmAt <= WIFI_BUTTON_SAVE_DOUBLE_PRESS_MS &&
-              buttonPassword.length() > 0;
-
-          if (doubleConfirm) {
-            const String ssid = wifiNetworks[selectedNetwork].ssid;
-            if (ssid.length() > 0) {
-              saveWifiCredentials(ssid, buttonPassword);
-              wifiSaved = true;
-              buttonStage = SettingsStage::Saved;
-              Serial.printf("Wi-Fi credentials saved from buttons: %s\n", ssid.c_str());
-            }
-          } else if (buttonPassword.length() < WIFI_BUTTON_PASSWORD_MAX_LENGTH) {
-            buttonPassword += WIFI_PASSWORD_CHARSET[passwordChoiceIndex];
-            lastPasswordConfirmIndex = passwordChoiceIndex;
-            lastPasswordConfirmAt = now;
-          }
-        } else if (passwordChoiceIndex == charsetLength) {
-          if (buttonPassword.length() > 0) {
-            buttonPassword.remove(buttonPassword.length() - 1);
-          }
-          lastPasswordConfirmIndex = -1;
-        } else {
-          exitRequested = true;
-          Serial.println("Wi-Fi setup button exit");
-        }
-      } else if (buttonStage == SettingsStage::DisplaySettings) {
-        if (displaySelection == 0) {
-          fullRefreshOptionIndex =
-              (fullRefreshOptionIndex + 1) %
-              (sizeof(FULL_REFRESH_OPTIONS) / sizeof(FULL_REFRESH_OPTIONS[0]));
-          displaySettings.fullRefreshInterval = FULL_REFRESH_OPTIONS[fullRefreshOptionIndex];
-          pageTransitionRefreshCount = 0;
-          Serial.printf("Display setting full refresh interval: %lu\n",
-                        static_cast<unsigned long>(displaySettings.fullRefreshInterval));
-        } else if (displaySelection == 1) {
-          webRefreshOptionIndex =
-              (webRefreshOptionIndex + 1) %
-              (sizeof(WEB_REFRESH_OPTIONS) / sizeof(WEB_REFRESH_OPTIONS[0]));
-          displaySettings.refreshSeconds = WEB_REFRESH_OPTIONS[webRefreshOptionIndex];
-          Serial.printf("Display setting web refresh seconds: %lu\n",
-                        static_cast<unsigned long>(displaySettings.refreshSeconds));
-        } else {
-          saveDeviceSettings(displaySettings);
-          displaySettingsSaved = true;
-          exitRequested = true;
-          pageTransitionRefreshCount = 0;
-          Serial.println("Display settings saved");
-        }
-      }
-      uiDirty = true;
+    // Throttle e-ink redraws: a refresh takes seconds.
+    if (context.dirty && millis() - lastRedrawAt > 2500) {
+      context.dirty = false;
+      lastRedrawAt = millis();
+      drawSetupGuideScreen(deviceName, context.pin, context.statusLine);
     }
 
     delay(BUTTON_SCAN_INTERVAL_MS);
+  }
+
+  const bool bleSaved = context.saved;
+  if (bleSaved) {
+    // Give the web client a moment to read the "saved" notification.
+    drawSetupGuideScreen(deviceName, context.pin, context.statusLine);
+    delay(1500);
   }
 
   server.stop();
   dnsServer.stop();
   WiFi.softAPdisconnect(true);
   WiFi.scanDelete();
+  NimBLEDevice::deinit(true);
+  bleSetup = nullptr;
 
-  if (bleRequested) {
-    runBleSetupMode();
-    return;
-  }
-
-  if (wifiSaved) {
-    drawSettingsScreen(SettingsStage::Saved,
-                       apName,
-                       wifiNetworks,
-                       networkCount,
-                       selectedNetwork,
-                       buttonPassword,
-                       passwordChoiceIndex,
-                       menuSelection,
-                       displaySettings,
-                       displaySelection,
-                       shouldUsePartialRefreshForScreenTransition());
+  if (wifiSaved || bleSaved) {
+    if (ENABLE_DISPLAY) {
+      drawStatus("기기 설정", "저장했습니다. 기기를 다시 시작합니다.");
+    }
     delay(800);
     ESP.restart();
-  }
-
-  if (exitRequested) {
-    Serial.println("Settings exited by button");
-    if (ENABLE_DISPLAY) {
-      const bool partialStatusRefresh = shouldUsePartialRefreshForScreenTransition();
-      if (displaySettingsSaved) {
-        drawStatus("화면 설정", "저장했습니다. 대시보드로 돌아갑니다.", partialStatusRefresh);
-      } else {
-        drawStatus("기기 설정", "취소했습니다. 대시보드로 돌아갑니다.", partialStatusRefresh);
-      }
-    }
     return;
   }
 
-  Serial.println("Settings timed out");
   if (ENABLE_DISPLAY) {
-    drawStatus("기기 설정",
-               "시간이 초과되었습니다. 대시보드로 돌아갑니다.",
-               shouldUsePartialRefreshForScreenTransition());
+    if (context.locked) {
+      Serial.println("Settings locked: too many wrong PINs");
+      drawStatus("기기 설정", "PIN 오류가 반복되어 종료했습니다.");
+    } else if (cancelled) {
+      drawStatus("기기 설정", "닫았습니다. 대시보드로 돌아갑니다.");
+    } else {
+      Serial.println("Settings timed out");
+      drawStatus("기기 설정", "시간이 초과되었습니다. 대시보드로 돌아갑니다.");
+    }
   }
 }
 
@@ -2165,20 +1856,44 @@ static bool fetchBitmap(const String &endpoint, std::unique_ptr<uint8_t[]> &buff
   return false;
 }
 
-// "Sat, 04 Jul 2026 07:22:24 GMT" -> "16:22" (KST).
-static String kstTimeFromHttpDate(const String &httpDate) {
-  const int colon = httpDate.indexOf(':');
-  if (colon < 2 || httpDate.length() < colon + 3) {
+// "Sat, 04 Jul 2026 07:22:24 GMT" -> "2026년 07월 04일 토요일 16:22 수신" (KST).
+// mktime() normalizes the +9h overflow and computes the weekday.
+static String kstHeaderLineFromHttpDate(const String &httpDate) {
+  char monthName[4] = {0};
+  int day = 0, year = 0, hour = 0, minute = 0, second = 0;
+  if (sscanf(httpDate.c_str(), "%*3s, %d %3s %d %d:%d:%d",
+             &day, monthName, &year, &hour, &minute, &second) != 6) {
     return "";
   }
-  int hours = httpDate.substring(colon - 2, colon).toInt() + 9;
-  const int minutes = httpDate.substring(colon + 1, colon + 3).toInt();
-  if (hours >= 24) {
-    hours -= 24;
+
+  static const char MONTHS[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  const char *monthPtr = strstr(MONTHS, monthName);
+  if (monthPtr == nullptr) {
+    return "";
   }
-  char formatted[6];
-  snprintf(formatted, sizeof(formatted), "%02d:%02d", hours, minutes);
-  return String(formatted);
+
+  struct tm timeInfo = {};
+  timeInfo.tm_year = year - 1900;
+  timeInfo.tm_mon = static_cast<int>(monthPtr - MONTHS) / 3;
+  timeInfo.tm_mday = day;
+  timeInfo.tm_hour = hour + 9;
+  timeInfo.tm_min = minute;
+  timeInfo.tm_sec = second;
+  timeInfo.tm_isdst = 0;
+  if (mktime(&timeInfo) == static_cast<time_t>(-1)) {
+    return "";
+  }
+
+  static const char *WEEKDAYS[] = {"일", "월", "화", "수", "목", "금", "토"};
+  char line[64];
+  snprintf(line, sizeof(line), "%04d년 %02d월 %02d일 %s요일 %02d:%02d 수신",
+           timeInfo.tm_year + 1900,
+           timeInfo.tm_mon + 1,
+           timeInfo.tm_mday,
+           WEEKDAYS[timeInfo.tm_wday],
+           timeInfo.tm_hour,
+           timeInfo.tm_min);
+  return String(line);
 }
 
 static bool fetchJsonOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer, int &size) {
@@ -2244,10 +1959,10 @@ static bool fetchJsonOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &bu
 
   MemoryWriteStream jsonStream(buffer.get(), bufferCapacity);
   const int written = http.writeToStream(&jsonStream);
-  const String receiptTime = kstTimeFromHttpDate(http.header("Date"));
+  const String receiptLine = kstHeaderLineFromHttpDate(http.header("Date"));
   http.end();
-  if (receiptTime.length() > 0) {
-    lastFetchReceiptTime = receiptTime;
+  if (receiptLine.length() > 0) {
+    lastFetchHeaderLine = receiptLine;
   }
 
   lastReceivedBytes = static_cast<int>(jsonStream.size());
@@ -2542,10 +2257,11 @@ static void drawNativeHeader(JsonObjectConst root, const String &title, const De
   display.drawLine(0, 28, SCREEN_WIDTH, 28, GxEPD_BLACK);
   drawInvertedText(8, 20, 82, 20, title, 5, TextSize::Tiny);
   drawText(100, 20, String(screenPage + 1) + "/" + String(SCREEN_PAGE_COUNT), 0, TextSize::Tiny);
-  drawText(146, 20, formatIsoDateTimeKst(jsonString(root["generatedAt"])) + " 업데이트", 0, TextSize::Tiny);
-  if (lastFetchReceiptTime.length() > 0) {
-    drawText(536, 20, "수신 " + lastFetchReceiptTime, 0, TextSize::Micro);
-  }
+  const String headerTimeLine =
+      lastFetchHeaderLine.length() > 0
+          ? lastFetchHeaderLine
+          : formatIsoDateTimeKst(jsonString(root["generatedAt"])) + " 수신";
+  drawText(146, 20, headerTimeLine, 0, TextSize::Tiny);
 
   drawWifiSignalIcon(614, 24, telemetry.rssi);
   drawText(652, 20, telemetry.ssid.length() > 0 ? telemetry.ssid.substring(0, 7) : "Wi-Fi", 8, TextSize::Tiny);
@@ -3500,7 +3216,11 @@ void setup() {
   Serial.println();
   Serial.println("ESP32 e-ink dashboard firmware");
   Serial.printf("Display enabled: %s\n", ENABLE_DISPLAY ? "yes" : "no");
-  screenPage = loadSavedScreenPage();
+  const DeviceSettings bootSettings = loadDeviceSettings();
+  screenPage = bootSettings.startPage >= 0 ? bootSettings.startPage : loadSavedScreenPage();
+  if (!pageVisible(bootSettings, screenPage)) {
+    screenPage = nextVisiblePage(bootSettings, screenPage, 1);
+  }
   Serial.printf("Screen page: %d\n", screenPage);
   setupButtons();
   refreshScreen();
@@ -3508,7 +3228,7 @@ void setup() {
 
 void loop() {
   const DeviceSettings settings = loadDeviceSettings();
-  const WaitAction action = sleepOrWait(settings.refreshSeconds);
+  const WaitAction action = sleepOrWait(settings);
   if (action == WaitAction::PageRefresh) {
     const bool partialDisplayRefresh = shouldUsePartialRefreshForScreenTransition();
     refreshScreen(false, partialDisplayRefresh);
