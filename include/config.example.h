@@ -26,6 +26,12 @@
 #define SETTINGS_REFRESH_SECONDS_MIN 300
 #define SETTINGS_REFRESH_SECONDS_MAX 7200
 #define WIFI_SETUP_TIMEOUT_SECONDS 300
+
+// Web Bluetooth setup page shown as QR code on the device settings screen.
+#define SETUP_PAGE_URL "https://your-app.vercel.app/setting"
+// BLE setup mode auto-shutdown (seconds) and PIN retry limit.
+#define BLE_SETUP_TIMEOUT_SECONDS 300
+#define BLE_SETUP_MAX_PIN_ATTEMPTS 3
 #define WIFI_SETUP_MAX_NETWORKS 10
 #define WIFI_BUTTON_PASSWORD_MAX_LENGTH 64
 #define WIFI_BUTTON_SAVE_DOUBLE_PRESS_MS 900

@@ -17,7 +17,9 @@
 #include <Fonts/FreeMono9pt7b.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <GxEPD2_BW.h>
+#include <NimBLEDevice.h>
 #include <U8g2_for_Adafruit_GFX.h>
+#include <qrcode.h>
 
 #include "config.h"
 #include "generated/galmuri_7_bitmap.h"
@@ -112,6 +114,18 @@
 
 #ifndef WIFI_SETUP_MAX_NETWORKS
 #define WIFI_SETUP_MAX_NETWORKS 10
+#endif
+
+#ifndef SETUP_PAGE_URL
+#define SETUP_PAGE_URL "https://eink-display-frontend.vercel.app/setting"
+#endif
+
+#ifndef BLE_SETUP_TIMEOUT_SECONDS
+#define BLE_SETUP_TIMEOUT_SECONDS 300
+#endif
+
+#ifndef BLE_SETUP_MAX_PIN_ATTEMPTS
+#define BLE_SETUP_MAX_PIN_ATTEMPTS 3
 #endif
 
 #ifndef PAGE_FULL_REFRESH_INTERVAL
@@ -261,8 +275,27 @@ private:
   bool overflowed_ = false;
 };
 
+// Server endpoint/token can be overridden at runtime from the BLE setup flow.
+// Falls back to compile-time values when nothing was saved.
+static String deviceEndpointBase() {
+  Preferences preferences;
+  preferences.begin("server", false);
+  const String endpoint =
+      preferences.isKey("endpoint") ? preferences.getString("endpoint", "") : "";
+  preferences.end();
+  return endpoint.length() > 0 ? endpoint : String(DEVICE_ENDPOINT);
+}
+
+static String deviceAuthToken() {
+  Preferences preferences;
+  preferences.begin("server", false);
+  const String token = preferences.isKey("token") ? preferences.getString("token", "") : "";
+  preferences.end();
+  return token.length() > 0 ? token : String(DEVICE_AUTH_TOKEN);
+}
+
 static bool isHttpsEndpoint() {
-  String endpoint = DEVICE_ENDPOINT;
+  String endpoint = deviceEndpointBase();
   endpoint.toLowerCase();
   return endpoint.startsWith("https://");
 }
@@ -491,7 +524,7 @@ static DeviceTelemetry readDeviceTelemetry() {
 }
 
 static String endpointWithTelemetry(const DeviceTelemetry &telemetry) {
-  String endpoint = DEVICE_ENDPOINT;
+  String endpoint = deviceEndpointBase();
   endpoint += endpoint.indexOf('?') >= 0 ? '&' : '?';
   endpoint += "wifi=connected";
   endpoint += "&ssid=" + urlEncode(telemetry.ssid);
@@ -508,7 +541,7 @@ static String endpointWithTelemetry(const DeviceTelemetry &telemetry) {
 }
 
 static String dashboardJsonEndpoint() {
-  String endpoint = DEVICE_ENDPOINT;
+  String endpoint = deviceEndpointBase();
   endpoint.replace("/api/screen.bin", "/api/screen.json");
   endpoint.replace("/api/screen.png", "/api/screen.json");
   return endpoint;
@@ -1222,6 +1255,7 @@ static void drawSettingsScreen(SettingsStage stage,
       drawKorean(28, 174, "좌/우: 메뉴 이동    확인: 들어가기");
       drawSelectionRow(46, 232, SCREEN_WIDTH - 92, "와이파이 설정", menuSelection == 0);
       drawSelectionRow(46, 282, SCREEN_WIDTH - 92, "화면 설정", menuSelection == 1);
+      drawSelectionRow(46, 332, SCREEN_WIDTH - 92, "블루투스 설정 (웹에서 설정)", menuSelection == 2);
     } else if (stage == SettingsStage::NetworkSelect) {
       drawKorean(28, 145, "1. 와이파이 선택");
       drawKorean(28, 174, "좌/우: 목록 이동    확인: 선택");
@@ -1426,6 +1460,300 @@ static String wifiSetupPage(const WifiNetworkEntry *networks, int networkCount, 
   return body;
 }
 
+// ---------------------------------------------------------------------------
+// BLE setup mode (Web Bluetooth)
+//
+// Security model (plan A): the device shows a random 6-digit PIN on the e-ink
+// panel. Every config write must carry that PIN, so only someone who can
+// physically see the screen can change settings. After
+// BLE_SETUP_MAX_PIN_ATTEMPTS wrong PINs or BLE_SETUP_TIMEOUT_SECONDS the mode
+// shuts down. The status characteristic never exposes stored secrets.
+// ---------------------------------------------------------------------------
+
+static const char *BLE_SETUP_SERVICE_UUID = "7b1e0001-9adb-4c9a-8b3f-e1c5a1f3d0aa";
+static const char *BLE_SETUP_CONFIG_UUID = "7b1e0002-9adb-4c9a-8b3f-e1c5a1f3d0aa";
+static const char *BLE_SETUP_STATUS_UUID = "7b1e0003-9adb-4c9a-8b3f-e1c5a1f3d0aa";
+
+struct BleSetupContext {
+  String pin;
+  int pinAttempts = 0;
+  volatile bool saved = false;
+  volatile bool locked = false;
+  volatile bool connected = false;
+  volatile bool dirty = false;
+  String statusLine = "웹에서 연결을 기다리는 중";
+  NimBLECharacteristic *statusCharacteristic = nullptr;
+};
+
+static BleSetupContext *bleSetup = nullptr;
+
+static void bleSetStatus(const String &code, const String &statusLine) {
+  if (bleSetup == nullptr) {
+    return;
+  }
+  bleSetup->statusLine = statusLine;
+  bleSetup->dirty = true;
+  if (bleSetup->statusCharacteristic != nullptr) {
+    bleSetup->statusCharacteristic->setValue(code.c_str());
+    bleSetup->statusCharacteristic->notify();
+  }
+}
+
+static void handleBleConfigWrite(const std::string &payload) {
+  if (bleSetup == nullptr || bleSetup->locked || bleSetup->saved) {
+    return;
+  }
+
+  JsonDocument document;
+  const DeserializationError parseError = deserializeJson(document, payload);
+  if (parseError) {
+    bleSetStatus("error:json", "잘못된 요청을 받았습니다.");
+    return;
+  }
+
+  const String pin = document["pin"] | "";
+  if (pin != bleSetup->pin) {
+    bleSetup->pinAttempts++;
+    if (bleSetup->pinAttempts >= BLE_SETUP_MAX_PIN_ATTEMPTS) {
+      bleSetup->locked = true;
+      bleSetStatus("locked", "PIN 오류가 반복되어 종료합니다.");
+    } else {
+      bleSetStatus("error:pin",
+                   String("PIN이 틀렸습니다. (남은 시도 ") +
+                       String(BLE_SETUP_MAX_PIN_ATTEMPTS - bleSetup->pinAttempts) + "회)");
+    }
+    return;
+  }
+
+  const String ssid = document["ssid"] | "";
+  const String password = document["password"] | "";
+  const String endpoint = document["endpoint"] | "";
+  const String token = document["token"] | "";
+  const long refreshSeconds = document["refreshSec"] | -1L;
+  const long fullRefreshInterval = document["fullEvery"] | -1L;
+
+  if (endpoint.length() > 0 && !endpoint.startsWith("https://") &&
+      !endpoint.startsWith("http://")) {
+    bleSetStatus("error:endpoint", "서버 주소 형식이 잘못되었습니다.");
+    return;
+  }
+
+  bool savedAnything = false;
+  if (ssid.length() > 0) {
+    saveWifiCredentials(ssid, password);
+    savedAnything = true;
+  }
+
+  if (endpoint.length() > 0 || token.length() > 0) {
+    Preferences preferences;
+    preferences.begin("server", false);
+    if (endpoint.length() > 0) {
+      preferences.putString("endpoint", endpoint);
+    }
+    if (token.length() > 0) {
+      preferences.putString("token", token);
+    }
+    preferences.end();
+    savedAnything = true;
+  }
+
+  if (refreshSeconds > 0 || fullRefreshInterval > 0) {
+    DeviceSettings settings = loadDeviceSettings();
+    if (refreshSeconds > 0) {
+      settings.refreshSeconds = clampSetting(static_cast<uint32_t>(refreshSeconds),
+                                             SETTINGS_REFRESH_SECONDS_MIN,
+                                             SETTINGS_REFRESH_SECONDS_MAX);
+    }
+    if (fullRefreshInterval > 0) {
+      settings.fullRefreshInterval =
+          clampSetting(static_cast<uint32_t>(fullRefreshInterval), 2, 20);
+    }
+    saveDeviceSettings(settings);
+    savedAnything = true;
+  }
+
+  if (!savedAnything) {
+    bleSetStatus("error:empty", "저장할 설정이 없습니다.");
+    return;
+  }
+
+  bleSetup->saved = true;
+  bleSetStatus("saved", "저장했습니다. 기기를 다시 시작합니다.");
+  Serial.println("BLE setup: config saved");
+}
+
+class BleConfigCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *characteristic) override {
+    handleBleConfigWrite(characteristic->getValue());
+  }
+};
+
+class BleServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *server) override {
+    if (bleSetup != nullptr) {
+      bleSetup->connected = true;
+      bleSetup->statusLine = "웹과 연결되었습니다. PIN을 입력하세요.";
+      bleSetup->dirty = true;
+    }
+  }
+
+  void onDisconnect(NimBLEServer *server) override {
+    if (bleSetup != nullptr && !bleSetup->saved && !bleSetup->locked) {
+      bleSetup->connected = false;
+      bleSetup->statusLine = "웹에서 연결을 기다리는 중";
+      bleSetup->dirty = true;
+      NimBLEDevice::startAdvertising();
+    }
+  }
+};
+
+static void drawQrCode(int16_t x, int16_t y, const char *text, uint8_t version, int16_t scale) {
+  QRCode qrcode;
+  std::unique_ptr<uint8_t[]> buffer(new (std::nothrow) uint8_t[qrcode_getBufferSize(version)]);
+  if (!buffer) {
+    return;
+  }
+  if (qrcode_initText(&qrcode, buffer.get(), version, ECC_MEDIUM, text) != 0) {
+    return;
+  }
+
+  // Quiet zone.
+  display.fillRect(x - 8, y - 8, qrcode.size * scale + 16, qrcode.size * scale + 16, GxEPD_WHITE);
+  display.drawRect(x - 8, y - 8, qrcode.size * scale + 16, qrcode.size * scale + 16, GxEPD_BLACK);
+  for (uint8_t moduleY = 0; moduleY < qrcode.size; moduleY++) {
+    for (uint8_t moduleX = 0; moduleX < qrcode.size; moduleX++) {
+      if (qrcode_getModule(&qrcode, moduleX, moduleY)) {
+        display.fillRect(x + moduleX * scale, y + moduleY * scale, scale, scale, GxEPD_BLACK);
+      }
+    }
+  }
+}
+
+static void drawBleSetupScreen(const String &deviceName, const String &pin, const String &statusLine) {
+  if (!ENABLE_DISPLAY) {
+    return;
+  }
+
+  display.setRotation(0);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.drawRect(10, 10, SCREEN_WIDTH - 20, SCREEN_HEIGHT - 20, GxEPD_BLACK);
+    display.drawLine(28, 96, SCREEN_WIDTH - 28, 96, GxEPD_BLACK);
+
+    drawKorean(28, 52, "블루투스 설정 모드", TextSize::Large);
+    drawKorean(28, 82, "웹 브라우저에서 기기 설정을 변경할 수 있습니다.", TextSize::Tiny);
+
+    drawKorean(28, 140, String("기기 이름: ") + deviceName);
+    drawKorean(28, 186, "확인 PIN", TextSize::Tiny);
+    drawKorean(28, 226, pin, TextSize::Large);
+
+    drawKorean(28, 282, "1. 오른쪽 QR 코드 또는 아래 주소로 접속", TextSize::Tiny);
+    drawKorean(44, 308, SETUP_PAGE_URL, TextSize::Tiny);
+    drawKorean(28, 336, "2. [기기 연결]을 누르고 목록에서 기기 선택", TextSize::Tiny);
+    drawKorean(28, 362, "3. 화면의 PIN 입력 후 설정 저장", TextSize::Tiny);
+
+    drawKorean(28, 402, "지원: Android/Mac/Windows Chrome (iOS 불가)", TextSize::Tiny);
+    drawKorean(28, 428, String("상태: ") + statusLine, TextSize::Tiny);
+    drawKorean(28, SCREEN_HEIGHT - 26, "취소: 상단 버튼 2개를 길게 누르세요. 5분 후 자동 종료됩니다.", TextSize::Tiny);
+
+    drawQrCode(SCREEN_WIDTH - 236, 128, SETUP_PAGE_URL, 6, 4);
+    drawKorean(SCREEN_WIDTH - 236, 340, "설정 페이지 QR", TextSize::Tiny);
+  } while (display.nextPage());
+}
+
+static void runBleSetupMode() {
+  deviceState = "ble-setup";
+  Serial.println("BLE setup mode start");
+
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  String suffix = WiFi.macAddress();
+  suffix.replace(":", "");
+  const String deviceName = "EINK-SETUP-" + suffix.substring(suffix.length() - 4);
+
+  BleSetupContext context;
+  char pinBuffer[7];
+  snprintf(pinBuffer, sizeof(pinBuffer), "%06lu",
+           static_cast<unsigned long>(esp_random() % 900000UL + 100000UL));
+  context.pin = pinBuffer;
+  bleSetup = &context;
+
+  NimBLEDevice::init(deviceName.c_str());
+  NimBLEServer *server = NimBLEDevice::createServer();
+  static BleServerCallbacks serverCallbacks;
+  static BleConfigCallbacks configCallbacks;
+  server->setCallbacks(&serverCallbacks);
+
+  NimBLEService *service = server->createService(BLE_SETUP_SERVICE_UUID);
+  NimBLECharacteristic *configCharacteristic = service->createCharacteristic(
+      BLE_SETUP_CONFIG_UUID, NIMBLE_PROPERTY::WRITE);
+  configCharacteristic->setCallbacks(&configCallbacks);
+  context.statusCharacteristic = service->createCharacteristic(
+      BLE_SETUP_STATUS_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  context.statusCharacteristic->setValue("ready");
+  service->start();
+
+  NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+  advertising->addServiceUUID(BLE_SETUP_SERVICE_UUID);
+  advertising->setScanResponse(true);
+  NimBLEDevice::startAdvertising();
+  Serial.printf("BLE advertising as %s, PIN %s\n", deviceName.c_str(), context.pin.c_str());
+
+  setupDisplay();
+  drawBleSetupScreen(deviceName, context.pin, context.statusLine);
+
+  buttonManager.reset();
+  bool cancelled = false;
+  const uint32_t startedAt = millis();
+  uint32_t lastRedrawAt = 0;
+  while (!context.saved && !context.locked && !cancelled &&
+         millis() - startedAt < BLE_SETUP_TIMEOUT_SECONDS * 1000UL) {
+    const ButtonEvent buttonEvent = buttonManager.update();
+    if (buttonEvent == ButtonEvent::LeftRightHold) {
+      cancelled = true;
+      buttonManager.waitForAllReleased();
+      break;
+    }
+
+    // Throttle e-ink redraws: refreshing the panel takes seconds.
+    if (context.dirty && millis() - lastRedrawAt > 2500) {
+      context.dirty = false;
+      lastRedrawAt = millis();
+      drawBleSetupScreen(deviceName, context.pin, context.statusLine);
+    }
+
+    delay(BUTTON_SCAN_INTERVAL_MS);
+  }
+
+  if (context.saved) {
+    // Give the web client a moment to read the "saved" notification.
+    drawBleSetupScreen(deviceName, context.pin, context.statusLine);
+    delay(1500);
+    NimBLEDevice::deinit(true);
+    bleSetup = nullptr;
+    ESP.restart();
+    return;
+  }
+
+  NimBLEDevice::deinit(true);
+  bleSetup = nullptr;
+
+  if (context.locked) {
+    Serial.println("BLE setup locked: too many wrong PINs");
+    drawStatus("블루투스 설정", "PIN 오류가 반복되어 종료했습니다.");
+  } else if (cancelled) {
+    Serial.println("BLE setup cancelled by button");
+    drawStatus("블루투스 설정", "취소했습니다. 대시보드로 돌아갑니다.");
+  } else {
+    Serial.println("BLE setup timed out");
+    drawStatus("블루투스 설정", "시간이 초과되었습니다. 대시보드로 돌아갑니다.");
+  }
+}
+
 static void startSettingsPortal() {
   deviceState = "settings";
   lastErrorCode = 0;
@@ -1451,6 +1779,7 @@ static void startSettingsPortal() {
   bool wifiSaved = false;
   bool displaySettingsSaved = false;
   bool exitRequested = false;
+  bool bleRequested = false;
   SettingsStage buttonStage = SettingsStage::Menu;
   String buttonPassword;
   DeviceSettings displaySettings = loadDeviceSettings();
@@ -1542,7 +1871,7 @@ static void startSettingsPortal() {
 
     if (buttonEvent == ButtonEvent::LeftClick) {
       if (buttonStage == SettingsStage::Menu) {
-        menuSelection = (menuSelection + 1) % 2;
+        menuSelection = (menuSelection + 2) % 3;
         Serial.printf("Settings menu selection: %d\n", menuSelection);
       } else if (buttonStage == SettingsStage::NetworkSelect) {
         moveNetworkSelection(-1);
@@ -1564,7 +1893,7 @@ static void startSettingsPortal() {
       uiDirty = true;
     } else if (buttonEvent == ButtonEvent::RightClick) {
       if (buttonStage == SettingsStage::Menu) {
-        menuSelection = (menuSelection + 1) % 2;
+        menuSelection = (menuSelection + 1) % 3;
         Serial.printf("Settings menu selection: %d\n", menuSelection);
       } else if (buttonStage == SettingsStage::NetworkSelect) {
         moveNetworkSelection(1);
@@ -1589,9 +1918,13 @@ static void startSettingsPortal() {
         if (menuSelection == 0) {
           buttonStage = SettingsStage::NetworkSelect;
           Serial.println("Settings menu: Wi-Fi setup");
-        } else {
+        } else if (menuSelection == 1) {
           buttonStage = SettingsStage::DisplaySettings;
           Serial.println("Settings menu: display settings");
+        } else {
+          bleRequested = true;
+          exitRequested = true;
+          Serial.println("Settings menu: BLE setup");
         }
       } else if (buttonStage == SettingsStage::NetworkSelect) {
         if (hasVisibleNetwork() && selectedNetwork < networkCount &&
@@ -1670,6 +2003,11 @@ static void startSettingsPortal() {
   WiFi.softAPdisconnect(true);
   WiFi.scanDelete();
 
+  if (bleRequested) {
+    runBleSetupMode();
+    return;
+  }
+
   if (wifiSaved) {
     drawSettingsScreen(SettingsStage::Saved,
                        apName,
@@ -1729,7 +2067,7 @@ static bool fetchBitmapOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &
     return false;
   }
 
-  http.addHeader("Authorization", String("Bearer ") + DEVICE_AUTH_TOKEN);
+  http.addHeader("Authorization", String("Bearer ") + deviceAuthToken());
   http.setConnectTimeout(DEVICE_HTTP_CONNECT_TIMEOUT_MS);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.setReuse(false);
@@ -1862,7 +2200,7 @@ static bool fetchJsonOnce(const String &endpoint, std::unique_ptr<uint8_t[]> &bu
     return false;
   }
 
-  http.addHeader("Authorization", String("Bearer ") + DEVICE_AUTH_TOKEN);
+  http.addHeader("Authorization", String("Bearer ") + deviceAuthToken());
   static const char *collectedHeaders[] = {"Date"};
   http.collectHeaders(collectedHeaders, 1);
   http.setConnectTimeout(DEVICE_HTTP_CONNECT_TIMEOUT_MS);
