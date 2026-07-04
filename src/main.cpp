@@ -681,6 +681,10 @@ static void setupButtons() {
   pinMode(BUTTON_LEFT_PIN, INPUT_PULLUP);
   pinMode(BUTTON_RIGHT_PIN, INPUT_PULLUP);
   pinMode(BUTTON_REFRESH_PIN, INPUT_PULLUP);
+  Serial.printf("Buttons: left=GPIO%d right=GPIO%d refresh=GPIO%d\n",
+                BUTTON_LEFT_PIN,
+                BUTTON_RIGHT_PIN,
+                BUTTON_REFRESH_PIN);
   buttonManager.begin();
 }
 
@@ -1277,7 +1281,7 @@ static WaitAction sleepOrWait(uint32_t seconds) {
     while (millis() - heartbeatStartedAt < DEBUG_HEARTBEAT_SECONDS * 1000UL) {
       const ButtonEvent buttonEvent = buttonManager.update();
       if (buttonEvent == ButtonEvent::RefreshClick) {
-        Serial.println("Button: refresh");
+        Serial.printf("Button: refresh GPIO%d\n", BUTTON_REFRESH_PIN);
         return WaitAction::ForceRefresh;
       } else if (buttonEvent == ButtonEvent::LeftRightHold) {
         Serial.println("Button: settings chord hold");
@@ -1286,12 +1290,12 @@ static WaitAction sleepOrWait(uint32_t seconds) {
       } else if (buttonEvent == ButtonEvent::LeftClick) {
         screenPage = (screenPage + SCREEN_PAGE_COUNT - 1) % SCREEN_PAGE_COUNT;
         saveScreenPage();
-        Serial.printf("Button: page left -> %d\n", screenPage);
+        Serial.printf("Button: page left GPIO%d -> %d\n", BUTTON_LEFT_PIN, screenPage);
         return WaitAction::PageRefresh;
       } else if (buttonEvent == ButtonEvent::RightClick) {
         screenPage = (screenPage + 1) % SCREEN_PAGE_COUNT;
         saveScreenPage();
-        Serial.printf("Button: page right -> %d\n", screenPage);
+        Serial.printf("Button: page right GPIO%d -> %d\n", BUTTON_RIGHT_PIN, screenPage);
         return WaitAction::PageRefresh;
       }
 

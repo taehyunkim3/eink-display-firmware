@@ -30,11 +30,13 @@
 #define WIFI_BUTTON_PASSWORD_MAX_LENGTH 64
 #define WIFI_BUTTON_SAVE_DOUBLE_PRESS_MS 900
 
-// reTerminal E1001 top buttons from the official schematic.
+// reTerminal E1001 top buttons, named from the front-facing user view.
+// Schematic nets are KEY0=GPIO3, KEY1=GPIO4, KEY2=GPIO5; the front-facing
+// physical order is reversed from the schematic drawing.
 #define ENABLE_BUTTONS true
-#define BUTTON_LEFT_PIN 3
-#define BUTTON_RIGHT_PIN 4
-#define BUTTON_REFRESH_PIN 5
+#define BUTTON_LEFT_PIN 5
+#define BUTTON_RIGHT_PIN 3
+#define BUTTON_REFRESH_PIN 4
 #define BUTTON_DEBOUNCE_MS 30
 // Buttons are scanned as events instead of blocking waits. A short click is
 // emitted when the button is released; left+right hold is emitted only after
