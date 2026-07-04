@@ -713,16 +713,17 @@ public:
       if (bothDownStartedAt_ == 0) {
         bothDownStartedAt_ = now;
       }
-
-      const bool joinedInWindow =
-          absDiff(left_.downAt, right_.downAt) <= WIFI_SETUP_CHORD_GRACE_MS;
-      if (joinedInWindow && !leftRightHoldEmitted_ &&
-          now - bothDownStartedAt_ >= WIFI_SETUP_HOLD_MS) {
+      // No press-stagger constraint: holding both buttons together for the
+      // hold duration always triggers the settings chord.
+      if (!leftRightHoldEmitted_ && now - bothDownStartedAt_ >= WIFI_SETUP_HOLD_MS) {
         leftRightHoldEmitted_ = true;
         event = ButtonEvent::LeftRightHold;
       }
-    } else if (!left_.down && !right_.down) {
-      resetLeftRightAfterEvent = true;
+    } else {
+      bothDownStartedAt_ = 0;
+      if (!left_.down && !right_.down) {
+        resetLeftRightAfterEvent = true;
+      }
     }
 
     if (event == ButtonEvent::None && left_.released && left_.releasedAfter >= BUTTON_CLICK_MIN_MS &&
@@ -1672,6 +1673,11 @@ static void drawSetupGuideScreen(const String &deviceName, const String &pin, co
 
     drawKorean(28, 52, "기기 설정", TextSize::Large);
     drawKorean(28, 82, "설정은 웹 브라우저에서 진행합니다. 이 화면은 안내만 표시합니다.", TextSize::Tiny);
+    {
+      const String versionText = String("펌웨어 v") + FIRMWARE_VERSION;
+      drawKorean(SCREEN_WIDTH - 36 - measureKorean(versionText, TextSize::Tiny), 52,
+                 versionText, TextSize::Tiny);
+    }
 
     drawKorean(28, 132, "방법 1 · 웹 블루투스 — 모든 설정 가능", TextSize::Bold);
     drawKorean(28, 160, "지원: Android/Mac/Windows Chrome (iOS 불가)", TextSize::Tiny);
