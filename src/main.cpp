@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <DNSServer.h>
 #include <driver/rtc_io.h>
+#include <ESPmDNS.h>
 #include <FS.h>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
@@ -160,6 +161,28 @@
 #define MAX_JSON_BYTES 64000
 #endif
 
+#ifndef SCREEN_PAGE_COUNT
+#define SCREEN_PAGE_COUNT 10
+#endif
+
+// Agent status page: shows local Codex/Cursor sessions served by the Mac
+// bridge (eink-frontend/bridge/agent-status-bridge.mjs) over LAN.
+#ifndef AGENT_BRIDGE_ENDPOINT
+#define AGENT_BRIDGE_ENDPOINT ""
+#endif
+
+#ifndef AGENT_POLL_SECONDS
+#define AGENT_POLL_SECONDS 3
+#endif
+
+#ifndef AGENT_FULL_REFRESH_EVERY
+#define AGENT_FULL_REFRESH_EVERY 30
+#endif
+
+#ifndef MAX_AGENT_JSON_BYTES
+#define MAX_AGENT_JSON_BYTES 16000
+#endif
+
 GxEPD2_BW<EPD_MODEL, EPD_MODEL::HEIGHT> display(
     EPD_MODEL(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
 U8G2_FOR_ADAFRUIT_GFX koreanFonts;
@@ -208,6 +231,17 @@ constexpr uint32_t DASHBOARD_CACHE_TTL_MS = 30UL * 60UL * 1000UL;
 RTC_DATA_ATTR static int screenPage = 0;
 RTC_DATA_ATTR static uint32_t pageTransitionRefreshCount = 0;
 
+// The agent status page only exists when SCREEN_PAGE_COUNT covers index 9.
+constexpr int AGENT_PAGE_INDEX = 9;
+// Last agent status JSON fetched from the Mac bridge, plus its stateHash so
+// the live loop repaints only when the bridge reports an actual change.
+static std::unique_ptr<uint8_t[]> cachedAgentJson;
+static int cachedAgentJsonSize = 0;
+static uint32_t cachedAgentJsonAt = 0;
+static String agentStateHash = "";
+static uint32_t agentPartialCount = 0;
+static uint32_t lastAgentPollTickMs = 0;
+
 enum class TextSize {
   Micro,
   Tiny,
@@ -220,6 +254,8 @@ static void setupDisplay();
 static void drawKorean(int16_t x, int16_t y, const String &text, TextSize size = TextSize::Small);
 static String utf8Prefix(const String &value, int maxChars);
 static bool flashFirmwareFromSd(const char *path);
+struct DeviceSettings;
+static void agentLivePollTick(const DeviceSettings &settings);
 
 static void setLastError(int code, const String &detail) {
   lastErrorCode = code;
@@ -255,6 +291,7 @@ struct DeviceSettings {
   int32_t nightStartHour;  // -1 = night mode off
   int32_t nightEndHour;    // KST hour; window may wrap past midnight
   uint32_t otaHours;       // OTA update check interval; 0 = off
+  uint32_t agentPollSeconds;  // bridge poll interval on the agent page
 };
 
 constexpr uint32_t ALL_PAGES_MASK = (1UL << SCREEN_PAGE_COUNT) - 1UL;
@@ -327,6 +364,24 @@ static bool isHttpsEndpoint() {
   return endpoint.startsWith("https://");
 }
 
+// Mac bridge address for the agent status page. Runtime (BLE) value wins,
+// compile-time default is the fallback. Empty = agent page disabled.
+static String agentBridgeEndpoint() {
+  Preferences preferences;
+  preferences.begin("server", false);
+  const String endpoint =
+      preferences.isKey("bridge") ? preferences.getString("bridge", "") : "";
+  preferences.end();
+  return endpoint.length() > 0 ? endpoint : String(AGENT_BRIDGE_ENDPOINT);
+}
+
+static void saveAgentBridgeEndpoint(const String &endpoint) {
+  Preferences preferences;
+  preferences.begin("server", false);
+  preferences.putString("bridge", endpoint);
+  preferences.end();
+}
+
 static String urlEncode(const String &value) {
   String encoded;
   const char *hex = "0123456789ABCDEF";
@@ -370,27 +425,86 @@ static String htmlEscape(const String &value) {
   return escaped;
 }
 
-static String storedWifiSsid() {
+// Up to WIFI_SLOT_COUNT saved networks. Slot 0 is the most recently saved;
+// connectWifi() scans and picks whichever saved network is actually visible.
+// The legacy single "ssid"/"password" keys are kept in sync with slot 0 so
+// older firmware can still read them after a downgrade.
+static const int WIFI_SLOT_COUNT = 5;
+
+struct WifiCredential {
+  String ssid;
+  String password;
+};
+
+static int loadWifiCredentials(WifiCredential *credentials) {
   Preferences preferences;
-  preferences.begin("wifi", false);
-  const String ssid = preferences.isKey("ssid") ? preferences.getString("ssid", "") : "";
+  preferences.begin("wifi", true);
+  int count = 0;
+  for (int slot = 0; slot < WIFI_SLOT_COUNT; slot++) {
+    const String ssidKey = String("ssid") + slot;
+    const String passKey = String("pass") + slot;
+    const String ssid = preferences.isKey(ssidKey.c_str()) ? preferences.getString(ssidKey.c_str(), "") : "";
+    if (ssid.length() == 0) {
+      continue;
+    }
+    credentials[count].ssid = ssid;
+    credentials[count].password =
+        preferences.isKey(passKey.c_str()) ? preferences.getString(passKey.c_str(), "") : "";
+    count++;
+  }
+  if (count == 0 && preferences.isKey("ssid")) {
+    const String legacySsid = preferences.getString("ssid", "");
+    if (legacySsid.length() > 0) {
+      credentials[0].ssid = legacySsid;
+      credentials[0].password = preferences.isKey("password") ? preferences.getString("password", "") : "";
+      count = 1;
+    }
+  }
   preferences.end();
-  return ssid;
+  return count;
+}
+
+static String storedWifiSsid() {
+  WifiCredential credentials[WIFI_SLOT_COUNT];
+  return loadWifiCredentials(credentials) > 0 ? credentials[0].ssid : String("");
 }
 
 static String storedWifiPassword() {
-  Preferences preferences;
-  preferences.begin("wifi", false);
-  const String password = preferences.isKey("password") ? preferences.getString("password", "") : "";
-  preferences.end();
-  return password;
+  WifiCredential credentials[WIFI_SLOT_COUNT];
+  return loadWifiCredentials(credentials) > 0 ? credentials[0].password : String("");
 }
 
+// Upserts the network into slot 0 and shifts the rest down (dedup by SSID).
 static void saveWifiCredentials(const String &ssid, const String &password) {
+  WifiCredential existing[WIFI_SLOT_COUNT];
+  const int existingCount = loadWifiCredentials(existing);
+
+  WifiCredential updated[WIFI_SLOT_COUNT];
+  updated[0].ssid = ssid;
+  updated[0].password = password;
+  int count = 1;
+  for (int i = 0; i < existingCount && count < WIFI_SLOT_COUNT; i++) {
+    if (existing[i].ssid == ssid) {
+      continue;
+    }
+    updated[count++] = existing[i];
+  }
+
   Preferences preferences;
   preferences.begin("wifi", false);
-  preferences.putString("ssid", ssid);
-  preferences.putString("password", password);
+  for (int slot = 0; slot < WIFI_SLOT_COUNT; slot++) {
+    const String ssidKey = String("ssid") + slot;
+    const String passKey = String("pass") + slot;
+    if (slot < count) {
+      preferences.putString(ssidKey.c_str(), updated[slot].ssid);
+      preferences.putString(passKey.c_str(), updated[slot].password);
+    } else {
+      preferences.remove(ssidKey.c_str());
+      preferences.remove(passKey.c_str());
+    }
+  }
+  preferences.putString("ssid", updated[0].ssid);
+  preferences.putString("password", updated[0].password);
   preferences.end();
 }
 
@@ -415,6 +529,7 @@ static DeviceSettings defaultDeviceSettings() {
       -1,
       6,
       24,
+      clampSetting(AGENT_POLL_SECONDS, 2, 60),
   };
 }
 
@@ -449,6 +564,8 @@ static DeviceSettings sanitizeDeviceSettings(DeviceSettings settings) {
   if (settings.otaHours > 0) {
     settings.otaHours = clampSetting(settings.otaHours, 1, 720);
   }
+  settings.agentPollSeconds = clampSetting(
+      settings.agentPollSeconds > 0 ? settings.agentPollSeconds : defaults.agentPollSeconds, 2, 60);
   return settings;
 }
 
@@ -466,6 +583,7 @@ static DeviceSettings loadDeviceSettings() {
       preferences.getInt("nightStart", defaults.nightStartHour),
       preferences.getInt("nightEnd", defaults.nightEndHour),
       preferences.getUInt("otaHours", defaults.otaHours),
+      preferences.getUInt("agentPoll", defaults.agentPollSeconds),
   };
   preferences.end();
   return sanitizeDeviceSettings(settings);
@@ -484,6 +602,7 @@ static void saveDeviceSettings(const DeviceSettings &rawSettings) {
   preferences.putInt("nightStart", settings.nightStartHour);
   preferences.putInt("nightEnd", settings.nightEndHour);
   preferences.putUInt("otaHours", settings.otaHours);
+  preferences.putUInt("agentPoll", settings.agentPollSeconds);
   preferences.end();
 }
 
@@ -1347,6 +1466,10 @@ static WaitAction sleepOrWait(const DeviceSettings &settings) {
         return WaitAction::PageRefresh;
       }
 
+      // Live agent status: poll the Mac bridge and partial-refresh the agent
+      // page while it is on screen (self-throttled, no-op on other pages).
+      agentLivePollTick(settings);
+
       delay(BUTTON_SCAN_INTERVAL_MS);
     }
   }
@@ -1355,36 +1478,104 @@ static WaitAction sleepOrWait(const DeviceSettings &settings) {
   return WaitAction::ForceRefresh;
 }
 
+static bool tryConnectWifi(const String &ssid, const String &password, uint32_t timeoutMs) {
+  Serial.printf("Connecting Wi-Fi: %s", ssid.c_str());
+  WiFi.begin(ssid.c_str(), password.c_str());
+  const uint32_t startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < timeoutMs) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  return WiFi.status() == WL_CONNECTED;
+}
+
 static bool connectWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.disconnect(false, false);
   delay(200);
 
-  const String savedSsid = storedWifiSsid();
-  const String savedPassword = storedWifiPassword();
-  const String ssid = savedSsid.length() > 0 ? savedSsid : String(WIFI_SSID);
-  const String password = savedSsid.length() > 0 ? savedPassword : String(WIFI_PASSWORD);
-
-  Serial.printf("Connecting Wi-Fi: %s", ssid.c_str());
-  WiFi.begin(ssid.c_str(), password.c_str());
-  const uint32_t startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 20000) {
-    Serial.print(".");
-    delay(500);
+  // Candidates: saved networks (most recently saved first) plus the
+  // compile-time default from config.h.
+  WifiCredential candidates[WIFI_SLOT_COUNT + 1];
+  int candidateCount = loadWifiCredentials(candidates);
+  if (String(WIFI_SSID).length() > 0) {
+    bool duplicate = false;
+    for (int i = 0; i < candidateCount; i++) {
+      if (candidates[i].ssid == WIFI_SSID) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (!duplicate) {
+      candidates[candidateCount].ssid = WIFI_SSID;
+      candidates[candidateCount].password = WIFI_PASSWORD;
+      candidateCount++;
+    }
   }
-  Serial.println();
-
-  if (WiFi.status() != WL_CONNECTED) {
-    setLastError(static_cast<int>(WiFi.status()), String("Wi-Fi 연결 실패\nSSID: ") + ssid);
-    Serial.println("Wi-Fi connection failed");
+  if (candidateCount == 0) {
+    setLastError(1, "저장된 Wi-Fi가 없습니다");
+    Serial.println("Wi-Fi connection failed: no credentials");
     return false;
   }
 
-  setLastError(0, "");
-  Serial.print("Wi-Fi connected. IP: ");
-  Serial.println(WiFi.localIP());
-  return true;
+  // With multiple candidates, scan once and try only networks that are in
+  // range, strongest signal first (scan results come sorted by RSSI).
+  int order[WIFI_SLOT_COUNT + 1];
+  int orderCount = 0;
+  if (candidateCount > 1) {
+    Serial.println("Scanning for saved Wi-Fi networks");
+    const int found = WiFi.scanNetworks();
+    for (int n = 0; n < found && orderCount < candidateCount; n++) {
+      const String scanned = WiFi.SSID(n);
+      for (int i = 0; i < candidateCount; i++) {
+        if (candidates[i].ssid != scanned) {
+          continue;
+        }
+        bool already = false;
+        for (int k = 0; k < orderCount; k++) {
+          if (order[k] == i) {
+            already = true;
+            break;
+          }
+        }
+        if (!already) {
+          order[orderCount++] = i;
+        }
+      }
+    }
+    WiFi.scanDelete();
+  }
+  if (orderCount == 0) {
+    // Single candidate, scan found nothing (hidden SSID), or scan failed:
+    // fall back to trying every candidate in saved order.
+    for (int i = 0; i < candidateCount; i++) {
+      order[orderCount++] = i;
+    }
+  }
+
+  for (int k = 0; k < orderCount; k++) {
+    const WifiCredential &credential = candidates[order[k]];
+    if (tryConnectWifi(credential.ssid, credential.password, k == 0 ? 20000 : 15000)) {
+      setLastError(0, "");
+      Serial.print("Wi-Fi connected. IP: ");
+      Serial.println(WiFi.localIP());
+      // mDNS responder is needed for MDNS.queryHost() (resolving the Mac
+      // bridge's <hostname>.local, whose DHCP IP changes over time).
+      if (MDNS.begin("eink-display")) {
+        Serial.println("mDNS started: eink-display.local");
+      }
+      return true;
+    }
+    WiFi.disconnect(false, false);
+    delay(200);
+  }
+
+  setLastError(static_cast<int>(WiFi.status()),
+               String("Wi-Fi 연결 실패\nSSID: ") + candidates[order[0]].ssid);
+  Serial.println("Wi-Fi connection failed");
+  return false;
 }
 
 static String wifiSetupPage(const WifiNetworkEntry *networks, int networkCount, bool saved) {
@@ -1498,6 +1689,14 @@ static void handleBleConfigWrite(const std::string &payload) {
     JsonObject config = response["config"].to<JsonObject>();
     const String storedSsid = storedWifiSsid();
     config["ssid"] = storedSsid.length() > 0 ? storedSsid : String(WIFI_SSID);
+    {
+      WifiCredential credentials[WIFI_SLOT_COUNT];
+      const int wifiCount = loadWifiCredentials(credentials);
+      JsonArray wifiList = config["wifiList"].to<JsonArray>();
+      for (int i = 0; i < wifiCount; i++) {
+        wifiList.add(credentials[i].ssid);
+      }
+    }
     config["endpoint"] = deviceEndpointBase();
     config["refreshSec"] = settings.refreshSeconds;
     config["fullEvery"] = settings.fullRefreshInterval;
@@ -1508,6 +1707,8 @@ static void handleBleConfigWrite(const std::string &payload) {
     config["nightStart"] = settings.nightStartHour;
     config["nightEnd"] = settings.nightEndHour;
     config["otaHours"] = settings.otaHours;
+    config["bridge"] = agentBridgeEndpoint();
+    config["agentPollSec"] = settings.agentPollSeconds;
     config["fwVersion"] = FIRMWARE_VERSION;
     config["pageCount"] = SCREEN_PAGE_COUNT;
     String serialized;
@@ -1529,6 +1730,14 @@ static void handleBleConfigWrite(const std::string &payload) {
     return;
   }
 
+  const bool hasBridgeKey = !document["bridge"].isNull();
+  const String bridge = document["bridge"] | "";
+  if (hasBridgeKey && bridge.length() > 0 && !bridge.startsWith("https://") &&
+      !bridge.startsWith("http://")) {
+    bleSetStatus("error:endpoint", "브리지 주소 형식이 잘못되었습니다.");
+    return;
+  }
+
   bool savedAnything = false;
   if (ssid.length() > 0) {
     saveWifiCredentials(ssid, password);
@@ -1545,6 +1754,12 @@ static void handleBleConfigWrite(const std::string &payload) {
       preferences.putString("token", token);
     }
     preferences.end();
+    savedAnything = true;
+  }
+
+  if (hasBridgeKey) {
+    // Empty string is a valid write: it clears the runtime override.
+    saveAgentBridgeEndpoint(bridge);
     savedAnything = true;
   }
 
@@ -1594,6 +1809,12 @@ static void handleBleConfigWrite(const std::string &payload) {
   }
   if (!document["otaHours"].isNull()) {
     settings.otaHours = document["otaHours"] | 24;
+    settingsChanged = true;
+  }
+  if (!document["agentPollSec"].isNull()) {
+    const long agentPollSeconds = document["agentPollSec"] | 3L;
+    settings.agentPollSeconds =
+        clampSetting(static_cast<uint32_t>(agentPollSeconds > 0 ? agentPollSeconds : 3), 2, 60);
     settingsChanged = true;
   }
   if (settingsChanged) {
@@ -2263,6 +2484,121 @@ static bool fetchJson(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer
   }
 
   return false;
+}
+
+// The Mac's DHCP IP changes over time, so the bridge endpoint should use a
+// Bonjour name like http://my-mac.local:8788/... . Regular DNS cannot resolve
+// .local names, so we resolve them via mDNS ourselves and substitute the IP.
+// The result is cached; a fetch failure invalidates it so the next attempt
+// re-resolves (e.g. after the Mac gets a new lease).
+static String mdnsResolvedHost;
+static String mdnsResolvedIp;
+
+static String resolveEndpointHost(const String &endpoint) {
+  const int schemeEnd = endpoint.indexOf("://");
+  if (schemeEnd < 0) {
+    return endpoint;
+  }
+  const int hostStart = schemeEnd + 3;
+  int hostEnd = hostStart;
+  while (hostEnd < static_cast<int>(endpoint.length()) &&
+         endpoint[hostEnd] != ':' && endpoint[hostEnd] != '/') {
+    hostEnd++;
+  }
+  String host = endpoint.substring(hostStart, hostEnd);
+  if (!host.endsWith(".local")) {
+    return endpoint;
+  }
+
+  const String bareName = host.substring(0, host.length() - 6);
+  if (mdnsResolvedHost != host || mdnsResolvedIp.length() == 0) {
+    const IPAddress resolved = MDNS.queryHost(bareName.c_str(), 2000);
+    if (resolved == IPAddress()) {
+      Serial.printf("mDNS lookup failed for %s\n", host.c_str());
+      return "";
+    }
+    mdnsResolvedHost = host;
+    mdnsResolvedIp = resolved.toString();
+    Serial.printf("mDNS resolved %s -> %s\n", host.c_str(), mdnsResolvedIp.c_str());
+  }
+  return endpoint.substring(0, hostStart) + mdnsResolvedIp + endpoint.substring(hostEnd);
+}
+
+// Polls the Mac agent bridge. Short timeouts: this runs inside the button
+// wait loop, so a dead bridge must not freeze the UI for long.
+static bool fetchAgentStatusOnce() {
+  const String configuredEndpoint = agentBridgeEndpoint();
+  if (configuredEndpoint.length() == 0 || WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+  const String endpoint = resolveEndpointHost(configuredEndpoint);
+  if (endpoint.length() == 0) {
+    return false;
+  }
+
+  WiFiClient plainClient;
+  WiFiClientSecure secureClient;
+  const bool https = endpoint.startsWith("https://");
+  if (https) {
+    secureClient.setInsecure();
+  }
+  WiFiClient &client = https ? static_cast<WiFiClient &>(secureClient)
+                             : static_cast<WiFiClient &>(plainClient);
+
+  HTTPClient http;
+  http.setConnectTimeout(3000);
+  http.setTimeout(4000);
+  http.setReuse(false);
+  if (!http.begin(client, endpoint)) {
+    return false;
+  }
+  http.addHeader("Authorization", String("Bearer ") + deviceAuthToken());
+
+  const int statusCode = http.GET();
+  if (statusCode != HTTP_CODE_OK) {
+    // Stale cached IP (Mac picked up a new DHCP lease) also lands here.
+    mdnsResolvedIp = "";
+    http.end();
+    return false;
+  }
+
+  const int contentLength = http.getSize();
+  if (contentLength > MAX_AGENT_JSON_BYTES) {
+    http.end();
+    return false;
+  }
+
+  const int capacity = contentLength > 0 ? contentLength : MAX_AGENT_JSON_BYTES;
+  std::unique_ptr<uint8_t[]> buffer(new (std::nothrow) uint8_t[capacity]);
+  if (!buffer) {
+    http.end();
+    return false;
+  }
+
+  MemoryWriteStream stream(buffer.get(), capacity);
+  const int written = http.writeToStream(&stream);
+  http.end();
+  if (written <= 0 || stream.overflowed() || stream.size() == 0) {
+    return false;
+  }
+
+  cachedAgentJson = std::move(buffer);
+  cachedAgentJsonSize = static_cast<int>(stream.size());
+  cachedAgentJsonAt = millis();
+  return true;
+}
+
+static String parseAgentStateHash() {
+  if (!cachedAgentJson || cachedAgentJsonSize <= 0) {
+    return "";
+  }
+  JsonDocument document;
+  if (deserializeJson(document,
+                      reinterpret_cast<const char *>(cachedAgentJson.get()),
+                      static_cast<size_t>(cachedAgentJsonSize))) {
+    return "";
+  }
+  return String(document["stateHash"] | "");
 }
 
 static bool renderBitmap(const uint8_t *buffer, int size, bool partialRefresh) {
@@ -3488,10 +3824,163 @@ static void drawNewsPage(JsonObjectConst root) {
   }
 }
 
-static bool renderDashboard(JsonObjectConst root, const DeviceTelemetry &telemetry, bool partialRefresh) {
+// ---- Agent status page ---------------------------------------------------
+// Shows local Codex/Cursor agent sessions from the Mac bridge. While this
+// page is visible (and deep sleep is off) the wait loop polls the bridge and
+// repaints just the content area with a partial refresh when state changes.
+
+static void drawAgentStatusBadge(int16_t x, int16_t baseline, const String &status, const String &label) {
+  // "waiting" = the agent asked a question and is blocked on the user, so
+  // it gets the same attention-grabbing inverted badge as a running agent.
+  if (status == "active" || status == "waiting") {
+    drawInvertedText(x, baseline, 66, 22, label, 3, TextSize::Small);
+    return;
+  }
+  display.drawRect(x, baseline - 17, 66, 22, GxEPD_BLACK);
+  const int16_t textWidth = measureKorean(label, TextSize::Small);
+  drawKorean(x + max(3, (66 - textWidth) / 2), baseline, label, TextSize::Small);
+}
+
+// Status glyph drawn in the empty space under the badge (left column of an
+// agent session row). cx/cy is the icon center.
+static void drawAgentStatusIcon(int16_t cx, int16_t cy, const String &status) {
+  if (status == "active") {
+    // Play triangle.
+    display.fillTriangle(cx - 9, cy - 12, cx - 9, cy + 12, cx + 13, cy, GxEPD_BLACK);
+  } else if (status == "waiting") {
+    // Circled question mark.
+    display.drawCircle(cx, cy, 15, GxEPD_BLACK);
+    display.drawCircle(cx, cy, 14, GxEPD_BLACK);
+    const String mark = "?";
+    const int16_t markWidth = measureKorean(mark, TextSize::Bold);
+    drawKorean(cx - markWidth / 2, cy + 7, mark, TextSize::Bold);
+  } else if (status == "recent") {
+    // Clock face. Idle (finished) sessions draw nothing.
+    display.drawCircle(cx, cy, 13, GxEPD_BLACK);
+    display.drawLine(cx, cy, cx, cy - 8, GxEPD_BLACK);
+    display.drawLine(cx, cy, cx + 6, cy + 2, GxEPD_BLACK);
+  }
+}
+
+static void drawAgentPageContent() {
+  // Partial repaints clip to the content window; redraw the screen border so
+  // the side/bottom frame lines survive.
+  display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, GxEPD_BLACK);
+
+  const String endpoint = agentBridgeEndpoint();
+  if (endpoint.length() == 0) {
+    drawText(24, 90, "에이전트 브리지가 설정되지 않았어요", 0, TextSize::Large);
+    drawText(24, 140, "1. Mac에서 eink-frontend 폴더의 npm run bridge 실행", 0, TextSize::Small);
+    drawText(24, 170, "2. 설정 페이지(블루투스)에서 브리지 주소 저장", 0, TextSize::Small);
+    drawText(24, 200, "예: http://<Mac-IP>:8788/agent-status.json", 0, TextSize::Small);
+    return;
+  }
+
+  JsonDocument document;
+  bool parsed = false;
+  if (cachedAgentJson && cachedAgentJsonSize > 0) {
+    parsed = deserializeJson(document,
+                             reinterpret_cast<const char *>(cachedAgentJson.get()),
+                             static_cast<size_t>(cachedAgentJsonSize)) == DeserializationError::Ok;
+  }
+  if (!parsed) {
+    drawText(24, 90, "브리지 응답 대기 중...", 0, TextSize::Large);
+    drawText(24, 140, endpoint, 64, TextSize::Small);
+    drawText(24, 170, "Mac에서 브리지 서버가 실행 중인지 확인하세요.", 0, TextSize::Small);
+    return;
+  }
+
+  JsonObjectConst root = document.as<JsonObjectConst>();
+  JsonObjectConst summary = root["summary"];
+  JsonArrayConst sessions = root["sessions"].as<JsonArrayConst>();
+  JsonObjectConst tokens = root["tokens"];
+
+  // Summary strip.
+  const int activeCount = summary["activeCount"] | 0;
+  const int codexActive = summary["codexActive"] | 0;
+  const int cursorActive = summary["cursorActive"] | 0;
+  String headline = String("진행중 ") + String(activeCount);
+  headline += "  CODEX " + String(codexActive);
+  headline += " · CURSOR " + String(cursorActive);
+  drawInvertedText(12, 60, 66, 22, "상태", 4, TextSize::Small);
+  drawText(92, 60, headline, 0, TextSize::Bold);
+
+  if (!tokens["primaryLeftPercent"].isNull()) {
+    String tokenLine = String("토큰 5h ") + String(static_cast<int>(tokens["primaryLeftPercent"] | 0)) + "%";
+    if (!tokens["secondaryLeftPercent"].isNull()) {
+      tokenLine += " · 7d " + String(static_cast<int>(tokens["secondaryLeftPercent"] | 0)) + "%";
+    }
+    const int16_t tokenWidth = measureKorean(tokenLine, TextSize::Small);
+    drawText(SCREEN_WIDTH - 16 - tokenWidth, 60, tokenLine, 0, TextSize::Small);
+  }
+  display.drawLine(12, 72, SCREEN_WIDTH - 12, 72, GxEPD_BLACK);
+
+  if (sessions.isNull() || sessions.size() == 0) {
+    drawText(24, 120, "표시할 에이전트 세션이 없어요", 0, TextSize::Bold);
+  }
+
+  // Session rows: 4 x 96px — line 1 project/provider/age, line 2 title,
+  // then the latest conversation message in 3 tightly-spaced Micro lines.
+  int16_t y = 78;
+  int rowCount = 0;
+  for (JsonObjectConst session : sessions) {
+    if (rowCount >= 4) {
+      break;
+    }
+    const String status = jsonString(session["status"], "idle");
+    const String statusLabel = jsonString(session["statusLabel"], "대기");
+    const String provider = jsonString(session["provider"]) == "cursor" ? "CURSOR" : "CODEX";
+    const String age = jsonString(session["age"]);
+
+    drawAgentStatusBadge(16, y + 20, status, statusLabel);
+    drawAgentStatusIcon(49, y + 58, status);
+    drawText(94, y + 20, jsonString(session["project"]), 24, TextSize::Bold);
+    // Faux bold: the bitmap fonts have no bold weight at this size, so
+    // overstrike with a 1px horizontal offset.
+    drawText(640, y + 18, provider, 0, TextSize::Tiny);
+    drawText(641, y + 18, provider, 0, TextSize::Tiny);
+    if (age.length() > 0) {
+      const String ageLine = age + " 전";
+      const int16_t ageWidth = measureKorean(ageLine, TextSize::Tiny);
+      drawText(SCREEN_WIDTH - 16 - ageWidth, y + 18, ageLine, 0, TextSize::Tiny);
+    }
+
+    drawText(94, y + 40, jsonString(session["title"]), 56, TextSize::Small);
+
+    String remaining = jsonString(session["message"]);
+    const int lineChars = 66;
+    int16_t lineY = y + 54;
+    for (int line = 0; line < 3 && remaining.length() > 0; line++) {
+      const String lineText = utf8Prefix(remaining, lineChars);
+      drawText(94, lineY, lineText, 0, TextSize::Tiny);
+      remaining = remaining.substring(lineText.length());
+      lineY += 14;
+    }
+    // No separator under the last row: it would collide with the footer.
+    if (rowCount < 3) {
+      display.drawFastHLine(12, y + 94, SCREEN_WIDTH - 24, GxEPD_BLACK);
+    }
+
+    y += 96;
+    rowCount++;
+  }
+
+  // Footer.
+  const String clock = jsonString(root["clock"]);
+  if (clock.length() > 0) {
+    drawText(16, SCREEN_HEIGHT - 12, clock + " 업데이트", 0, TextSize::Tiny);
+  }
+  const String footerRight = "브리지 라이브";
+  const int16_t footerWidth = measureKorean(footerRight, TextSize::Tiny);
+  drawText(SCREEN_WIDTH - 16 - footerWidth, SCREEN_HEIGHT - 12, footerRight, 0, TextSize::Tiny);
+}
+
+// Repaints the agent page. Partial mode touches only the area below the
+// header so the panel skips the black/white full-refresh flash.
+static void renderAgentScreen(bool partialRefresh) {
   display.setRotation(0);
   if (partialRefresh) {
-    display.setPartialWindow(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    display.setPartialWindow(0, 30, SCREEN_WIDTH, SCREEN_HEIGHT - 30);
   } else {
     display.setFullWindow();
   }
@@ -3500,8 +3989,79 @@ static bool renderDashboard(JsonObjectConst root, const DeviceTelemetry &telemet
   do {
     display.fillScreen(GxEPD_WHITE);
     display.setTextColor(GxEPD_BLACK);
+    if (!partialRefresh) {
+      JsonDocument empty;
+      const DeviceTelemetry telemetry = readDeviceTelemetry();
+      drawNativeHeader(empty.to<JsonObject>(), "에이전트", telemetry);
+    }
+    drawAgentPageContent();
+  } while (display.nextPage());
+}
 
-    const int page = ((screenPage % SCREEN_PAGE_COUNT) + SCREEN_PAGE_COUNT) % SCREEN_PAGE_COUNT;
+// Called from the wait loop. Self-throttles to settings.agentPollSeconds and
+// repaints only when the bridge's stateHash moved.
+static void agentLivePollTick(const DeviceSettings &settings) {
+  if (!ENABLE_DISPLAY || settings.deepSleep || SCREEN_PAGE_COUNT <= AGENT_PAGE_INDEX) {
+    return;
+  }
+  const int page = ((screenPage % SCREEN_PAGE_COUNT) + SCREEN_PAGE_COUNT) % SCREEN_PAGE_COUNT;
+  if (page != AGENT_PAGE_INDEX || agentBridgeEndpoint().length() == 0) {
+    return;
+  }
+  if (nightSecondsRemaining(settings) > 0) {
+    return;
+  }
+  const uint32_t intervalMs = settings.agentPollSeconds * 1000UL;
+  if (lastAgentPollTickMs != 0 && millis() - lastAgentPollTickMs < intervalMs) {
+    return;
+  }
+  lastAgentPollTickMs = millis();
+
+  if (WiFi.status() != WL_CONNECTED || !fetchAgentStatusOnce()) {
+    return;
+  }
+
+  const String stateHash = parseAgentStateHash();
+  if (stateHash.length() > 0 && stateHash == agentStateHash) {
+    return;
+  }
+  agentStateHash = stateHash;
+
+  agentPartialCount++;
+  if (agentPartialCount >= AGENT_FULL_REFRESH_EVERY) {
+    agentPartialCount = 0;
+    renderAgentScreen(false);
+  } else {
+    renderAgentScreen(true);
+  }
+}
+
+static bool renderDashboard(JsonObjectConst root, const DeviceTelemetry &telemetry, bool partialRefresh) {
+  display.setRotation(0);
+  if (partialRefresh) {
+    display.setPartialWindow(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+  } else {
+    display.setFullWindow();
+  }
+
+  const int currentPage = ((screenPage % SCREEN_PAGE_COUNT) + SCREEN_PAGE_COUNT) % SCREEN_PAGE_COUNT;
+  if (currentPage == AGENT_PAGE_INDEX) {
+    // Landing on the agent page: get fresh bridge data so the first paint is
+    // already live instead of waiting for the next poll tick.
+    if (millis() - cachedAgentJsonAt > 5000UL || !cachedAgentJson) {
+      fetchAgentStatusOnce();
+    }
+    agentStateHash = parseAgentStateHash();
+    lastAgentPollTickMs = millis();
+    agentPartialCount = 0;
+  }
+
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+
+    const int page = currentPage;
     if (page == 0) {
       drawNativeHeader(root, "요약", telemetry);
       drawOverviewPage(root);
@@ -3529,6 +4089,9 @@ static bool renderDashboard(JsonObjectConst root, const DeviceTelemetry &telemet
     } else if (page == 8) {
       drawNativeHeader(root, "뉴스", telemetry);
       drawNewsPage(root);
+    } else if (page == AGENT_PAGE_INDEX) {
+      drawNativeHeader(root, "에이전트", telemetry);
+      drawAgentPageContent();
     }
   } while (display.nextPage());
 

@@ -19,13 +19,25 @@
 #define FALLBACK_SLEEP_SECONDS 1800
 #define BOOT_TEST_SECONDS 0
 #define DEBUG_HEARTBEAT_SECONDS 5
-#define SCREEN_PAGE_COUNT 9
+#define SCREEN_PAGE_COUNT 10
 // Device setting defaults. Users can change these from the on-device settings
 // menu; saved values are stored in ESP32 Preferences.
 #define PAGE_FULL_REFRESH_INTERVAL 5
 #define SETTINGS_REFRESH_SECONDS_MIN 300
 #define SETTINGS_REFRESH_SECONDS_MAX 7200
 #define WIFI_SETUP_TIMEOUT_SECONDS 300
+
+// Agent status page (last page). The Mac bridge serves local Codex/Cursor
+// session status over LAN: run `npm run bridge` inside eink-frontend.
+// The address can also be set at runtime from the BLE settings page.
+// Prefer a Bonjour name (find it with `scutil --get LocalHostName` on the
+// Mac): it survives DHCP IP changes because the firmware resolves it via
+// mDNS. Example: "http://my-macbook.local:8788/agent-status.json"
+#define AGENT_BRIDGE_ENDPOINT ""
+// How often the device polls the bridge while the agent page is visible.
+#define AGENT_POLL_SECONDS 3
+// Run a full (ghost-clearing) refresh after this many partial updates.
+#define AGENT_FULL_REFRESH_EVERY 30
 
 // Web Bluetooth setup page shown as QR code on the device settings screen.
 #define SETUP_PAGE_URL "https://your-app.vercel.app/setting"
