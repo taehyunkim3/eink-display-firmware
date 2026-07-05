@@ -3906,12 +3906,12 @@ static void drawAgentPageContent() {
   drawText(92, 60, headline, 0, TextSize::Bold);
 
   if (!tokens["primaryLeftPercent"].isNull()) {
-    String tokenLine = String("토큰 5h ") + String(static_cast<int>(tokens["primaryLeftPercent"] | 0)) + "%";
+    String tokenLine = String("CODEX 토큰 5h ") + String(static_cast<int>(tokens["primaryLeftPercent"] | 0)) + "%";
     if (!tokens["secondaryLeftPercent"].isNull()) {
       tokenLine += " · 7d " + String(static_cast<int>(tokens["secondaryLeftPercent"] | 0)) + "%";
     }
-    const int16_t tokenWidth = measureKorean(tokenLine, TextSize::Small);
-    drawText(SCREEN_WIDTH - 16 - tokenWidth, 60, tokenLine, 0, TextSize::Small);
+    const int16_t tokenWidth = measureKorean(tokenLine, TextSize::Tiny);
+    drawText(SCREEN_WIDTH - 16 - tokenWidth, 60, tokenLine, 0, TextSize::Tiny);
   }
   display.drawLine(12, 72, SCREEN_WIDTH - 12, 72, GxEPD_BLACK);
 
