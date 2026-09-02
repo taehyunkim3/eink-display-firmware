@@ -2713,10 +2713,17 @@ static void drawSnackVotePage(JsonObjectConst root, const DeviceTelemetry &telem
   drawText(LEFT_MARGIN, headerY, "상품", 0, TextSize::Tiny);
   drawText(LEFT_MARGIN + LEFT_WIDTH - 34, headerY, "득표", 0, TextSize::Tiny);
 
+  // items는 득표수 내림차순으로 온다. 0표는 화면에서 숨기므로 앞에서부터
+  // 0표를 만나는 지점까지만 득표한 상품이다.
   JsonArrayConst items = root["items"].as<JsonArrayConst>();
   constexpr int MAX_ITEM_ROWS = 15;
-  const int itemCount = static_cast<int>(items.size());
-  const int visibleItemCount = min(itemCount, itemCount > MAX_ITEM_ROWS ? MAX_ITEM_ROWS - 1 : MAX_ITEM_ROWS);
+  int votedItemCount = 0;
+  while (votedItemCount < static_cast<int>(items.size()) &&
+         (items[votedItemCount]["voteCount"] | 0) > 0) {
+    votedItemCount++;
+  }
+  const int visibleItemCount =
+      min(votedItemCount, votedItemCount > MAX_ITEM_ROWS ? MAX_ITEM_ROWS - 1 : MAX_ITEM_ROWS);
   int16_t itemY = itemsStartY;
   for (int i = 0; i < visibleItemCount; i++) {
     JsonObjectConst item = items[i];
@@ -2729,10 +2736,14 @@ static void drawSnackVotePage(JsonObjectConst root, const DeviceTelemetry &telem
              TextSize::Bold);
     itemY += ROW_PITCH;
   }
-  if (visibleItemCount < itemCount) {
-    drawText(LEFT_MARGIN, itemY, "외 " + String(itemCount - visibleItemCount) + "개", 0, TextSize::Tiny);
-  } else if (itemCount == 0) {
-    drawText(LEFT_MARGIN, itemY, "등록된 상품 없음", 0, TextSize::Small);
+  if (visibleItemCount < votedItemCount) {
+    drawText(LEFT_MARGIN,
+             itemY,
+             "외 " + String(votedItemCount - visibleItemCount) + "개 더 있음 · QR로 전체 확인",
+             0,
+             TextSize::Tiny);
+  } else if (votedItemCount == 0) {
+    drawText(LEFT_MARGIN, itemY, "아직 투표 없음", 0, TextSize::Small);
   }
 
   const String qrUrl = jsonString(root["qrUrl"]);
@@ -3346,6 +3357,10 @@ void loop() {
     refreshScreen(false, partialDisplayRefresh);
   } else if (action == WaitAction::ForceRefresh) {
     pageTransitionRefreshCount = 0;
+    if (ENABLE_DISPLAY) {
+      setupDisplay();
+      drawStatus("새로고침중", "최신 정보를 가져오는 중입니다...", true);
+    }
     refreshScreen(true);
   } else if (action == WaitAction::WifiSetup) {
     startSettingsPortal();
