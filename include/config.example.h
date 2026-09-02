@@ -23,7 +23,7 @@
 #define SCREEN_PAGE_COUNT 1
 // Device setting defaults. Users can change these from the on-device settings
 // menu; saved values are stored in ESP32 Preferences.
-#define PAGE_FULL_REFRESH_INTERVAL 5
+#define PAGE_FULL_REFRESH_INTERVAL 3
 #define SETTINGS_REFRESH_SECONDS_MIN 300
 #define SETTINGS_REFRESH_SECONDS_MAX 7200
 #define WIFI_SETUP_TIMEOUT_SECONDS 300

@@ -2645,25 +2645,26 @@ static void drawSnackVotePage(JsonObjectConst root, const DeviceTelemetry &telem
     drawBatteryIcon(SCREEN_WIDTH - 54, 8, telemetry.batteryPercent, telemetry.batteryChargeState == "charging");
   }
 
-  drawInvertedText(LEFT_MARGIN, 28, 108, 24, "간식 투표", 0, TextSize::Bold);
+  drawKorean(LEFT_MARGIN, 24, "MR.DEVELLO 간식 대시보드", TextSize::Large);
+  drawInvertedText(LEFT_MARGIN, 54, 108, 24, "간식 투표", 0, TextSize::Bold);
   const String roundName = jsonString(root["roundName"], "진행 중인 투표 없음");
-  drawKorean(LEFT_MARGIN, 70, utf8Prefix(roundName, 23), TextSize::Large);
+  drawKorean(LEFT_MARGIN, 88, utf8Prefix(roundName, 23), TextSize::Large);
 
   const int registeredProductCount = root["registeredProductCount"] | 0;
-  drawText(LEFT_MARGIN, 108, "등록 상품", 0, TextSize::Tiny);
-  drawText(112, 108, String(registeredProductCount) + "개", 0, TextSize::Bold);
+  drawText(LEFT_MARGIN, 118, "등록 상품", 0, TextSize::Tiny);
+  drawText(112, 118, String(registeredProductCount) + "개", 0, TextSize::Bold);
 
   const String roundStartedAt = jsonString(root["roundStartedAt"]);
-  drawText(LEFT_MARGIN, 140, "투표 시작", 0, TextSize::Tiny);
+  drawText(LEFT_MARGIN, 136, "투표 시작", 0, TextSize::Tiny);
   drawText(112,
-           140,
+           136,
            roundStartedAt.length() > 0 ? formatIsoDateTimeKst(roundStartedAt) : "-",
            0,
            TextSize::Tiny);
 
   JsonObjectConst delivery = root["delivery"];
   const bool deliveryInProgress = delivery["inProgress"] | false;
-  constexpr int16_t DELIVERY_LINE_Y = 160;
+  constexpr int16_t DELIVERY_LINE_Y = 154;
   drawInvertedText(LEFT_MARGIN,
                    DELIVERY_LINE_Y,
                    76,
@@ -2729,20 +2730,21 @@ static void drawSnackVotePage(JsonObjectConst root, const DeviceTelemetry &telem
     const int16_t qrX = QR_AREA_LEFT + (SCREEN_WIDTH - QR_AREA_LEFT - qrSize) / 2;
     drawQrCode(qrX, 72, qrUrl.c_str(), qrVersion, qrScale);
     drawKorean(QR_AREA_LEFT + 76, 408, "투표 참여 QR", TextSize::Bold);
+    drawText(QR_AREA_LEFT + 24, 424, qrUrl, 0, TextSize::Micro);
   } else {
     drawKorean(QR_AREA_LEFT + 42, 220, "QR 주소 없음", TextSize::Large);
   }
 
   const String lastUpdatedAt = jsonString(root["lastUpdatedAt"]);
   const unsigned int autoRefreshMinutes = settings.refreshSeconds / 60;
-  drawText(QR_AREA_LEFT + 24, 426, "버튼을 누르면 최신 정보로 업데이트됩니다", 0, TextSize::Micro);
+  drawText(QR_AREA_LEFT + 24, 440, "버튼을 누르면 최신 정보로 업데이트됩니다", 0, TextSize::Micro);
   drawText(QR_AREA_LEFT + 24,
-           442,
+           454,
            String(autoRefreshMinutes) + "분마다 자동 업데이트됩니다",
            0,
            TextSize::Micro);
   drawText(QR_AREA_LEFT + 24,
-           458,
+           468,
            "최근 업데이트 " +
                (lastUpdatedAt.length() > 0 ? formatIsoDateTimeKst(lastUpdatedAt) : "-"),
            0,
