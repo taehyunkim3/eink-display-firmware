@@ -1393,15 +1393,11 @@ static WaitAction sleepOrWait(const DeviceSettings &settings) {
         buttonManager.waitForAllReleased();
         return WaitAction::WifiSetup;
       } else if (buttonEvent == ButtonEvent::LeftClick) {
-        screenPage = nextVisiblePage(settings, screenPage, -1);
-        saveScreenPage();
-        Serial.printf("Button: page left GPIO%d -> %d\n", BUTTON_LEFT_PIN, screenPage);
-        return WaitAction::PageRefresh;
+        Serial.printf("Button: left GPIO%d -> force refresh\n", BUTTON_LEFT_PIN);
+        return WaitAction::ForceRefresh;
       } else if (buttonEvent == ButtonEvent::RightClick) {
-        screenPage = nextVisiblePage(settings, screenPage, 1);
-        saveScreenPage();
-        Serial.printf("Button: page right GPIO%d -> %d\n", BUTTON_RIGHT_PIN, screenPage);
-        return WaitAction::PageRefresh;
+        Serial.printf("Button: right GPIO%d -> force refresh\n", BUTTON_RIGHT_PIN);
+        return WaitAction::ForceRefresh;
       }
 
       if (rotateMs > 0 && millis() - waitStartedAt >= rotateMs) {
@@ -2624,6 +2620,7 @@ static void drawInvertedText(int16_t x,
 }
 
 static void drawSnackVotePage(JsonObjectConst root) {
+  const DeviceSettings settings = loadDeviceSettings();
   constexpr int16_t LEFT_MARGIN = 20;
   constexpr int16_t LEFT_WIDTH = 420;
   constexpr int16_t QR_AREA_LEFT = 460;
@@ -2638,53 +2635,59 @@ static void drawSnackVotePage(JsonObjectConst root) {
   drawText(LEFT_MARGIN, 108, "등록 상품", 0, TextSize::Tiny);
   drawText(112, 108, String(registeredProductCount) + "개", 0, TextSize::Bold);
 
-  const String lastUpdatedAt = jsonString(root["lastUpdatedAt"]);
-  drawText(LEFT_MARGIN, 140, "최근 업데이트", 0, TextSize::Tiny);
+  const String roundStartedAt = jsonString(root["roundStartedAt"]);
+  drawText(LEFT_MARGIN, 140, "투표 시작", 0, TextSize::Tiny);
   drawText(112,
            140,
-           lastUpdatedAt.length() > 0 ? formatIsoDateTimeKst(lastUpdatedAt) : "업데이트 전",
+           roundStartedAt.length() > 0 ? formatIsoDateTimeKst(roundStartedAt) : "-",
            0,
            TextSize::Tiny);
 
   JsonObjectConst delivery = root["delivery"];
   const bool deliveryInProgress = delivery["inProgress"] | false;
+  constexpr int16_t DELIVERY_LINE_Y = 160;
   drawInvertedText(LEFT_MARGIN,
-                   178,
-                   82,
-                   22,
-                   deliveryInProgress ? "배송 중" : "배송 없음",
+                   DELIVERY_LINE_Y,
+                   76,
+                   18,
+                   deliveryInProgress ? "배송중" : "배송없음",
                    0,
-                   TextSize::Small);
+                   TextSize::Tiny);
   const String deliveryMemo = jsonString(delivery["memo"], "배송 메모 없음");
-  drawText(LEFT_MARGIN, 210, deliveryMemo, 27, TextSize::Small);
+  drawText(LEFT_MARGIN + 84, DELIVERY_LINE_Y, deliveryMemo, 18, TextSize::Tiny);
   const String deliveryEndsAt = jsonString(delivery["endsAt"]);
-  if (deliveryEndsAt.length() > 0) {
+  const bool hasDeliveryEndsAt = deliveryEndsAt.length() > 0;
+  if (hasDeliveryEndsAt) {
     drawText(LEFT_MARGIN,
-             238,
+             DELIVERY_LINE_Y + 18,
              "배송 종료 " + formatIsoDateTimeKst(deliveryEndsAt),
              0,
              TextSize::Tiny);
   }
 
-  display.drawFastHLine(LEFT_MARGIN, 254, LEFT_WIDTH, GxEPD_BLACK);
-  drawText(LEFT_MARGIN, 280, "상품", 0, TextSize::Tiny);
-  drawText(LEFT_MARGIN + LEFT_WIDTH - 34, 280, "득표", 0, TextSize::Tiny);
+  const int16_t dividerY = DELIVERY_LINE_Y + (hasDeliveryEndsAt ? 34 : 18);
+  const int16_t headerY = dividerY + 16;
+  const int16_t itemsStartY = headerY + 18;
+  constexpr int16_t ROW_PITCH = 16;
+  display.drawFastHLine(LEFT_MARGIN, dividerY, LEFT_WIDTH, GxEPD_BLACK);
+  drawText(LEFT_MARGIN, headerY, "상품", 0, TextSize::Tiny);
+  drawText(LEFT_MARGIN + LEFT_WIDTH - 34, headerY, "득표", 0, TextSize::Tiny);
 
   JsonArrayConst items = root["items"].as<JsonArrayConst>();
-  constexpr int MAX_ITEM_ROWS = 5;
+  constexpr int MAX_ITEM_ROWS = 15;
   const int itemCount = static_cast<int>(items.size());
   const int visibleItemCount = min(itemCount, itemCount > MAX_ITEM_ROWS ? MAX_ITEM_ROWS - 1 : MAX_ITEM_ROWS);
-  int16_t itemY = 316;
+  int16_t itemY = itemsStartY;
   for (int i = 0; i < visibleItemCount; i++) {
     JsonObjectConst item = items[i];
-    drawText(LEFT_MARGIN, itemY, String(i + 1) + ". " + jsonString(item["name"]), 22, TextSize::Small);
+    drawText(LEFT_MARGIN, itemY, String(i + 1) + ". " + jsonString(item["name"]), 17, TextSize::Small);
     const String voteText = String(item["voteCount"] | 0) + "표";
     drawText(LEFT_MARGIN + LEFT_WIDTH - measureKorean(voteText, TextSize::Bold),
              itemY,
              voteText,
              0,
              TextSize::Bold);
-    itemY += 34;
+    itemY += ROW_PITCH;
   }
   if (visibleItemCount < itemCount) {
     drawText(LEFT_MARGIN, itemY, "외 " + String(itemCount - visibleItemCount) + "개", 0, TextSize::Tiny);
@@ -2712,14 +2715,20 @@ static void drawSnackVotePage(JsonObjectConst root) {
     drawKorean(QR_AREA_LEFT + 42, 220, "QR 주소 없음", TextSize::Large);
   }
 
-  const String generatedAt = jsonString(root["generatedAt"]);
-  if (generatedAt.length() > 0) {
-    drawText(QR_AREA_LEFT + 24,
-             452,
-             formatIsoDateTimeKst(generatedAt) + " 생성",
-             0,
-             TextSize::Tiny);
-  }
+  const String lastUpdatedAt = jsonString(root["lastUpdatedAt"]);
+  const unsigned int autoRefreshMinutes = settings.refreshSeconds / 60;
+  drawText(QR_AREA_LEFT + 24, 426, "버튼을 누르면 최신 정보로 업데이트됩니다", 0, TextSize::Micro);
+  drawText(QR_AREA_LEFT + 24,
+           442,
+           String(autoRefreshMinutes) + "분마다 자동 업데이트됩니다",
+           0,
+           TextSize::Micro);
+  drawText(QR_AREA_LEFT + 24,
+           458,
+           "최근 업데이트 " +
+               (lastUpdatedAt.length() > 0 ? formatIsoDateTimeKst(lastUpdatedAt) : "-"),
+           0,
+           TextSize::Micro);
 }
 
 static void setupSdAssets() {
