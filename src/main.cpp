@@ -2728,27 +2728,27 @@ static void drawSnackVotePage(JsonObjectConst root, const DeviceTelemetry &telem
     }
     const int16_t qrSize = (17 + qrVersion * 4) * qrScale;
     const int16_t qrX = QR_AREA_LEFT + (SCREEN_WIDTH - QR_AREA_LEFT - qrSize) / 2;
-    drawQrCode(qrX, 72, qrUrl.c_str(), qrVersion, qrScale);
-    drawKorean(QR_AREA_LEFT + 76, 408, "투표 참여 QR", TextSize::Bold);
-    drawText(QR_AREA_LEFT + 24, 424, qrUrl, 0, TextSize::Micro);
+    drawQrCode(qrX, 40, qrUrl.c_str(), qrVersion, qrScale);
+    drawKorean(QR_AREA_LEFT + 76, 376, "투표 참여 QR", TextSize::Bold);
+    drawText(QR_AREA_LEFT + 24, 396, qrUrl, 44, TextSize::Tiny);
   } else {
     drawKorean(QR_AREA_LEFT + 42, 220, "QR 주소 없음", TextSize::Large);
   }
 
   const String lastUpdatedAt = jsonString(root["lastUpdatedAt"]);
   const unsigned int autoRefreshMinutes = settings.refreshSeconds / 60;
-  drawText(QR_AREA_LEFT + 24, 440, "버튼을 누르면 최신 정보로 업데이트됩니다", 0, TextSize::Micro);
+  drawText(QR_AREA_LEFT + 24, 420, "버튼을 누르면 최신 정보로 업데이트됩니다", 0, TextSize::Tiny);
   drawText(QR_AREA_LEFT + 24,
-           454,
+           440,
            String(autoRefreshMinutes) + "분마다 자동 업데이트됩니다",
            0,
-           TextSize::Micro);
+           TextSize::Tiny);
   drawText(QR_AREA_LEFT + 24,
-           468,
+           460,
            "최근 업데이트 " +
                (lastUpdatedAt.length() > 0 ? formatIsoDateTimeKst(lastUpdatedAt) : "-"),
            0,
-           TextSize::Micro);
+           TextSize::Tiny);
 }
 
 static void setupSdAssets() {
