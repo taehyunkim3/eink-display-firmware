@@ -2619,13 +2619,31 @@ static void drawInvertedText(int16_t x,
   setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
 }
 
-static void drawSnackVotePage(JsonObjectConst root) {
+static void drawBatteryIcon(int16_t x, int16_t y, int percent, bool charging) {
+  display.drawRect(x, y, 34, 16, GxEPD_BLACK);
+  display.fillRect(x + 35, y + 5, 3, 6, GxEPD_BLACK);
+  const int fillWidth = constrain(percent, 0, 100) * 30 / 100;
+  if (fillWidth > 0) {
+    display.fillRect(x + 2, y + 2, fillWidth, 12, GxEPD_BLACK);
+  }
+  if (charging) {
+    display.drawLine(x + 15, y + 2, x + 10, y + 9, GxEPD_BLACK);
+    display.drawLine(x + 10, y + 9, x + 18, y + 9, GxEPD_BLACK);
+    display.drawLine(x + 18, y + 9, x + 13, y + 15, GxEPD_BLACK);
+  }
+}
+
+static void drawSnackVotePage(JsonObjectConst root, const DeviceTelemetry &telemetry) {
   const DeviceSettings settings = loadDeviceSettings();
   constexpr int16_t LEFT_MARGIN = 20;
   constexpr int16_t LEFT_WIDTH = 420;
   constexpr int16_t QR_AREA_LEFT = 460;
   display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, GxEPD_BLACK);
   display.drawFastVLine(QR_AREA_LEFT, 0, SCREEN_HEIGHT, GxEPD_BLACK);
+
+  if (telemetry.batteryPercent >= 0) {
+    drawBatteryIcon(SCREEN_WIDTH - 54, 8, telemetry.batteryPercent, telemetry.batteryChargeState == "charging");
+  }
 
   drawInvertedText(LEFT_MARGIN, 28, 108, 24, "간식 투표", 0, TextSize::Bold);
   const String roundName = jsonString(root["roundName"], "진행 중인 투표 없음");
@@ -2794,7 +2812,7 @@ static bool renderDashboard(JsonObjectConst root, const DeviceTelemetry &telemet
     display.fillScreen(GxEPD_WHITE);
     display.setTextColor(GxEPD_BLACK);
 
-    drawSnackVotePage(root);
+    drawSnackVotePage(root, telemetry);
   } while (display.nextPage());
 
   return true;
