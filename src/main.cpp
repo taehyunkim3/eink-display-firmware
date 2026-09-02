@@ -2676,18 +2676,39 @@ static void drawSnackVotePage(JsonObjectConst root, const DeviceTelemetry &telem
   drawText(LEFT_MARGIN + 84, DELIVERY_LINE_Y, deliveryMemo, 18, TextSize::Tiny);
   const String deliveryEndsAt = jsonString(delivery["endsAt"]);
   const bool hasDeliveryEndsAt = deliveryEndsAt.length() > 0;
+  int16_t deliverySubY = DELIVERY_LINE_Y + 18;
   if (hasDeliveryEndsAt) {
     drawText(LEFT_MARGIN,
-             DELIVERY_LINE_Y + 18,
+             deliverySubY,
              "배송 종료 " + formatIsoDateTimeKst(deliveryEndsAt),
              0,
              TextSize::Tiny);
+    deliverySubY += 16;
   }
 
-  const int16_t dividerY = DELIVERY_LINE_Y + (hasDeliveryEndsAt ? 34 : 18);
+  const String lastDeliveryAt = jsonString(root["lastDeliveryAt"]);
+  if (lastDeliveryAt.length() > 0) {
+    const String generatedAt = jsonString(root["generatedAt"]);
+    const CivilDate lastDeliveryDate = parseDateKey(dateKeyFromIso(lastDeliveryAt));
+    const CivilDate today = parseDateKey(dateKeyFromIso(generatedAt));
+    const int elapsedDays = daysFromCivil(today.year, today.month, today.day) -
+                             daysFromCivil(lastDeliveryDate.year, lastDeliveryDate.month, lastDeliveryDate.day);
+    const String elapsedText = elapsedDays <= 0 ? "오늘" : String(elapsedDays) + "일 전";
+    drawText(LEFT_MARGIN,
+             deliverySubY,
+             "마지막 배송 " + twoDigit(lastDeliveryDate.month) + "/" +
+                 twoDigit(lastDeliveryDate.day) + " (" + elapsedText + ")",
+             0,
+             TextSize::Tiny);
+  } else {
+    drawText(LEFT_MARGIN, deliverySubY, "마지막 배송 기록 없음", 0, TextSize::Tiny);
+  }
+  deliverySubY += 16;
+
+  const int16_t dividerY = deliverySubY;
   const int16_t headerY = dividerY + 16;
   const int16_t itemsStartY = headerY + 18;
-  constexpr int16_t ROW_PITCH = 16;
+  constexpr int16_t ROW_PITCH = 15;
   display.drawFastHLine(LEFT_MARGIN, dividerY, LEFT_WIDTH, GxEPD_BLACK);
   drawText(LEFT_MARGIN, headerY, "상품", 0, TextSize::Tiny);
   drawText(LEFT_MARGIN + LEFT_WIDTH - 34, headerY, "득표", 0, TextSize::Tiny);
@@ -2730,7 +2751,7 @@ static void drawSnackVotePage(JsonObjectConst root, const DeviceTelemetry &telem
     const int16_t qrX = QR_AREA_LEFT + (SCREEN_WIDTH - QR_AREA_LEFT - qrSize) / 2;
     drawQrCode(qrX, 40, qrUrl.c_str(), qrVersion, qrScale);
     drawKorean(QR_AREA_LEFT + 76, 376, "투표 참여 QR", TextSize::Bold);
-    drawText(QR_AREA_LEFT + 24, 396, qrUrl, 44, TextSize::Tiny);
+    drawText(QR_AREA_LEFT + 24, 396, qrUrl, 60, TextSize::Tiny);
   } else {
     drawKorean(QR_AREA_LEFT + 42, 220, "QR 주소 없음", TextSize::Large);
   }
