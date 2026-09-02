@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <DNSServer.h>
 #include <driver/rtc_io.h>
-#include <ESPmDNS.h>
 #include <FS.h>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
@@ -162,25 +161,7 @@
 #endif
 
 #ifndef SCREEN_PAGE_COUNT
-#define SCREEN_PAGE_COUNT 10
-#endif
-
-// Agent status page: shows local Codex/Cursor sessions served by the Mac
-// bridge (eink-frontend/bridge/agent-status-bridge.mjs) over LAN.
-#ifndef AGENT_BRIDGE_ENDPOINT
-#define AGENT_BRIDGE_ENDPOINT ""
-#endif
-
-#ifndef AGENT_POLL_SECONDS
-#define AGENT_POLL_SECONDS 3
-#endif
-
-#ifndef AGENT_FULL_REFRESH_EVERY
-#define AGENT_FULL_REFRESH_EVERY 30
-#endif
-
-#ifndef MAX_AGENT_JSON_BYTES
-#define MAX_AGENT_JSON_BYTES 16000
+#define SCREEN_PAGE_COUNT 1
 #endif
 
 GxEPD2_BW<EPD_MODEL, EPD_MODEL::HEIGHT> display(
@@ -231,17 +212,6 @@ constexpr uint32_t DASHBOARD_CACHE_TTL_MS = 30UL * 60UL * 1000UL;
 RTC_DATA_ATTR static int screenPage = 0;
 RTC_DATA_ATTR static uint32_t pageTransitionRefreshCount = 0;
 
-// The agent status page only exists when SCREEN_PAGE_COUNT covers index 9.
-constexpr int AGENT_PAGE_INDEX = 9;
-// Last agent status JSON fetched from the Mac bridge, plus its stateHash so
-// the live loop repaints only when the bridge reports an actual change.
-static std::unique_ptr<uint8_t[]> cachedAgentJson;
-static int cachedAgentJsonSize = 0;
-static uint32_t cachedAgentJsonAt = 0;
-static String agentStateHash = "";
-static uint32_t agentPartialCount = 0;
-static uint32_t lastAgentPollTickMs = 0;
-
 enum class TextSize {
   Micro,
   Tiny,
@@ -255,7 +225,6 @@ static void drawKorean(int16_t x, int16_t y, const String &text, TextSize size =
 static String utf8Prefix(const String &value, int maxChars);
 static bool flashFirmwareFromSd(const char *path);
 struct DeviceSettings;
-static void agentLivePollTick(const DeviceSettings &settings);
 
 static void setLastError(int code, const String &detail) {
   lastErrorCode = code;
@@ -291,7 +260,6 @@ struct DeviceSettings {
   int32_t nightStartHour;  // -1 = night mode off
   int32_t nightEndHour;    // KST hour; window may wrap past midnight
   uint32_t otaHours;       // OTA update check interval; 0 = off
-  uint32_t agentPollSeconds;  // bridge poll interval on the agent page
 };
 
 constexpr uint32_t ALL_PAGES_MASK = (1UL << SCREEN_PAGE_COUNT) - 1UL;
@@ -362,24 +330,6 @@ static bool isHttpsEndpoint() {
   String endpoint = deviceEndpointBase();
   endpoint.toLowerCase();
   return endpoint.startsWith("https://");
-}
-
-// Mac bridge address for the agent status page. Runtime (BLE) value wins,
-// compile-time default is the fallback. Empty = agent page disabled.
-static String agentBridgeEndpoint() {
-  Preferences preferences;
-  preferences.begin("server", false);
-  const String endpoint =
-      preferences.isKey("bridge") ? preferences.getString("bridge", "") : "";
-  preferences.end();
-  return endpoint.length() > 0 ? endpoint : String(AGENT_BRIDGE_ENDPOINT);
-}
-
-static void saveAgentBridgeEndpoint(const String &endpoint) {
-  Preferences preferences;
-  preferences.begin("server", false);
-  preferences.putString("bridge", endpoint);
-  preferences.end();
 }
 
 static String urlEncode(const String &value) {
@@ -529,7 +479,6 @@ static DeviceSettings defaultDeviceSettings() {
       -1,
       6,
       24,
-      clampSetting(AGENT_POLL_SECONDS, 2, 60),
   };
 }
 
@@ -564,8 +513,6 @@ static DeviceSettings sanitizeDeviceSettings(DeviceSettings settings) {
   if (settings.otaHours > 0) {
     settings.otaHours = clampSetting(settings.otaHours, 1, 720);
   }
-  settings.agentPollSeconds = clampSetting(
-      settings.agentPollSeconds > 0 ? settings.agentPollSeconds : defaults.agentPollSeconds, 2, 60);
   return settings;
 }
 
@@ -583,7 +530,6 @@ static DeviceSettings loadDeviceSettings() {
       preferences.getInt("nightStart", defaults.nightStartHour),
       preferences.getInt("nightEnd", defaults.nightEndHour),
       preferences.getUInt("otaHours", defaults.otaHours),
-      preferences.getUInt("agentPoll", defaults.agentPollSeconds),
   };
   preferences.end();
   return sanitizeDeviceSettings(settings);
@@ -602,7 +548,6 @@ static void saveDeviceSettings(const DeviceSettings &rawSettings) {
   preferences.putInt("nightStart", settings.nightStartHour);
   preferences.putInt("nightEnd", settings.nightEndHour);
   preferences.putUInt("otaHours", settings.otaHours);
-  preferences.putUInt("agentPoll", settings.agentPollSeconds);
   preferences.end();
 }
 
@@ -1466,10 +1411,6 @@ static WaitAction sleepOrWait(const DeviceSettings &settings) {
         return WaitAction::PageRefresh;
       }
 
-      // Live agent status: poll the Mac bridge and partial-refresh the agent
-      // page while it is on screen (self-throttled, no-op on other pages).
-      agentLivePollTick(settings);
-
       delay(BUTTON_SCAN_INTERVAL_MS);
     }
   }
@@ -1561,11 +1502,6 @@ static bool connectWifi() {
       setLastError(0, "");
       Serial.print("Wi-Fi connected. IP: ");
       Serial.println(WiFi.localIP());
-      // mDNS responder is needed for MDNS.queryHost() (resolving the Mac
-      // bridge's <hostname>.local, whose DHCP IP changes over time).
-      if (MDNS.begin("eink-display")) {
-        Serial.println("mDNS started: eink-display.local");
-      }
       return true;
     }
     WiFi.disconnect(false, false);
@@ -1707,8 +1643,6 @@ static void handleBleConfigWrite(const std::string &payload) {
     config["nightStart"] = settings.nightStartHour;
     config["nightEnd"] = settings.nightEndHour;
     config["otaHours"] = settings.otaHours;
-    config["bridge"] = agentBridgeEndpoint();
-    config["agentPollSec"] = settings.agentPollSeconds;
     config["fwVersion"] = FIRMWARE_VERSION;
     config["pageCount"] = SCREEN_PAGE_COUNT;
     String serialized;
@@ -1730,14 +1664,6 @@ static void handleBleConfigWrite(const std::string &payload) {
     return;
   }
 
-  const bool hasBridgeKey = !document["bridge"].isNull();
-  const String bridge = document["bridge"] | "";
-  if (hasBridgeKey && bridge.length() > 0 && !bridge.startsWith("https://") &&
-      !bridge.startsWith("http://")) {
-    bleSetStatus("error:endpoint", "브리지 주소 형식이 잘못되었습니다.");
-    return;
-  }
-
   bool savedAnything = false;
   if (ssid.length() > 0) {
     saveWifiCredentials(ssid, password);
@@ -1754,12 +1680,6 @@ static void handleBleConfigWrite(const std::string &payload) {
       preferences.putString("token", token);
     }
     preferences.end();
-    savedAnything = true;
-  }
-
-  if (hasBridgeKey) {
-    // Empty string is a valid write: it clears the runtime override.
-    saveAgentBridgeEndpoint(bridge);
     savedAnything = true;
   }
 
@@ -1809,12 +1729,6 @@ static void handleBleConfigWrite(const std::string &payload) {
   }
   if (!document["otaHours"].isNull()) {
     settings.otaHours = document["otaHours"] | 24;
-    settingsChanged = true;
-  }
-  if (!document["agentPollSec"].isNull()) {
-    const long agentPollSeconds = document["agentPollSec"] | 3L;
-    settings.agentPollSeconds =
-        clampSetting(static_cast<uint32_t>(agentPollSeconds > 0 ? agentPollSeconds : 3), 2, 60);
     settingsChanged = true;
   }
   if (settingsChanged) {
@@ -2486,121 +2400,6 @@ static bool fetchJson(const String &endpoint, std::unique_ptr<uint8_t[]> &buffer
   return false;
 }
 
-// The Mac's DHCP IP changes over time, so the bridge endpoint should use a
-// Bonjour name like http://my-mac.local:8788/... . Regular DNS cannot resolve
-// .local names, so we resolve them via mDNS ourselves and substitute the IP.
-// The result is cached; a fetch failure invalidates it so the next attempt
-// re-resolves (e.g. after the Mac gets a new lease).
-static String mdnsResolvedHost;
-static String mdnsResolvedIp;
-
-static String resolveEndpointHost(const String &endpoint) {
-  const int schemeEnd = endpoint.indexOf("://");
-  if (schemeEnd < 0) {
-    return endpoint;
-  }
-  const int hostStart = schemeEnd + 3;
-  int hostEnd = hostStart;
-  while (hostEnd < static_cast<int>(endpoint.length()) &&
-         endpoint[hostEnd] != ':' && endpoint[hostEnd] != '/') {
-    hostEnd++;
-  }
-  String host = endpoint.substring(hostStart, hostEnd);
-  if (!host.endsWith(".local")) {
-    return endpoint;
-  }
-
-  const String bareName = host.substring(0, host.length() - 6);
-  if (mdnsResolvedHost != host || mdnsResolvedIp.length() == 0) {
-    const IPAddress resolved = MDNS.queryHost(bareName.c_str(), 2000);
-    if (resolved == IPAddress()) {
-      Serial.printf("mDNS lookup failed for %s\n", host.c_str());
-      return "";
-    }
-    mdnsResolvedHost = host;
-    mdnsResolvedIp = resolved.toString();
-    Serial.printf("mDNS resolved %s -> %s\n", host.c_str(), mdnsResolvedIp.c_str());
-  }
-  return endpoint.substring(0, hostStart) + mdnsResolvedIp + endpoint.substring(hostEnd);
-}
-
-// Polls the Mac agent bridge. Short timeouts: this runs inside the button
-// wait loop, so a dead bridge must not freeze the UI for long.
-static bool fetchAgentStatusOnce() {
-  const String configuredEndpoint = agentBridgeEndpoint();
-  if (configuredEndpoint.length() == 0 || WiFi.status() != WL_CONNECTED) {
-    return false;
-  }
-  const String endpoint = resolveEndpointHost(configuredEndpoint);
-  if (endpoint.length() == 0) {
-    return false;
-  }
-
-  WiFiClient plainClient;
-  WiFiClientSecure secureClient;
-  const bool https = endpoint.startsWith("https://");
-  if (https) {
-    secureClient.setInsecure();
-  }
-  WiFiClient &client = https ? static_cast<WiFiClient &>(secureClient)
-                             : static_cast<WiFiClient &>(plainClient);
-
-  HTTPClient http;
-  http.setConnectTimeout(3000);
-  http.setTimeout(4000);
-  http.setReuse(false);
-  if (!http.begin(client, endpoint)) {
-    return false;
-  }
-  http.addHeader("Authorization", String("Bearer ") + deviceAuthToken());
-
-  const int statusCode = http.GET();
-  if (statusCode != HTTP_CODE_OK) {
-    // Stale cached IP (Mac picked up a new DHCP lease) also lands here.
-    mdnsResolvedIp = "";
-    http.end();
-    return false;
-  }
-
-  const int contentLength = http.getSize();
-  if (contentLength > MAX_AGENT_JSON_BYTES) {
-    http.end();
-    return false;
-  }
-
-  const int capacity = contentLength > 0 ? contentLength : MAX_AGENT_JSON_BYTES;
-  std::unique_ptr<uint8_t[]> buffer(new (std::nothrow) uint8_t[capacity]);
-  if (!buffer) {
-    http.end();
-    return false;
-  }
-
-  MemoryWriteStream stream(buffer.get(), capacity);
-  const int written = http.writeToStream(&stream);
-  http.end();
-  if (written <= 0 || stream.overflowed() || stream.size() == 0) {
-    return false;
-  }
-
-  cachedAgentJson = std::move(buffer);
-  cachedAgentJsonSize = static_cast<int>(stream.size());
-  cachedAgentJsonAt = millis();
-  return true;
-}
-
-static String parseAgentStateHash() {
-  if (!cachedAgentJson || cachedAgentJsonSize <= 0) {
-    return "";
-  }
-  JsonDocument document;
-  if (deserializeJson(document,
-                      reinterpret_cast<const char *>(cachedAgentJson.get()),
-                      static_cast<size_t>(cachedAgentJsonSize))) {
-    return "";
-  }
-  return String(document["stateHash"] | "");
-}
-
 static bool renderBitmap(const uint8_t *buffer, int size, bool partialRefresh) {
   if (size != SCREEN_BITMAP_BYTES) {
     return false;
@@ -2824,396 +2623,102 @@ static void drawInvertedText(int16_t x,
   setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
 }
 
-static void drawGridCellFrame(int16_t x,
-                              int16_t y,
-                              int16_t w,
-                              int16_t h,
-                              int row,
-                              int col) {
-  if (row == 0) {
-    display.drawFastHLine(x, y, w, GxEPD_BLACK);
-  }
-  if (col == 0) {
-    display.drawFastVLine(x, y, h, GxEPD_BLACK);
-  }
-  display.drawFastHLine(x, y + h, w, GxEPD_BLACK);
-  display.drawFastVLine(x + w, y, h, GxEPD_BLACK);
-}
-
-static void drawBatteryIcon(int16_t x, int16_t y, int percent, bool charging) {
-  display.drawRect(x, y, 34, 16, GxEPD_BLACK);
-  display.fillRect(x + 35, y + 5, 3, 6, GxEPD_BLACK);
-  const int fillWidth = constrain(percent, 0, 100) * 30 / 100;
-  if (fillWidth > 0) {
-    display.fillRect(x + 2, y + 2, fillWidth, 12, GxEPD_BLACK);
-  }
-  if (charging) {
-    display.drawLine(x + 15, y + 2, x + 10, y + 9, GxEPD_BLACK);
-    display.drawLine(x + 10, y + 9, x + 18, y + 9, GxEPD_BLACK);
-    display.drawLine(x + 18, y + 9, x + 13, y + 15, GxEPD_BLACK);
-  }
-}
-
-// 20x20 seasonal pixel doodle; (x, y) is the top-left corner.
-static void drawSeasonGlyph(int16_t x, int16_t y, int month) {
-  const int16_t cx = x + 10;
-  const int16_t cy = y + 10;
-  constexpr float DEG = 3.14159265f / 180.0f;
-
-  if (month >= 3 && month <= 5) {
-    // 봄: 벚꽃 (꽃잎 5개 + 중심)
-    for (int i = 0; i < 5; i++) {
-      const float angle = (i * 72.0f - 90.0f) * DEG;
-      display.fillCircle(cx + lroundf(cosf(angle) * 6), cy + lroundf(sinf(angle) * 6), 3, GxEPD_BLACK);
-    }
-    display.fillCircle(cx, cy, 2, GxEPD_WHITE);
-    display.drawCircle(cx, cy, 2, GxEPD_BLACK);
-  } else if (month >= 6 && month <= 8) {
-    // 여름: 해 (원 + 광선 8개)
-    display.fillCircle(cx, cy, 5, GxEPD_BLACK);
-    for (int i = 0; i < 8; i++) {
-      const float angle = i * 45.0f * DEG;
-      display.drawLine(cx + lroundf(cosf(angle) * 7), cy + lroundf(sinf(angle) * 7),
-                       cx + lroundf(cosf(angle) * 10), cy + lroundf(sinf(angle) * 10), GxEPD_BLACK);
-    }
-  } else if (month >= 9 && month <= 11) {
-    // 가을: 낙엽 (잎몸 + 잎맥 + 꼭지)
-    display.fillTriangle(cx, y, x + 3, cy + 2, cx, y + 15, GxEPD_BLACK);
-    display.fillTriangle(cx, y, x + 17, cy + 2, cx, y + 15, GxEPD_BLACK);
-    display.drawLine(cx, y + 3, cx, y + 13, GxEPD_WHITE);
-    display.drawLine(cx, y + 15, cx + 3, y + 19, GxEPD_BLACK);
-  } else {
-    // 겨울: 눈송이 (6방향 가지)
-    for (int i = 0; i < 6; i++) {
-      const float angle = i * 60.0f * DEG;
-      const int16_t tipX = cx + lroundf(cosf(angle) * 9);
-      const int16_t tipY = cy + lroundf(sinf(angle) * 9);
-      display.drawLine(cx, cy, tipX, tipY, GxEPD_BLACK);
-      display.fillCircle(tipX, tipY, 1, GxEPD_BLACK);
-    }
-  }
-}
-
-static void drawNativeHeader(JsonObjectConst root, const String &title, const DeviceTelemetry &telemetry) {
+static void drawSnackVotePage(JsonObjectConst root) {
+  constexpr int16_t LEFT_MARGIN = 20;
+  constexpr int16_t LEFT_WIDTH = 420;
+  constexpr int16_t QR_AREA_LEFT = 460;
   display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, GxEPD_BLACK);
-  display.drawLine(0, 28, SCREEN_WIDTH, 28, GxEPD_BLACK);
-  drawInvertedText(8, 20, 82, 20, title, 5, TextSize::Tiny);
-  drawText(100, 20, String(screenPage + 1) + "/" + String(SCREEN_PAGE_COUNT), 0, TextSize::Tiny);
-  const String headerTimeLine =
-      lastFetchHeaderLine.length() > 0
-          ? lastFetchHeaderLine
-          : formatIsoDateTimeKst(jsonString(root["generatedAt"])) + " 수신";
-  drawText(146, 20, headerTimeLine, 0, TextSize::Tiny);
+  display.drawFastVLine(QR_AREA_LEFT, 0, SCREEN_HEIGHT, GxEPD_BLACK);
+
+  drawInvertedText(LEFT_MARGIN, 28, 108, 24, "간식 투표", 0, TextSize::Bold);
+  const String roundName = jsonString(root["roundName"], "진행 중인 투표 없음");
+  drawKorean(LEFT_MARGIN, 70, utf8Prefix(roundName, 23), TextSize::Large);
+
+  const int registeredProductCount = root["registeredProductCount"] | 0;
+  drawText(LEFT_MARGIN, 108, "등록 상품", 0, TextSize::Tiny);
+  drawText(112, 108, String(registeredProductCount) + "개", 0, TextSize::Bold);
+
+  const String lastUpdatedAt = jsonString(root["lastUpdatedAt"]);
+  drawText(LEFT_MARGIN, 140, "최근 업데이트", 0, TextSize::Tiny);
+  drawText(112,
+           140,
+           lastUpdatedAt.length() > 0 ? formatIsoDateTimeKst(lastUpdatedAt) : "업데이트 전",
+           0,
+           TextSize::Tiny);
+
+  JsonObjectConst delivery = root["delivery"];
+  const bool deliveryInProgress = delivery["inProgress"] | false;
+  drawInvertedText(LEFT_MARGIN,
+                   178,
+                   82,
+                   22,
+                   deliveryInProgress ? "배송 중" : "배송 없음",
+                   0,
+                   TextSize::Small);
+  const String deliveryMemo = jsonString(delivery["memo"], "배송 메모 없음");
+  drawText(LEFT_MARGIN, 210, deliveryMemo, 27, TextSize::Small);
+  const String deliveryEndsAt = jsonString(delivery["endsAt"]);
+  if (deliveryEndsAt.length() > 0) {
+    drawText(LEFT_MARGIN,
+             238,
+             "배송 종료 " + formatIsoDateTimeKst(deliveryEndsAt),
+             0,
+             TextSize::Tiny);
+  }
+
+  display.drawFastHLine(LEFT_MARGIN, 254, LEFT_WIDTH, GxEPD_BLACK);
+  drawText(LEFT_MARGIN, 280, "상품", 0, TextSize::Tiny);
+  drawText(LEFT_MARGIN + LEFT_WIDTH - 34, 280, "득표", 0, TextSize::Tiny);
+
+  JsonArrayConst items = root["items"].as<JsonArrayConst>();
+  constexpr int MAX_ITEM_ROWS = 5;
+  const int itemCount = static_cast<int>(items.size());
+  const int visibleItemCount = min(itemCount, itemCount > MAX_ITEM_ROWS ? MAX_ITEM_ROWS - 1 : MAX_ITEM_ROWS);
+  int16_t itemY = 316;
+  for (int i = 0; i < visibleItemCount; i++) {
+    JsonObjectConst item = items[i];
+    drawText(LEFT_MARGIN, itemY, String(i + 1) + ". " + jsonString(item["name"]), 22, TextSize::Small);
+    const String voteText = String(item["voteCount"] | 0) + "표";
+    drawText(LEFT_MARGIN + LEFT_WIDTH - measureKorean(voteText, TextSize::Bold),
+             itemY,
+             voteText,
+             0,
+             TextSize::Bold);
+    itemY += 34;
+  }
+  if (visibleItemCount < itemCount) {
+    drawText(LEFT_MARGIN, itemY, "외 " + String(itemCount - visibleItemCount) + "개", 0, TextSize::Tiny);
+  } else if (itemCount == 0) {
+    drawText(LEFT_MARGIN, itemY, "등록된 상품 없음", 0, TextSize::Small);
+  }
+
+  const String qrUrl = jsonString(root["qrUrl"]);
+  if (qrUrl.length() > 0) {
+    uint8_t qrVersion = 5;
+    int16_t qrScale = 8;
+    if (qrUrl.length() > 80) {
+      qrVersion = 8;
+      qrScale = 6;
+    }
+    if (qrUrl.length() > 145) {
+      qrVersion = 10;
+      qrScale = 5;
+    }
+    const int16_t qrSize = (17 + qrVersion * 4) * qrScale;
+    const int16_t qrX = QR_AREA_LEFT + (SCREEN_WIDTH - QR_AREA_LEFT - qrSize) / 2;
+    drawQrCode(qrX, 72, qrUrl.c_str(), qrVersion, qrScale);
+    drawKorean(QR_AREA_LEFT + 76, 408, "투표 참여 QR", TextSize::Bold);
+  } else {
+    drawKorean(QR_AREA_LEFT + 42, 220, "QR 주소 없음", TextSize::Large);
+  }
 
   const String generatedAt = jsonString(root["generatedAt"]);
-  const int seasonMonth = generatedAt.length() >= 7 ? generatedAt.substring(5, 7).toInt() : 0;
-  if (seasonMonth >= 1 && seasonMonth <= 12) {
-    drawSeasonGlyph(566, 4, seasonMonth);
-  }
-
-  drawWifiSignalIcon(614, 24, telemetry.rssi);
-  drawText(652, 20, telemetry.ssid.length() > 0 ? telemetry.ssid.substring(0, 7) : "Wi-Fi", 8, TextSize::Tiny);
-  if (telemetry.batteryPercent >= 0) {
-    drawBatteryIcon(746, 6, telemetry.batteryPercent, telemetry.batteryChargeState == "charging");
-  }
-}
-
-static void drawSparkline(JsonArrayConst history, int16_t x, int16_t y, int16_t w, int16_t h) {
-  if (history.size() < 2) {
-    display.drawLine(x, y + h / 2, x + w, y + h / 2, GxEPD_BLACK);
-    return;
-  }
-
-  float minValue = history[0].as<float>();
-  float maxValue = minValue;
-  for (JsonVariantConst value : history) {
-    const float number = value.as<float>();
-    if (number < minValue) minValue = number;
-    if (number > maxValue) maxValue = number;
-  }
-  if (fabs(maxValue - minValue) < 0.0001f) {
-    maxValue = minValue + 1.0f;
-  }
-
-  int previousX = x;
-  int previousY = y + h - static_cast<int>((history[0].as<float>() - minValue) / (maxValue - minValue) * h);
-  for (size_t i = 1; i < history.size(); i++) {
-    const int currentX = x + static_cast<int>(i * w / (history.size() - 1));
-    const int currentY = y + h - static_cast<int>((history[i].as<float>() - minValue) / (maxValue - minValue) * h);
-    display.drawLine(previousX, previousY, currentX, currentY, GxEPD_BLACK);
-    previousX = currentX;
-    previousY = currentY;
-  }
-}
-
-static float parseMarketNumber(const String &value, bool *ok = nullptr) {
-  String normalized;
-  normalized.reserve(value.length());
-  for (int i = 0; i < value.length(); i++) {
-    const char c = value[i];
-    if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.') {
-      normalized += c;
-    }
-  }
-
-  if (normalized.length() == 0 || normalized == "-" || normalized == "+") {
-    if (ok) *ok = false;
-    return 0.0f;
-  }
-
-  if (ok) *ok = true;
-  return normalized.toFloat();
-}
-
-static float stockPreviousClose(JsonObjectConst stock, bool *ok = nullptr) {
-  bool priceOk = false;
-  bool rateOk = false;
-  const float latestPrice = parseMarketNumber(jsonString(stock["price"]), &priceOk);
-  const float latestRate = parseMarketNumber(jsonString(stock["changePercent"]), &rateOk);
-  if (priceOk && rateOk && latestRate > -99.0f) {
-    if (ok) *ok = true;
-    return latestPrice / (1.0f + latestRate / 100.0f);
-  }
-
-  JsonArrayConst history = stock["history"].as<JsonArrayConst>();
-  if (history.size() > 0) {
-    if (ok) *ok = true;
-    return history[0].as<float>();
-  }
-
-  if (ok) *ok = false;
-  return 0.0f;
-}
-
-static float stockPercentRange(JsonObjectConst stock) {
-  bool ok = false;
-  const float latestRate = fabs(parseMarketNumber(jsonString(stock["changePercent"]), &ok));
-  const float padded = ok ? ceilf(max(1.0f, latestRate) * 1.35f) : 3.0f;
-  return constrain(padded, 1.0f, 15.0f);
-}
-
-static int percentY(float percent, float range, int16_t y, int16_t h) {
-  const float clamped = constrain(percent, -range, range);
-  return y + h / 2 - static_cast<int>((clamped / range) * (h / 2 - 5));
-}
-
-static void drawChartGrid(int16_t x, int16_t y, int16_t w, int16_t h) {
-  display.drawRect(x, y, w, h, GxEPD_BLACK);
-  const int midY = y + h / 2;
-  for (int px = x + 5; px < x + w - 5; px += 8) {
-    display.drawFastHLine(px, midY, 4, GxEPD_BLACK);
-  }
-  for (int i = 1; i < 4; i++) {
-    const int gx = x + (w * i) / 4;
-    for (int py = y + 5; py < y + h - 5; py += 8) {
-      display.drawFastVLine(gx, py, 3, GxEPD_BLACK);
-    }
-  }
-}
-
-static void drawPercentLineChart(JsonObjectConst stock, int16_t x, int16_t y, int16_t w, int16_t h) {
-  JsonArrayConst history = stock["history"].as<JsonArrayConst>();
-  drawChartGrid(x, y, w, h);
-  if (history.size() < 2) {
-    return;
-  }
-
-  bool baselineOk = false;
-  const float baseline = stockPreviousClose(stock, &baselineOk);
-  if (!baselineOk || fabs(baseline) < 0.0001f) {
-    return;
-  }
-
-  const float range = stockPercentRange(stock);
-  int previousX = x + 5;
-  float firstPercent = ((history[0].as<float>() - baseline) / baseline) * 100.0f;
-  int previousY = percentY(firstPercent, range, y, h);
-  for (size_t i = 1; i < history.size(); i++) {
-    const int currentX = x + 5 + static_cast<int>(i * (w - 10) / (history.size() - 1));
-    const float percent = ((history[i].as<float>() - baseline) / baseline) * 100.0f;
-    const int currentY = percentY(percent, range, y, h);
-    display.drawLine(previousX, previousY, currentX, currentY, GxEPD_BLACK);
-    previousX = currentX;
-    previousY = currentY;
-  }
-}
-
-static bool drawCandleChart(JsonObjectConst stock, int16_t x, int16_t y, int16_t w, int16_t h) {
-  JsonArrayConst candles = stock["candles"].as<JsonArrayConst>();
-  if (candles.size() < 2) {
-    return false;
-  }
-
-  bool baselineOk = false;
-  const float baseline = stockPreviousClose(stock, &baselineOk);
-  if (!baselineOk || fabs(baseline) < 0.0001f) {
-    return false;
-  }
-
-  drawChartGrid(x, y, w, h);
-  const float range = stockPercentRange(stock);
-  const int count = min(static_cast<int>(candles.size()), 36);
-  const int start = static_cast<int>(candles.size()) - count;
-  const int slot = max(5, (w - 12) / max(1, count));
-  const int bodyW = max(2, min(6, slot - 2));
-
-  for (int i = 0; i < count; i++) {
-    JsonObjectConst candle = candles[start + i];
-    const float open = candle["o"].as<float>();
-    const float high = candle["h"].as<float>();
-    const float low = candle["l"].as<float>();
-    const float close = candle["c"].as<float>();
-    if (open <= 0 || high <= 0 || low <= 0 || close <= 0) {
-      continue;
-    }
-
-    const int cx = x + 6 + i * (w - 12) / max(1, count - 1);
-    const int highY = percentY(((high - baseline) / baseline) * 100.0f, range, y, h);
-    const int lowY = percentY(((low - baseline) / baseline) * 100.0f, range, y, h);
-    const int openY = percentY(((open - baseline) / baseline) * 100.0f, range, y, h);
-    const int closeY = percentY(((close - baseline) / baseline) * 100.0f, range, y, h);
-    const int top = min(openY, closeY);
-    const int bottom = max(openY, closeY);
-    display.drawLine(cx, highY, cx, lowY, GxEPD_BLACK);
-    if (close >= open) {
-      display.drawRect(cx - bodyW / 2, top, bodyW, max(2, bottom - top), GxEPD_BLACK);
-    } else {
-      display.fillRect(cx - bodyW / 2, top, bodyW, max(2, bottom - top), GxEPD_BLACK);
-    }
-  }
-
-  return true;
-}
-
-static String formatWithThousands(const String &raw);
-
-static String compactChartPrice(float value) {
-  if (!isfinite(value) || value <= 0) {
-    return "--";
-  }
-  if (value >= 1000.0f) {
-    return formatWithThousands(String(static_cast<long>(round(value))));
-  }
-  if (value >= 100.0f) {
-    return String(value, 1);
-  }
-  return String(value, 2);
-}
-
-static String removeNumberSeparators(String value) {
-  value.replace(",", "");
-  value.replace("，", "");
-  return value;
-}
-
-// Normalize separators, then re-insert a comma every 3 digits of the integer part.
-static String formatWithThousands(const String &raw) {
-  const String value = removeNumberSeparators(raw);
-
-  int digitsStart = -1;
-  for (int i = 0; i < value.length(); i++) {
-    if (value[i] >= '0' && value[i] <= '9') {
-      digitsStart = i;
-      break;
-    }
-  }
-  if (digitsStart < 0) {
-    return value;
-  }
-
-  int digitsEnd = digitsStart;
-  while (digitsEnd < value.length() && value[digitsEnd] >= '0' && value[digitsEnd] <= '9') {
-    digitsEnd++;
-  }
-
-  const String integerPart = value.substring(digitsStart, digitsEnd);
-  String grouped;
-  for (int i = 0; i < integerPart.length(); i++) {
-    if (i > 0 && (integerPart.length() - i) % 3 == 0) {
-      grouped += ',';
-    }
-    grouped += integerPart[i];
-  }
-
-  return value.substring(0, digitsStart) + grouped + value.substring(digitsEnd);
-}
-
-static String stockDirectionWord(JsonObjectConst stock) {
-  const String direction = jsonString(stock["direction"]);
-  if (direction == "up") return "상승";
-  if (direction == "down") return "하락";
-  if (direction == "flat") return "보합";
-  return "변동";
-}
-
-static String signedStockValue(JsonObjectConst stock, const String &value, const String &suffix = "") {
-  String cleaned = removeNumberSeparators(value);
-  while (cleaned.startsWith("+") || cleaned.startsWith("-")) {
-    cleaned.remove(0, 1);
-  }
-  const String direction = jsonString(stock["direction"]);
-  const String grouped = formatWithThousands(cleaned);
-  if (direction == "up") return "+" + grouped + suffix;
-  if (direction == "down") return "-" + grouped + suffix;
-  return grouped + suffix;
-}
-
-// Price scale on the right of the chart: +range / previous close / -range.
-static void drawChartPriceAxis(JsonObjectConst stock, int16_t x, int16_t y, int16_t w, int16_t h) {
-  bool baselineOk = false;
-  const float baseline = stockPreviousClose(stock, &baselineOk);
-  if (!baselineOk || fabs(baseline) < 0.0001f) {
-    return;
-  }
-
-  const float range = stockPercentRange(stock);
-  const float prices[] = {
-      baseline * (1.0f + range / 100.0f),
-      baseline,
-      baseline * (1.0f - range / 100.0f),
-  };
-  const float percents[] = {range, 0.0f, -range};
-
-  for (int i = 0; i < 3; i++) {
-    const int tickY = percentY(percents[i], range, y, h);
-    display.drawFastHLine(x, tickY, 3, GxEPD_BLACK);
-    drawText(x + 5, tickY + 3, compactChartPrice(prices[i]), 0, TextSize::Micro);
-  }
-}
-
-// Time labels only; prices live on the y-axis.
-static void drawChartPointLabels(JsonObjectConst stock,
-                                 int16_t x,
-                                 int16_t y,
-                                 int16_t w,
-                                 int16_t h) {
-  (void)h;
-  JsonArrayConst candles = stock["candles"].as<JsonArrayConst>();
-  if (candles.size() >= 2) {
-    const int count = min(static_cast<int>(candles.size()), 36);
-    const int start = static_cast<int>(candles.size()) - count;
-    const int indexes[] = {start, start + (count - 1) / 2, start + count - 1};
-
-    for (int i = 0; i < 3; i++) {
-      JsonObjectConst candle = candles[indexes[i]];
-      const String time = jsonString(candle["t"], "--:--");
-      const int16_t textW = measureKorean(time, TextSize::Micro);
-      const int labelX[] = {x, x + w / 2 - textW / 2, x + w - textW};
-      drawText(labelX[i], y, time, 8, TextSize::Micro);
-    }
-    return;
-  }
-
-  JsonArrayConst history = stock["history"].as<JsonArrayConst>();
-  if (history.size() < 2) {
-    return;
-  }
-
-  const char *labels[] = {"시작", "중간", "현재"};
-  for (int i = 0; i < 3; i++) {
-    const int16_t textW = measureKorean(labels[i], TextSize::Micro);
-    const int labelX[] = {x, x + w / 2 - textW / 2, x + w - textW};
-    drawText(labelX[i], y, labels[i], 8, TextSize::Micro);
+  if (generatedAt.length() > 0) {
+    drawText(QR_AREA_LEFT + 24,
+             452,
+             formatIsoDateTimeKst(generatedAt) + " 생성",
+             0,
+             TextSize::Tiny);
   }
 }
 
@@ -3246,7 +2751,6 @@ static void setupSdAssets() {
                 static_cast<unsigned>(SD.cardType()),
                 static_cast<unsigned long long>(SD.cardSize() / (1024ULL * 1024ULL)));
   SD.mkdir("/eink");
-  SD.mkdir("/eink/icons");
   SD.mkdir("/eink/fonts");
 
   // Offline manual update: drop a build as /eink/update/manual.bin on the
@@ -3267,776 +2771,8 @@ static void setupSdAssets() {
   }
 }
 
-enum class WeatherGlyph {
-  Clear,
-  PartlyCloudy,
-  Cloudy,
-  Fog,
-  Rain,
-  Snow,
-  Thunder,
-};
-
-static WeatherGlyph weatherGlyphForCode(int code) {
-  if (code == 0) return WeatherGlyph::Clear;
-  if (code == 1 || code == 2) return WeatherGlyph::PartlyCloudy;
-  if (code == 45 || code == 48) return WeatherGlyph::Fog;
-  if ((code >= 71 && code <= 77) || code == 85 || code == 86) return WeatherGlyph::Snow;
-  if (code >= 95 && code <= 99) return WeatherGlyph::Thunder;
-  if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) return WeatherGlyph::Rain;
-  return WeatherGlyph::Cloudy;
-}
-
-// s(x): scale a coordinate designed on a 32px grid to the requested size.
-static void drawSunShape(int16_t x, int16_t y, int size, int16_t cx, int16_t cy, int16_t r) {
-  const auto s = [size](int v) { return static_cast<int16_t>(v * size / 32); };
-  const int16_t px = x + s(cx);
-  const int16_t py = y + s(cy);
-  const int16_t pr = max<int16_t>(3, s(r));
-  display.fillCircle(px, py, pr, GxEPD_BLACK);
-  display.fillCircle(px, py, pr - max<int16_t>(2, pr / 3), GxEPD_WHITE);
-  const int16_t inner = pr + max<int16_t>(2, s(3));
-  const int16_t outer = inner + max<int16_t>(2, s(4));
-  for (int i = 0; i < 8; i++) {
-    const float angle = i * PI / 4.0f;
-    const float dx = cosf(angle);
-    const float dy = sinf(angle);
-    for (int t = -1; t <= 0; t++) {
-      display.drawLine(px + static_cast<int16_t>(dx * inner) + t,
-                       py + static_cast<int16_t>(dy * inner),
-                       px + static_cast<int16_t>(dx * outer) + t,
-                       py + static_cast<int16_t>(dy * outer),
-                       GxEPD_BLACK);
-    }
-  }
-}
-
-// Solid cloud with a white inset so the outline reads as a bold 2px stroke.
-static void drawCloudShape(int16_t x, int16_t y, int size, int16_t offsetY) {
-  const auto s = [size](int v) { return static_cast<int16_t>(v * size / 32); };
-  const int16_t oy = s(offsetY);
-  display.fillCircle(x + s(10), y + oy + s(15), s(6), GxEPD_BLACK);
-  display.fillCircle(x + s(18), y + oy + s(11), s(8), GxEPD_BLACK);
-  display.fillCircle(x + s(25), y + oy + s(15), s(5), GxEPD_BLACK);
-  display.fillRect(x + s(8), y + oy + s(15), s(19), s(6), GxEPD_BLACK);
-  display.fillCircle(x + s(10), y + oy + s(15), s(4), GxEPD_WHITE);
-  display.fillCircle(x + s(18), y + oy + s(11), s(6), GxEPD_WHITE);
-  display.fillCircle(x + s(25), y + oy + s(15), s(3), GxEPD_WHITE);
-  display.fillRect(x + s(10), y + oy + s(14), s(15), s(5), GxEPD_WHITE);
-}
-
-static void drawWeatherIcon(int16_t x, int16_t y, int code, int size = 32) {
-  const auto s = [size](int v) { return static_cast<int16_t>(v * size / 32); };
-  const WeatherGlyph glyph = weatherGlyphForCode(code);
-
-  switch (glyph) {
-    case WeatherGlyph::Clear:
-      drawSunShape(x, y, size, 16, 16, 7);
-      break;
-    case WeatherGlyph::PartlyCloudy:
-      drawSunShape(x, y, size, 21, 10, 5);
-      drawCloudShape(x, y, size, 8);
-      break;
-    case WeatherGlyph::Cloudy:
-      drawCloudShape(x, y, size, 2);
-      break;
-    case WeatherGlyph::Fog:
-      drawCloudShape(x, y, size, -4);
-      for (int i = 0; i < 3; i++) {
-        const int16_t lineY = y + s(21 + i * 4);
-        display.fillRect(x + s(5 + (i % 2) * 3), lineY, s(22), max<int16_t>(1, s(2)), GxEPD_BLACK);
-      }
-      break;
-    case WeatherGlyph::Rain:
-      drawCloudShape(x, y, size, -2);
-      for (int i = 0; i < 3; i++) {
-        const int16_t dropX = x + s(9 + i * 8);
-        const int16_t dropY = y + s(23);
-        for (int t = 0; t <= 1; t++) {
-          display.drawLine(dropX + t, dropY, dropX - s(3) + t, dropY + s(7), GxEPD_BLACK);
-        }
-      }
-      break;
-    case WeatherGlyph::Snow:
-      drawCloudShape(x, y, size, -2);
-      for (int i = 0; i < 3; i++) {
-        const int16_t cx = x + s(9 + i * 8);
-        const int16_t cy = y + s(26);
-        display.drawLine(cx - s(2), cy, cx + s(2), cy, GxEPD_BLACK);
-        display.drawLine(cx, cy - s(2), cx, cy + s(2), GxEPD_BLACK);
-        display.drawLine(cx - s(2), cy - s(2), cx + s(2), cy + s(2), GxEPD_BLACK);
-        display.drawLine(cx - s(2), cy + s(2), cx + s(2), cy - s(2), GxEPD_BLACK);
-      }
-      break;
-    case WeatherGlyph::Thunder: {
-      drawCloudShape(x, y, size, -2);
-      const int16_t bx = x + s(15);
-      const int16_t by = y + s(20);
-      display.fillTriangle(bx, by, bx + s(5), by, bx - s(2), by + s(7), GxEPD_BLACK);
-      display.fillTriangle(bx + s(4), by + s(4), bx - s(1), by + s(5), bx + s(1), by + s(12), GxEPD_BLACK);
-      break;
-    }
-  }
-}
-
-static bool overviewMarketMatch(JsonObjectConst stock, int slot) {
-  const String name = jsonString(stock["name"]);
-  const String code = jsonString(stock["code"]);
-  if (slot == 0) {
-    return name == "KOSPI" || code == "^KS11";
-  }
-  if (slot == 1) {
-    return name == "KOSDAQ" || code == "^KQ11";
-  }
-  return name.indexOf("USD/KRW") >= 0 || code == "KRW=X" || name.indexOf("WTI") >= 0 ||
-         code == "CL=F";
-}
-
-static JsonObjectConst overviewMarketSlot(JsonArrayConst stocks, int slot) {
-  for (JsonObjectConst stock : stocks) {
-    if (overviewMarketMatch(stock, slot)) {
-      return stock;
-    }
-  }
-  return JsonObjectConst();
-}
-
-// Filled title bar across the top of a card, with an optional right-aligned
-// secondary label. Text renders white-on-black.
-static void drawCardTitle(int16_t x, int16_t y, int16_t w, const String &title, const String &right = "") {
-  display.fillRect(x, y, w, 22, GxEPD_BLACK);
-  setKoreanTextColors(GxEPD_WHITE, GxEPD_BLACK);
-  drawKorean(x + 9, y + 16, title, TextSize::Tiny);
-  if (right.length() > 0) {
-    drawKorean(x + w - 9 - measureKorean(right, TextSize::Tiny), y + 16, right, TextSize::Tiny);
-  }
-  setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
-}
-
-static void drawTrendArrow(int16_t x, int16_t y, const String &direction) {
-  if (direction == "up") {
-    display.fillTriangle(x, y + 9, x + 10, y + 9, x + 5, y, GxEPD_BLACK);
-  } else if (direction == "down") {
-    display.fillTriangle(x, y, x + 10, y, x + 5, y + 9, GxEPD_BLACK);
-  } else {
-    display.fillRect(x, y + 4, 10, 2, GxEPD_BLACK);
-  }
-}
-
-static void drawOverviewPage(JsonObjectConst root) {
-  JsonObjectConst weather = root["weather"];
-  JsonArrayConst events = root["events"];
-  JsonArrayConst stocks = root["stocks"];
-  JsonArrayConst news = root["news"].as<JsonArrayConst>();
-
-  // ── 날씨 카드 (좌상단) ──
-  const int16_t wx = 12, wy = 40, ww = 380, wh = 210;
-  display.drawRect(wx, wy, ww, wh, GxEPD_BLACK);
-  const String weatherAlert = jsonString(root["weatherAlert"]);
-  drawCardTitle(wx, wy, ww, "오늘 날씨",
-                weatherAlert.length() > 0 ? weatherAlert : jsonString(weather["label"]));
-
-  drawWeatherIcon(wx + 14, wy + 32, weather["weatherCode"].isNull() ? 3 : weather["weatherCode"].as<int>(), 48);
-  drawText(wx + 76, wy + 66, formatValue(weather["temperatureC"], "C"), 0, TextSize::Large);
-  drawText(wx + 76, wy + 94, jsonString(weather["condition"], "날씨 정보 없음"), 13);
-
-  JsonObjectConst todayForecast = weather["daily"][0];
-  drawText(wx + 250, wy + 50, "최고 " + formatValue(todayForecast["maxTemperatureC"], "C"), 0, TextSize::Tiny);
-  drawText(wx + 250, wy + 72, "최저 " + formatValue(todayForecast["minTemperatureC"], "C"), 0, TextSize::Tiny);
-  drawText(wx + 250, wy + 94,
-           "강수 " + formatValue(todayForecast["precipitationProbabilityPercent"], "%"),
-           0,
-           TextSize::Tiny);
-
-  display.drawLine(wx + 12, wy + 110, wx + ww - 12, wy + 110, GxEPD_BLACK);
-  drawText(wx + 14, wy + 134, "체감 " + formatValue(weather["apparentTemperatureC"], "C"), 0, TextSize::Tiny);
-  drawText(wx + 140, wy + 134, "습도 " + formatValue(weather["humidityPercent"], "%"), 0, TextSize::Tiny);
-  drawText(wx + 252, wy + 134, "바람 " + formatValue(weather["windKph"], "km/h"), 0, TextSize::Tiny);
-
-  JsonArrayConst hourly = todayForecast["hourly"];
-  int16_t hourX = wx + 14;
-  for (size_t h = 0; h < hourly.size() && h < 3; h++) {
-    JsonObjectConst hour = hourly[h];
-    drawWeatherIcon(hourX, wy + 152, hour["weatherCode"].isNull() ? 3 : hour["weatherCode"].as<int>(), 32);
-    drawText(hourX + 40, wy + 168, formatIsoTime(jsonString(hour["time"])), 0, TextSize::Micro);
-    drawText(hourX + 40, wy + 188, formatValue(hour["temperatureC"], "C"), 0, TextSize::Tiny);
-    hourX += 124;
-  }
-
-  // ── 오늘 일정 카드 (우상단) ──
-  const int16_t ex = 404, ey = 40, ew = 384, eh = 210;
-  display.drawRect(ex, ey, ew, eh, GxEPD_BLACK);
-  drawCardTitle(ex, ey, ew, "다가오는 일정",
-                events.size() > 0 ? String(events.size()) + "건" : String(""));
-
-  if (events.size() == 0) {
-    drawText(ex + 16, ey + 66, "예정된 일정이 없어요", 0, TextSize::Small);
-  } else {
-    int16_t rowY = ey + 52;
-    for (size_t i = 0; i < events.size() && i < 3; i++) {
-      JsonObjectConst event = events[i];
-      const String time =
-          event["allDay"].as<bool>() ? "종일" : formatIsoTime(jsonString(event["startsAt"]));
-      drawText(ex + 14, rowY, time, 0, TextSize::Bold);
-      drawText(ex + 76, rowY, jsonString(event["title"]), 19, TextSize::Small);
-      drawText(ex + 76, rowY + 20, jsonString(event["calendarName"], "캘린더"), 24, TextSize::Micro);
-      if (i < 2 && i + 1 < events.size()) {
-        display.drawLine(ex + 14, rowY + 32, ex + ew - 14, rowY + 32, GxEPD_BLACK);
-      }
-      rowY += 50;
-    }
-  }
-
-  // ── 시장 지표 카드 (중단, 3열) ──
-  const int16_t mx = 12, my = 262, mw = 776, mh = 126;
-  display.drawRect(mx, my, mw, mh, GxEPD_BLACK);
-  drawCardTitle(mx, my, mw, "시장 지표");
-
-  const int16_t colWidth = mw / 3;
-  for (int i = 0; i < 3; i++) {
-    const int16_t colX = mx + i * colWidth;
-    if (i > 0) {
-      display.drawFastVLine(colX, my + 22, mh - 22, GxEPD_BLACK);
-    }
-
-    JsonObjectConst stock = overviewMarketSlot(stocks, i);
-    const int16_t tx = colX + 14;
-    if (stock.isNull()) {
-      const char *fallbackLabel = i == 0 ? "KOSPI" : (i == 1 ? "KOSDAQ" : "WTI");
-      drawText(tx, my + 48, fallbackLabel, 0, TextSize::Bold);
-      drawText(tx, my + 82, "--", 0, TextSize::Large);
-      continue;
-    }
-
-    drawText(tx, my + 48, jsonString(stock["name"]), 10, TextSize::Bold);
-    drawText(tx, my + 82, formatWithThousands(jsonString(stock["price"], "--")), 12, TextSize::Large);
-    drawTrendArrow(tx, my + 96, jsonString(stock["direction"]));
-    drawText(tx + 18, my + 106,
-             signedStockValue(stock, jsonString(stock["changePercent"], "--"), "%"),
-             9,
-             TextSize::Small);
-    drawSparkline(stock["history"].as<JsonArrayConst>(), colX + 152, my + 40, 92, 60);
-  }
-
-  // ── 뉴스 스트립 (하단) ──
-  const int16_t nx = 12, ny = 400, nw = 776, nh = 68;
-  display.drawRect(nx, ny, nw, nh, GxEPD_BLACK);
-  display.fillRect(nx, ny, 58, nh, GxEPD_BLACK);
-  setKoreanTextColors(GxEPD_WHITE, GxEPD_BLACK);
-  drawKorean(nx + 13, ny + 41, "뉴스", TextSize::Tiny);
-  setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
-
-  // Line 1: latest headline. Line 2: daily quote if the server sent one,
-  // otherwise the second headline.
-  const String dailyQuote = jsonString(root["quote"]);
-  if ((news.isNull() || news.size() == 0) && dailyQuote.length() == 0) {
-    drawText(nx + 74, ny + 41, "뉴스 정보 없음", 0, TextSize::Tiny);
-  } else {
-    int line = 0;
-    for (size_t i = 0; !news.isNull() && i < news.size() && line < 2; i++) {
-      if (line == 1 && dailyQuote.length() > 0) {
-        break;
-      }
-      JsonObjectConst item = news[i];
-      const int16_t lineY = ny + 27 + static_cast<int16_t>(line) * 27;
-      const String time = formatIsoTime(jsonString(item["publishedAt"]));
-      drawText(nx + 74, lineY, time.length() > 0 ? time : "--:--", 0, TextSize::Micro);
-      drawText(nx + 122, lineY, jsonString(item["title"]), 42, TextSize::Tiny);
-      line++;
-    }
-    if (dailyQuote.length() > 0 && line < 2) {
-      const int16_t lineY = ny + 27 + static_cast<int16_t>(line) * 27;
-      drawText(nx + 74, lineY, "명언", 0, TextSize::Micro);
-      drawText(nx + 122, lineY, dailyQuote, 44, TextSize::Tiny);
-    }
-  }
-}
-
-static void drawWeatherPage(JsonObjectConst root) {
-  JsonObjectConst weather = root["weather"];
-  JsonArrayConst days = weather["daily"];
-  const int top = 38;
-  const int cellW = SCREEN_WIDTH / 2;
-  const int cellH = (SCREEN_HEIGHT - top - 2) / 4;
-  for (size_t i = 0; i < days.size() && i < 8; i++) {
-    JsonObjectConst day = days[i];
-    const int col = i % 2;
-    const int row = i / 2;
-    const int x = col * cellW;
-    const int y = top + row * cellH;
-    drawGridCellFrame(x, y, cellW, cellH, row, col);
-
-    drawText(x + 10, y + 24, jsonString(day["date"]).substring(5), 5, TextSize::Bold);
-    drawWeatherIcon(x + 10, y + 38, day["weatherCode"].isNull() ? 3 : day["weatherCode"].as<int>());
-    drawText(x + 50, y + 54, jsonString(day["condition"]), 12, TextSize::Bold);
-    drawText(x + 50, y + 77,
-             formatValue(day["minTemperatureC"], "C") + "-" +
-                 formatValue(day["maxTemperatureC"], "C"),
-             10);
-    drawText(x + 154, y + 77,
-             "강수 " + formatValue(day["precipitationProbabilityPercent"], "%"),
-             8);
-
-    JsonArrayConst hourly = day["hourly"];
-    int hx = x + 244;
-    for (size_t h = 0; h < hourly.size() && h < 3; h++) {
-      JsonObjectConst hour = hourly[h];
-      drawText(hx, y + 30, formatIsoTime(jsonString(hour["time"])), 5, TextSize::Tiny);
-      drawWeatherIcon(hx, y + 38, hour["weatherCode"].isNull() ? 3 : hour["weatherCode"].as<int>());
-      drawText(hx, y + 86, formatValue(hour["temperatureC"], "C"), 5, TextSize::Tiny);
-      hx += 48;
-    }
-  }
-}
-
-static void drawMonthCalendarPage(JsonObjectConst root) {
-  const CivilDate base = parseDateKey(dateKeyFromIso(jsonString(root["generatedAt"])));
-  const int firstDay = daysFromCivil(base.year, base.month, 1);
-  const int startDay = firstDay - weekdayFromDays(firstDay);
-  const String todayKey = dateKeyFromCivil(base);
-  JsonArrayConst events = root["events"];
-
-  for (int i = 0; i < 7; i++) {
-    drawText(52 + i * 112, 53, WEEKDAY_LABELS[i], 0, TextSize::Tiny);
-  }
-
-  const int top = 56;
-  const int cellW = SCREEN_WIDTH / 7;
-  const int cellH = (SCREEN_HEIGHT - top - 1) / 6;
-  for (int row = 0; row < 6; row++) {
-    for (int col = 0; col < 7; col++) {
-      const int x = col * cellW;
-      const int y = top + row * cellH;
-      const CivilDate date = civilFromDays(startDay + row * 7 + col);
-      const String key = dateKeyFromCivil(date);
-      display.drawRect(x, y, cellW + 1, cellH + 1, GxEPD_BLACK);
-      if (key == todayKey) {
-        display.fillRect(x + 1, y + 1, cellW - 2, 3, GxEPD_BLACK);
-        display.fillRect(x + 1, y + 1, 3, cellH - 2, GxEPD_BLACK);
-      }
-      drawText(x + 3, y + 13, date.day == 1 ? String(date.month) + "월1일" : String(date.day), 5, TextSize::Tiny);
-
-      int eventY = y + 24;
-      int shown = 0;
-      for (JsonObjectConst event : events) {
-        if (!sameEventDay(event, key)) continue;
-        const String time = event["allDay"].as<bool>() ? "" : formatIsoTime(jsonString(event["startsAt"])) + " ";
-        drawText(x + 4, eventY, time + jsonString(event["title"]), 18, TextSize::Micro);
-        eventY += 11;
-        shown++;
-        if (shown >= 4) break;
-      }
-      if (events.size() > 0 && shown >= 4) {
-        int remaining = 0;
-        for (JsonObjectConst event : events) {
-          if (sameEventDay(event, key)) remaining++;
-        }
-        if (remaining > shown) {
-          drawText(x + 4, eventY, "+" + String(remaining - shown), 4, TextSize::Micro);
-        }
-      }
-    }
-  }
-}
-
-static void drawWeekCalendarPage(JsonObjectConst root) {
-  const CivilDate base = parseDateKey(dateKeyFromIso(jsonString(root["generatedAt"])));
-  const int baseDay = daysFromCivil(base.year, base.month, base.day);
-  const int startDay = baseDay - weekdayFromDays(baseDay);
-  const String todayKey = dateKeyFromCivil(base);
-  JsonArrayConst events = root["events"];
-  const int top = 40;
-  const int colW = SCREEN_WIDTH / 7;
-
-  for (int col = 0; col < 7; col++) {
-    const int x = col * colW;
-    const CivilDate date = civilFromDays(startDay + col);
-    const String key = dateKeyFromCivil(date);
-    display.drawRect(x, top, colW + 1, SCREEN_HEIGHT - top - 2, GxEPD_BLACK);
-    if (key == todayKey) {
-      display.fillRect(x + 1, top + 1, colW - 2, 3, GxEPD_BLACK);
-      display.fillRect(x + 1, top + 1, 3, SCREEN_HEIGHT - top - 4, GxEPD_BLACK);
-    }
-    drawText(x + 4, 58, String(WEEKDAY_LABELS[col]), 0, TextSize::Tiny);
-    drawText(x + 4, 76, String(date.month) + "/" + String(date.day), 5, TextSize::Tiny);
-    display.drawLine(x, 84, x + colW, 84, GxEPD_BLACK);
-
-    int y = 100;
-    int shown = 0;
-    for (JsonObjectConst event : events) {
-      if (!sameEventDay(event, key)) continue;
-      const String time = event["allDay"].as<bool>() ? "" : formatIsoTime(jsonString(event["startsAt"])) + " ";
-      drawText(x + 5, y, time + jsonString(event["title"]), 18, TextSize::Micro);
-      y += 12;
-      shown++;
-      if (shown >= 30) break;
-    }
-    if (shown == 0) {
-      drawText(x + 14, 274, "일정 없음", 5, TextSize::Tiny);
-    }
-  }
-}
-
-static String flowValue(JsonVariantConst value) {
-  if (value.isNull()) return "--";
-  const long number = value.as<long>();
-  const String sign = number > 0 ? "+" : "";
-  if (abs(number) >= 10000) {
-    return sign + String(number / 10000) + "만";
-  }
-  return sign + String(number);
-}
-
-static void drawStocksPage(JsonObjectConst root) {
-  JsonArrayConst stocks = root["stocks"];
-  const int tileW = SCREEN_WIDTH / 3;
-  const int tileH = (SCREEN_HEIGHT - 38) / 4;
-  for (int i = 0; i < 12; i++) {
-    const int col = i % 3;
-    const int row = i / 3;
-    const int x = col * tileW;
-    const int y = 38 + row * tileH;
-    drawGridCellFrame(x, y, tileW, tileH, row, col);
-    if (i >= static_cast<int>(stocks.size())) continue;
-    JsonObjectConst stock = stocks[i];
-    drawInvertedText(x + 1, y + 24, tileW - 1, 24, jsonString(stock["name"]), 10);
-    drawText(x + 8, y + 54, formatWithThousands(jsonString(stock["price"], "--")), 12, TextSize::Bold);
-    drawText(x + 138,
-             y + 54,
-             stockDirectionWord(stock) + " " + signedStockValue(stock, jsonString(stock["changePercent"], "--"), "%"),
-             11,
-             TextSize::Bold);
-    drawText(x + 8,
-             y + 76,
-             "변동 " + signedStockValue(stock, jsonString(stock["change"], "--")),
-             14,
-             TextSize::Tiny);
-    JsonObjectConst flow = stock["investorFlow"];
-    if (!flow.isNull()) {
-      drawText(x + 8, y + 98, "개인 " + flowValue(flow["retail"]), 10, TextSize::Tiny);
-      drawText(x + 92, y + 98, "기관 " + flowValue(flow["institutional"]), 10, TextSize::Tiny);
-      drawText(x + 176, y + 98, "외인 " + flowValue(flow["foreign"]), 10, TextSize::Tiny);
-    }
-  }
-}
-
-static void drawStockChartTile(JsonObjectConst stock,
-                               int indexInPage,
-                               int globalIndex,
-                               int16_t x,
-                               int16_t y,
-                               int16_t w,
-                               int16_t h) {
-  const int col = indexInPage % 2;
-  const int row = indexInPage / 2;
-  drawGridCellFrame(x, y, w, h, row, col);
-  drawText(x + 10, y + 24, String(globalIndex + 1) + ". " + jsonString(stock["name"]), 14, TextSize::Bold);
-  drawText(x + 10, y + 46,
-           formatWithThousands(jsonString(stock["price"], "--")) + "  " +
-               signedStockValue(stock, jsonString(stock["changePercent"], "--"), "%"),
-           18);
-
-  const int axisW = 42;
-  const int chartX = x + 10;
-  const int chartY = y + 58;
-  const int chartW = w - 20 - axisW;
-  const int chartH = h - 122;
-  if (!drawCandleChart(stock, chartX, chartY, chartW, chartH)) {
-    drawPercentLineChart(stock, chartX, chartY, chartW, chartH);
-  }
-  drawChartPriceAxis(stock, chartX + chartW, chartY, axisW, chartH);
-  drawChartPointLabels(stock, chartX, chartY + chartH + 14, chartW, 16);
-
-  JsonObjectConst flow = stock["investorFlow"];
-  if (!flow.isNull()) {
-    const int flowY = y + h - 16;
-    drawText(x + 10, flowY, "개인 " + flowValue(flow["retail"]), 10, TextSize::Tiny);
-    drawText(x + 130, flowY, "기관 " + flowValue(flow["institutional"]), 10, TextSize::Tiny);
-    drawText(x + 250, flowY, "외인 " + flowValue(flow["foreign"]), 10, TextSize::Tiny);
-  } else {
-    drawText(x + 10, y + h - 16, "점선: 전일 종가 0% 기준", 16, TextSize::Tiny);
-  }
-}
-
-static void drawStockChartsPage(JsonObjectConst root, int pageGroup) {
-  JsonArrayConst stocks = root["stocks"];
-  const int top = 38;
-  const int cellW = SCREEN_WIDTH / 2;
-  const int cellH = (SCREEN_HEIGHT - top - 2) / 2;
-  const int start = pageGroup * 4;
-  for (int i = 0; i < 4; i++) {
-    const int stockIndex = start + i;
-    const int col = i % 2;
-    const int row = i / 2;
-    const int x = col * cellW;
-    const int y = top + row * cellH;
-    if (stockIndex >= static_cast<int>(stocks.size())) {
-      drawGridCellFrame(x, y, cellW, cellH, row, col);
-      drawText(x + 18, y + 104, "표시할 항목 없음", 0, TextSize::Bold);
-      continue;
-    }
-    drawStockChartTile(stocks[stockIndex], i, stockIndex, x, y, cellW, cellH);
-  }
-}
-
-static void drawNewsPage(JsonObjectConst root) {
-  JsonArrayConst news = root["news"].as<JsonArrayConst>();
-
-  // AI market summary box on top (only when the server provides one).
-  int y = 62;
-  const String summary = jsonString(root["marketSummary"]);
-  if (summary.length() > 0) {
-    display.fillRect(12, 40, 92, 20, GxEPD_BLACK);
-    setKoreanTextColors(GxEPD_WHITE, GxEPD_BLACK);
-    drawKorean(20, 55, "AI 시황", TextSize::Tiny);
-    setKoreanTextColors(GxEPD_BLACK, GxEPD_WHITE);
-
-    int lineY = 82;
-    int lineStart = 0;
-    for (int lines = 0; lines < 3 && lineStart < static_cast<int>(summary.length()); lines++) {
-      int lineEnd = summary.indexOf('\n', lineStart);
-      if (lineEnd < 0) {
-        lineEnd = summary.length();
-      }
-      drawText(20, lineY, summary.substring(lineStart, lineEnd), 52, TextSize::Small);
-      lineY += 22;
-      lineStart = lineEnd + 1;
-    }
-    display.drawLine(12, lineY - 8, SCREEN_WIDTH - 12, lineY - 8, GxEPD_BLACK);
-    y = lineY + 16;
-  }
-
-  if (news.isNull() || news.size() == 0) {
-    drawText(24, y + 22, "뉴스 정보 없음", 0, TextSize::Bold);
-    return;
-  }
-
-  for (JsonObjectConst item : news) {
-    if (y > SCREEN_HEIGHT - 20) {
-      break;
-    }
-    const String time = formatIsoTime(jsonString(item["publishedAt"]));
-    drawText(16, y, time.length() > 0 ? time : "--:--", 0, TextSize::Tiny);
-    drawText(64, y, jsonString(item["title"]), 50, TextSize::Small);
-    drawText(SCREEN_WIDTH - 78, y, jsonString(item["source"]), 6, TextSize::Tiny);
-    display.drawFastHLine(12, y + 12, SCREEN_WIDTH - 24, GxEPD_BLACK);
-    y += 36;
-  }
-}
-
-// ---- Agent status page ---------------------------------------------------
-// Shows local Codex/Cursor agent sessions from the Mac bridge. While this
-// page is visible (and deep sleep is off) the wait loop polls the bridge and
-// repaints just the content area with a partial refresh when state changes.
-
-static void drawAgentStatusBadge(int16_t x, int16_t baseline, const String &status, const String &label) {
-  // "waiting" = the agent asked a question and is blocked on the user, so
-  // it gets the same attention-grabbing inverted badge as a running agent.
-  if (status == "active" || status == "waiting") {
-    drawInvertedText(x, baseline, 66, 22, label, 3, TextSize::Small);
-    return;
-  }
-  display.drawRect(x, baseline - 17, 66, 22, GxEPD_BLACK);
-  const int16_t textWidth = measureKorean(label, TextSize::Small);
-  drawKorean(x + max(3, (66 - textWidth) / 2), baseline, label, TextSize::Small);
-}
-
-// Status glyph drawn in the empty space under the badge (left column of an
-// agent session row). cx/cy is the icon center.
-static void drawAgentStatusIcon(int16_t cx, int16_t cy, const String &status) {
-  if (status == "active") {
-    // Play triangle.
-    display.fillTriangle(cx - 9, cy - 12, cx - 9, cy + 12, cx + 13, cy, GxEPD_BLACK);
-  } else if (status == "waiting") {
-    // Circled question mark.
-    display.drawCircle(cx, cy, 15, GxEPD_BLACK);
-    display.drawCircle(cx, cy, 14, GxEPD_BLACK);
-    const String mark = "?";
-    const int16_t markWidth = measureKorean(mark, TextSize::Bold);
-    drawKorean(cx - markWidth / 2, cy + 7, mark, TextSize::Bold);
-  } else if (status == "recent") {
-    // Clock face. Idle (finished) sessions draw nothing.
-    display.drawCircle(cx, cy, 13, GxEPD_BLACK);
-    display.drawLine(cx, cy, cx, cy - 8, GxEPD_BLACK);
-    display.drawLine(cx, cy, cx + 6, cy + 2, GxEPD_BLACK);
-  }
-}
-
-static void drawAgentPageContent() {
-  // Partial repaints clip to the content window; redraw the screen border so
-  // the side/bottom frame lines survive.
-  display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, GxEPD_BLACK);
-
-  const String endpoint = agentBridgeEndpoint();
-  if (endpoint.length() == 0) {
-    drawText(24, 90, "에이전트 브리지가 설정되지 않았어요", 0, TextSize::Large);
-    drawText(24, 140, "1. Mac에서 eink-frontend 폴더의 npm run bridge 실행", 0, TextSize::Small);
-    drawText(24, 170, "2. 설정 페이지(블루투스)에서 브리지 주소 저장", 0, TextSize::Small);
-    drawText(24, 200, "예: http://<Mac-IP>:8788/agent-status.json", 0, TextSize::Small);
-    return;
-  }
-
-  JsonDocument document;
-  bool parsed = false;
-  if (cachedAgentJson && cachedAgentJsonSize > 0) {
-    parsed = deserializeJson(document,
-                             reinterpret_cast<const char *>(cachedAgentJson.get()),
-                             static_cast<size_t>(cachedAgentJsonSize)) == DeserializationError::Ok;
-  }
-  if (!parsed) {
-    drawText(24, 90, "브리지 응답 대기 중...", 0, TextSize::Large);
-    drawText(24, 140, endpoint, 64, TextSize::Small);
-    drawText(24, 170, "Mac에서 브리지 서버가 실행 중인지 확인하세요.", 0, TextSize::Small);
-    return;
-  }
-
-  JsonObjectConst root = document.as<JsonObjectConst>();
-  JsonObjectConst summary = root["summary"];
-  JsonArrayConst sessions = root["sessions"].as<JsonArrayConst>();
-  JsonObjectConst tokens = root["tokens"];
-
-  // Summary strip.
-  const int activeCount = summary["activeCount"] | 0;
-  const int codexActive = summary["codexActive"] | 0;
-  const int cursorActive = summary["cursorActive"] | 0;
-  String headline = String("진행중 ") + String(activeCount);
-  headline += "  CODEX " + String(codexActive);
-  headline += " · CURSOR " + String(cursorActive);
-  drawInvertedText(12, 60, 66, 22, "상태", 4, TextSize::Small);
-  drawText(92, 60, headline, 0, TextSize::Bold);
-
-  if (!tokens["primaryLeftPercent"].isNull()) {
-    String tokenLine = String("CODEX 토큰 5h ") + String(static_cast<int>(tokens["primaryLeftPercent"] | 0)) + "%";
-    if (!tokens["secondaryLeftPercent"].isNull()) {
-      tokenLine += " · 7d " + String(static_cast<int>(tokens["secondaryLeftPercent"] | 0)) + "%";
-    }
-    const int16_t tokenWidth = measureKorean(tokenLine, TextSize::Tiny);
-    drawText(SCREEN_WIDTH - 16 - tokenWidth, 60, tokenLine, 0, TextSize::Tiny);
-  }
-  display.drawLine(12, 72, SCREEN_WIDTH - 12, 72, GxEPD_BLACK);
-
-  if (sessions.isNull() || sessions.size() == 0) {
-    drawText(24, 120, "표시할 에이전트 세션이 없어요", 0, TextSize::Bold);
-  }
-
-  // Session rows: 4 x 96px — line 1 project/provider/age, line 2 title,
-  // then the latest conversation message in 3 tightly-spaced Micro lines.
-  int16_t y = 78;
-  int rowCount = 0;
-  for (JsonObjectConst session : sessions) {
-    if (rowCount >= 4) {
-      break;
-    }
-    const String status = jsonString(session["status"], "idle");
-    const String statusLabel = jsonString(session["statusLabel"], "대기");
-    const String provider = jsonString(session["provider"]) == "cursor" ? "CURSOR" : "CODEX";
-    const String age = jsonString(session["age"]);
-
-    drawAgentStatusBadge(16, y + 20, status, statusLabel);
-    drawAgentStatusIcon(49, y + 58, status);
-    drawText(94, y + 20, jsonString(session["project"]), 24, TextSize::Bold);
-    // Faux bold: the bitmap fonts have no bold weight at this size, so
-    // overstrike with a 1px horizontal offset.
-    drawText(640, y + 18, provider, 0, TextSize::Tiny);
-    drawText(641, y + 18, provider, 0, TextSize::Tiny);
-    if (age.length() > 0) {
-      const String ageLine = age + " 전";
-      const int16_t ageWidth = measureKorean(ageLine, TextSize::Tiny);
-      drawText(SCREEN_WIDTH - 16 - ageWidth, y + 18, ageLine, 0, TextSize::Tiny);
-    }
-
-    drawText(94, y + 40, jsonString(session["title"]), 56, TextSize::Small);
-
-    String remaining = jsonString(session["message"]);
-    const int lineChars = 66;
-    int16_t lineY = y + 54;
-    for (int line = 0; line < 3 && remaining.length() > 0; line++) {
-      const String lineText = utf8Prefix(remaining, lineChars);
-      drawText(94, lineY, lineText, 0, TextSize::Tiny);
-      remaining = remaining.substring(lineText.length());
-      lineY += 14;
-    }
-    // No separator under the last row: it would collide with the footer.
-    if (rowCount < 3) {
-      display.drawFastHLine(12, y + 94, SCREEN_WIDTH - 24, GxEPD_BLACK);
-    }
-
-    y += 96;
-    rowCount++;
-  }
-
-  // Footer.
-  const String clock = jsonString(root["clock"]);
-  if (clock.length() > 0) {
-    drawText(16, SCREEN_HEIGHT - 12, clock + " 업데이트", 0, TextSize::Tiny);
-  }
-  const String footerRight = "브리지 라이브";
-  const int16_t footerWidth = measureKorean(footerRight, TextSize::Tiny);
-  drawText(SCREEN_WIDTH - 16 - footerWidth, SCREEN_HEIGHT - 12, footerRight, 0, TextSize::Tiny);
-}
-
-// Repaints the agent page. Partial mode touches only the area below the
-// header so the panel skips the black/white full-refresh flash.
-static void renderAgentScreen(bool partialRefresh) {
-  display.setRotation(0);
-  if (partialRefresh) {
-    display.setPartialWindow(0, 30, SCREEN_WIDTH, SCREEN_HEIGHT - 30);
-  } else {
-    display.setFullWindow();
-  }
-
-  display.firstPage();
-  do {
-    display.fillScreen(GxEPD_WHITE);
-    display.setTextColor(GxEPD_BLACK);
-    if (!partialRefresh) {
-      JsonDocument empty;
-      const DeviceTelemetry telemetry = readDeviceTelemetry();
-      drawNativeHeader(empty.to<JsonObject>(), "에이전트", telemetry);
-    }
-    drawAgentPageContent();
-  } while (display.nextPage());
-}
-
-// Called from the wait loop. Self-throttles to settings.agentPollSeconds and
-// repaints only when the bridge's stateHash moved.
-static void agentLivePollTick(const DeviceSettings &settings) {
-  if (!ENABLE_DISPLAY || settings.deepSleep || SCREEN_PAGE_COUNT <= AGENT_PAGE_INDEX) {
-    return;
-  }
-  const int page = ((screenPage % SCREEN_PAGE_COUNT) + SCREEN_PAGE_COUNT) % SCREEN_PAGE_COUNT;
-  if (page != AGENT_PAGE_INDEX || agentBridgeEndpoint().length() == 0) {
-    return;
-  }
-  if (nightSecondsRemaining(settings) > 0) {
-    return;
-  }
-  const uint32_t intervalMs = settings.agentPollSeconds * 1000UL;
-  if (lastAgentPollTickMs != 0 && millis() - lastAgentPollTickMs < intervalMs) {
-    return;
-  }
-  lastAgentPollTickMs = millis();
-
-  if (WiFi.status() != WL_CONNECTED || !fetchAgentStatusOnce()) {
-    return;
-  }
-
-  const String stateHash = parseAgentStateHash();
-  if (stateHash.length() > 0 && stateHash == agentStateHash) {
-    return;
-  }
-  agentStateHash = stateHash;
-
-  agentPartialCount++;
-  if (agentPartialCount >= AGENT_FULL_REFRESH_EVERY) {
-    agentPartialCount = 0;
-    renderAgentScreen(false);
-  } else {
-    renderAgentScreen(true);
-  }
-}
-
 static bool renderDashboard(JsonObjectConst root, const DeviceTelemetry &telemetry, bool partialRefresh) {
+  (void)telemetry;
   display.setRotation(0);
   if (partialRefresh) {
     display.setPartialWindow(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -4044,55 +2780,12 @@ static bool renderDashboard(JsonObjectConst root, const DeviceTelemetry &telemet
     display.setFullWindow();
   }
 
-  const int currentPage = ((screenPage % SCREEN_PAGE_COUNT) + SCREEN_PAGE_COUNT) % SCREEN_PAGE_COUNT;
-  if (currentPage == AGENT_PAGE_INDEX) {
-    // Landing on the agent page: get fresh bridge data so the first paint is
-    // already live instead of waiting for the next poll tick.
-    if (millis() - cachedAgentJsonAt > 5000UL || !cachedAgentJson) {
-      fetchAgentStatusOnce();
-    }
-    agentStateHash = parseAgentStateHash();
-    lastAgentPollTickMs = millis();
-    agentPartialCount = 0;
-  }
-
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
     display.setTextColor(GxEPD_BLACK);
 
-    const int page = currentPage;
-    if (page == 0) {
-      drawNativeHeader(root, "요약", telemetry);
-      drawOverviewPage(root);
-    } else if (page == 1) {
-      drawNativeHeader(root, "주간날씨", telemetry);
-      drawWeatherPage(root);
-    } else if (page == 2) {
-      drawNativeHeader(root, "캘린더", telemetry);
-      drawMonthCalendarPage(root);
-    } else if (page == 3) {
-      drawNativeHeader(root, "주간일정", telemetry);
-      drawWeekCalendarPage(root);
-    } else if (page == 4) {
-      drawNativeHeader(root, "시장지표", telemetry);
-      drawStocksPage(root);
-    } else if (page == 5) {
-      drawNativeHeader(root, "차트1", telemetry);
-      drawStockChartsPage(root, 0);
-    } else if (page == 6) {
-      drawNativeHeader(root, "차트2", telemetry);
-      drawStockChartsPage(root, 1);
-    } else if (page == 7) {
-      drawNativeHeader(root, "차트3", telemetry);
-      drawStockChartsPage(root, 2);
-    } else if (page == 8) {
-      drawNativeHeader(root, "뉴스", telemetry);
-      drawNewsPage(root);
-    } else if (page == AGENT_PAGE_INDEX) {
-      drawNativeHeader(root, "에이전트", telemetry);
-      drawAgentPageContent();
-    }
+    drawSnackVotePage(root);
   } while (display.nextPage());
 
   return true;
