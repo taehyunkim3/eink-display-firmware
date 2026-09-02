@@ -2646,7 +2646,7 @@ static void drawSnackVotePage(JsonObjectConst root, const DeviceTelemetry &telem
   }
 
   drawKorean(LEFT_MARGIN, 24, "MR.DEVELLO 간식 대시보드", TextSize::Large);
-  drawInvertedText(LEFT_MARGIN, 54, 108, 24, "간식 투표", 0, TextSize::Bold);
+  drawInvertedText(LEFT_MARGIN, 54, 200, 24, "간식 투표가 진행중입니다", 0, TextSize::Bold);
   const String roundName = jsonString(root["roundName"], "진행 중인 투표 없음");
   drawKorean(LEFT_MARGIN, 88, utf8Prefix(roundName, 23), TextSize::Large);
 
@@ -2694,10 +2694,13 @@ static void drawSnackVotePage(JsonObjectConst root, const DeviceTelemetry &telem
     const int elapsedDays = daysFromCivil(today.year, today.month, today.day) -
                              daysFromCivil(lastDeliveryDate.year, lastDeliveryDate.month, lastDeliveryDate.day);
     const String elapsedText = elapsedDays <= 0 ? "오늘" : String(elapsedDays) + "일 전";
+    const int lastDeliveryRoundSequence = root["lastDeliveryRoundSequence"] | 0;
+    const String roundSuffix =
+        lastDeliveryRoundSequence > 0 ? ", " + String(lastDeliveryRoundSequence) + "회차" : "";
     drawText(LEFT_MARGIN,
              deliverySubY,
              "마지막 배송 " + twoDigit(lastDeliveryDate.month) + "/" +
-                 twoDigit(lastDeliveryDate.day) + " (" + elapsedText + ")",
+                 twoDigit(lastDeliveryDate.day) + " (" + elapsedText + roundSuffix + ")",
              0,
              TextSize::Tiny);
   } else {
@@ -2709,14 +2712,20 @@ static void drawSnackVotePage(JsonObjectConst root, const DeviceTelemetry &telem
   const int16_t headerY = dividerY + 16;
   const int16_t itemsStartY = headerY + 18;
   constexpr int16_t ROW_PITCH = 15;
+  constexpr int16_t COL_GAP = 10;
+  constexpr int16_t COL_WIDTH = (LEFT_WIDTH - COL_GAP) / 2;
+  constexpr int16_t COL_X[2] = {LEFT_MARGIN, LEFT_MARGIN + COL_WIDTH + COL_GAP};
+  constexpr int ROWS_PER_COL = 16;
   display.drawFastHLine(LEFT_MARGIN, dividerY, LEFT_WIDTH, GxEPD_BLACK);
-  drawText(LEFT_MARGIN, headerY, "상품", 0, TextSize::Tiny);
-  drawText(LEFT_MARGIN + LEFT_WIDTH - 34, headerY, "득표", 0, TextSize::Tiny);
+  drawText(COL_X[0], headerY, "상품", 0, TextSize::Tiny);
+  drawText(COL_X[0] + COL_WIDTH - 34, headerY, "득표", 0, TextSize::Tiny);
+  drawText(COL_X[1], headerY, "상품", 0, TextSize::Tiny);
+  drawText(COL_X[1] + COL_WIDTH - 34, headerY, "득표", 0, TextSize::Tiny);
 
   // items는 득표수 내림차순으로 온다. 0표는 화면에서 숨기므로 앞에서부터
   // 0표를 만나는 지점까지만 득표한 상품이다.
   JsonArrayConst items = root["items"].as<JsonArrayConst>();
-  constexpr int MAX_ITEM_ROWS = 15;
+  constexpr int MAX_ITEM_ROWS = ROWS_PER_COL * 2;
   int votedItemCount = 0;
   while (votedItemCount < static_cast<int>(items.size()) &&
          (items[votedItemCount]["voteCount"] | 0) > 0) {
@@ -2724,26 +2733,27 @@ static void drawSnackVotePage(JsonObjectConst root, const DeviceTelemetry &telem
   }
   const int visibleItemCount =
       min(votedItemCount, votedItemCount > MAX_ITEM_ROWS ? MAX_ITEM_ROWS - 1 : MAX_ITEM_ROWS);
-  int16_t itemY = itemsStartY;
   for (int i = 0; i < visibleItemCount; i++) {
     JsonObjectConst item = items[i];
-    drawText(LEFT_MARGIN, itemY, String(i + 1) + ". " + jsonString(item["name"]), 17, TextSize::Small);
+    const int16_t colX = COL_X[i / ROWS_PER_COL];
+    const int16_t rowY = itemsStartY + (i % ROWS_PER_COL) * ROW_PITCH;
+    drawText(colX, rowY, String(i + 1) + ". " + jsonString(item["name"]), 9, TextSize::Small);
     const String voteText = String(item["voteCount"] | 0) + "표";
-    drawText(LEFT_MARGIN + LEFT_WIDTH - measureKorean(voteText, TextSize::Bold),
-             itemY,
+    drawText(colX + COL_WIDTH - measureKorean(voteText, TextSize::Bold),
+             rowY,
              voteText,
              0,
              TextSize::Bold);
-    itemY += ROW_PITCH;
   }
+  const int16_t footerY = itemsStartY + ROWS_PER_COL * ROW_PITCH;
   if (visibleItemCount < votedItemCount) {
     drawText(LEFT_MARGIN,
-             itemY,
+             footerY,
              "외 " + String(votedItemCount - visibleItemCount) + "개 더 있음 · QR로 전체 확인",
              0,
              TextSize::Tiny);
   } else if (votedItemCount == 0) {
-    drawText(LEFT_MARGIN, itemY, "아직 투표 없음", 0, TextSize::Small);
+    drawText(LEFT_MARGIN, footerY, "아직 투표 없음", 0, TextSize::Small);
   }
 
   const String qrUrl = jsonString(root["qrUrl"]);
@@ -2769,7 +2779,7 @@ static void drawSnackVotePage(JsonObjectConst root, const DeviceTelemetry &telem
 
   const String lastUpdatedAt = jsonString(root["lastUpdatedAt"]);
   const unsigned int autoRefreshMinutes = settings.refreshSeconds / 60;
-  drawText(QR_AREA_LEFT + 24, 420, "버튼을 누르면 최신 정보로 업데이트됩니다", 0, TextSize::Tiny);
+  drawText(QR_AREA_LEFT + 24, 420, "아무 버튼을 누르면 최신 정보로 업데이트됩니다", 0, TextSize::Tiny);
   drawText(QR_AREA_LEFT + 24,
            440,
            String(autoRefreshMinutes) + "분마다 자동 업데이트됩니다",
@@ -3359,7 +3369,7 @@ void loop() {
     pageTransitionRefreshCount = 0;
     if (ENABLE_DISPLAY) {
       setupDisplay();
-      drawStatus("새로고침중", "최신 정보를 가져오는 중입니다...", true);
+      drawStatus("새로고침중", "최신 정보를 가져오는 중입니다... (약 5초 소요)", true);
     }
     refreshScreen(true);
   } else if (action == WaitAction::WifiSetup) {
